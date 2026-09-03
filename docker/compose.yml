@@ -45,7 +45,11 @@ services:
     environment:
       - CORDBRIEF_EXCHANGE_DIR=/var/cordbrief/exchange
       - CORDBRIEF_DATA_DIR=/var/cordbrief/data
-      # Future LLM secrets will be provided here, inaccessible to the collector
+      - GEMINI_API_KEY
+      - CORDBRIEF_LLM_PROVIDER
+      - CORDBRIEF_LLM_BASE_URL
+      - CORDBRIEF_LLM_MODEL
+      - CORDBRIEF_LLM_API_KEY
     volumes:
       # Shared filesystem exchange (reads events/status/catalog, writes watchlist/core-ack)
       - cordbrief_exchange:/var/cordbrief/exchange

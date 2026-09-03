@@ -199,18 +199,35 @@ func TestValidate_Errors(t *testing.T) {
 			expectError: "invalid schedule.timezone",
 		},
 		{
-			name: "invalid llm base url",
+			name: "invalid llm provider",
 			modify: func(c *Config) {
+				c.LLM.Provider = "unsupported"
+			},
+			expectError: "must be \"gemini\" or \"local\"",
+		},
+		{
+			name: "invalid local llm base url",
+			modify: func(c *Config) {
+				c.LLM.Provider = "local"
 				c.LLM.BaseURL = "not-a-url"
 			},
 			expectError: "invalid llm.base_url",
 		},
 		{
-			name: "missing llm model",
+			name: "missing local llm base url",
 			modify: func(c *Config) {
+				c.LLM.Provider = "local"
+				c.LLM.BaseURL = ""
+			},
+			expectError: "llm.base_url is required for provider 'local'",
+		},
+		{
+			name: "missing local llm model",
+			modify: func(c *Config) {
+				c.LLM.Provider = "local"
 				c.LLM.Model = ""
 			},
-			expectError: "llm.model is required",
+			expectError: "llm.model is required for provider 'local'",
 		},
 		{
 			name: "invalid first_run_lookback",
@@ -240,8 +257,9 @@ func TestValidate_Errors(t *testing.T) {
 					Timezone: "UTC",
 				},
 				LLM: LLMConfig{
-					BaseURL: "http://localhost:8080/v1",
-					Model:   "model",
+					Provider: "local",
+					BaseURL:  "http://localhost:8080/v1",
+					Model:    "model",
 				},
 				Digest: DigestConfig{},
 			}
@@ -254,6 +272,79 @@ func TestValidate_Errors(t *testing.T) {
 				t.Errorf("expected error %q, got: %v", tc.expectError, err)
 			}
 		})
+	}
+}
+
+func TestLLM_GeminiDefaults(t *testing.T) {
+	cfg := &Config{
+		GuildID:          "123",
+		SourceChannelIDs: []string{"ch1"},
+		DigestChannelID:  "ch2",
+		Schedule: ScheduleConfig{
+			Time:     "08:00",
+			Timezone: "UTC",
+		},
+		LLM: LLMConfig{
+			Provider: "gemini",
+		},
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+
+	if cfg.LLM.BaseURL != DefaultGeminiBaseURL {
+		t.Errorf("expected default gemini base URL %s, got %s", DefaultGeminiBaseURL, cfg.LLM.BaseURL)
+	}
+	if cfg.LLM.Model != DefaultGeminiModel {
+		t.Errorf("expected default gemini model %s, got %s", DefaultGeminiModel, cfg.LLM.Model)
+	}
+	if cfg.LLM.APIKeyEnv != DefaultGeminiKeyEnv {
+		t.Errorf("expected default gemini api key env %s, got %s", DefaultGeminiKeyEnv, cfg.LLM.APIKeyEnv)
+	}
+	if cfg.LLM.MaxInputChars != DefaultGeminiMaxInput {
+		t.Errorf("expected max input chars %d, got %d", DefaultGeminiMaxInput, cfg.LLM.MaxInputChars)
+	}
+	if cfg.LLM.MaxOutputTokens != DefaultGeminiMaxOutput {
+		t.Errorf("expected max output tokens %d, got %d", DefaultGeminiMaxOutput, cfg.LLM.MaxOutputTokens)
+	}
+	if cfg.LLM.TimeoutSeconds != DefaultGeminiTimeout {
+		t.Errorf("expected timeout %d, got %d", DefaultGeminiTimeout, cfg.LLM.TimeoutSeconds)
+	}
+}
+
+func TestLLM_LocalConfiguration(t *testing.T) {
+	cfg := &Config{
+		GuildID:          "123",
+		SourceChannelIDs: []string{"ch1"},
+		DigestChannelID:  "ch2",
+		Schedule: ScheduleConfig{
+			Time:     "08:00",
+			Timezone: "UTC",
+		},
+		LLM: LLMConfig{
+			Provider: "local",
+			BaseURL:  "http://host.docker.internal:8081/v1",
+			Model:    "Qwen-custom",
+		},
+	}
+
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("unexpected validation error: %v", err)
+	}
+
+	if cfg.LLM.BaseURL != "http://host.docker.internal:8081/v1" {
+		t.Errorf("unexpected base URL: %s", cfg.LLM.BaseURL)
+	}
+	if cfg.LLM.Model != "Qwen-custom" {
+		t.Errorf("unexpected model: %s", cfg.LLM.Model)
+	}
+	// API key is optional for local
+	if cfg.LLM.APIKeyEnv != "" {
+		t.Errorf("expected empty APIKeyEnv for local by default, got %s", cfg.LLM.APIKeyEnv)
+	}
+	if cfg.LLM.TimeoutSeconds != DefaultLocalTimeout {
+		t.Errorf("expected default local timeout %d, got %d", DefaultLocalTimeout, cfg.LLM.TimeoutSeconds)
 	}
 }
 

@@ -10,11 +10,11 @@
     "timezone": "America/New_York"
   },
   "llm": {
-    "base_url": "http://localhost:11434/v1",
-    "model": "llama3",
-    "api_key_env": "CORDBRIEF_LLM_API_KEY",
-    "max_input_chars": 30000,
-    "max_output_tokens": 1024
+    "provider": "gemini",
+    "model": "gemini-3.7-flash",
+    "max_input_chars": 200000,
+    "max_output_tokens": 8192,
+    "timeout_seconds": 120
   },
   "digest": {
     "output_language": "en",

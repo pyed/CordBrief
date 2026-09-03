@@ -13,10 +13,26 @@ import (
 
 const (
 	EnvDiscordToken = "CORDBRIEF_DISCORD_TOKEN"
+	EnvGeminiKey    = "GEMINI_API_KEY"
 
-	DefaultLanguage      = "en"
-	DefaultMaxInputChars = 30000
-	DefaultMaxOutputToks = 1024
+	ProviderGemini = "gemini"
+	ProviderLocal  = "local"
+
+	DefaultGeminiBaseURL   = "https://generativelanguage.googleapis.com/v1beta/openai/"
+	DefaultGeminiModel     = "gemini-3.7-flash"
+	DefaultGeminiKeyEnv    = "GEMINI_API_KEY"
+	DefaultGeminiMaxInput  = 200000
+	DefaultGeminiMaxOutput = 8192
+	DefaultGeminiTimeout   = 120
+
+	DefaultLocalMaxInput  = 200000
+	DefaultLocalMaxOutput = 8192
+	DefaultLocalTimeout   = 180
+
+	DefaultMaxInputChars = DefaultGeminiMaxInput
+	DefaultMaxOutputToks = DefaultGeminiMaxOutput
+
+	DefaultLanguage              = "en"
 	DefaultLookback              = "24h"
 	DefaultCatchup               = "48h"
 	DefaultMaxMessagesPerChannel = 20000
@@ -33,13 +49,15 @@ type ScheduleConfig struct {
 	Minute   int            `json:"-"`
 }
 
-// LLMConfig defines OpenAI-compatible language model connection settings.
+// LLMConfig defines language model connection settings for Gemini and Local LLM.
 type LLMConfig struct {
-	BaseURL         string `json:"base_url"`
-	Model           string `json:"model"`
+	Provider        string `json:"provider"` // "gemini" or "local"
+	BaseURL         string `json:"base_url,omitempty"`
+	Model           string `json:"model,omitempty"`
 	APIKeyEnv       string `json:"api_key_env,omitempty"`
-	MaxInputChars   int    `json:"max_input_chars"`
-	MaxOutputTokens int    `json:"max_output_tokens"`
+	MaxInputChars   int    `json:"max_input_chars,omitempty"`
+	MaxOutputTokens int    `json:"max_output_tokens,omitempty"`
+	TimeoutSeconds  int    `json:"timeout_seconds,omitempty"`
 }
 
 // DigestConfig defines summarization parameters, filtering, and time bounds.
@@ -136,26 +154,64 @@ func (c *Config) Validate() error {
 		}
 	}
 
-	// LLM
-	if strings.TrimSpace(c.LLM.BaseURL) == "" {
-		errs = append(errs, "llm.base_url is required")
-	} else {
-		u, err := url.Parse(c.LLM.BaseURL)
-		if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
-			errs = append(errs, fmt.Sprintf("invalid llm.base_url %q: must be a valid http or https URL", c.LLM.BaseURL))
+	// LLM validation
+	p := strings.ToLower(strings.TrimSpace(c.LLM.Provider))
+	if p == "" {
+		p = ProviderGemini
+	}
+
+	switch p {
+	case ProviderGemini:
+		c.LLM.Provider = ProviderGemini
+		if strings.TrimSpace(c.LLM.BaseURL) == "" {
+			c.LLM.BaseURL = DefaultGeminiBaseURL
+		} else {
+			u, err := url.Parse(c.LLM.BaseURL)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				errs = append(errs, fmt.Sprintf("invalid llm.base_url %q: must be a valid http or https URL", c.LLM.BaseURL))
+			}
 		}
-	}
+		if strings.TrimSpace(c.LLM.Model) == "" {
+			c.LLM.Model = DefaultGeminiModel
+		}
+		if strings.TrimSpace(c.LLM.APIKeyEnv) == "" {
+			c.LLM.APIKeyEnv = DefaultGeminiKeyEnv
+		}
+		if c.LLM.MaxInputChars <= 0 {
+			c.LLM.MaxInputChars = DefaultGeminiMaxInput
+		}
+		if c.LLM.MaxOutputTokens <= 0 {
+			c.LLM.MaxOutputTokens = DefaultGeminiMaxOutput
+		}
+		if c.LLM.TimeoutSeconds <= 0 {
+			c.LLM.TimeoutSeconds = DefaultGeminiTimeout
+		}
 
-	if strings.TrimSpace(c.LLM.Model) == "" {
-		errs = append(errs, "llm.model is required")
-	}
+	case ProviderLocal:
+		c.LLM.Provider = ProviderLocal
+		if strings.TrimSpace(c.LLM.BaseURL) == "" {
+			errs = append(errs, "llm.base_url is required for provider 'local' (e.g. 'http://host.docker.internal:8081/v1')")
+		} else {
+			u, err := url.Parse(c.LLM.BaseURL)
+			if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" {
+				errs = append(errs, fmt.Sprintf("invalid llm.base_url %q: must be a valid http or https URL", c.LLM.BaseURL))
+			}
+		}
+		if strings.TrimSpace(c.LLM.Model) == "" {
+			errs = append(errs, "llm.model is required for provider 'local'")
+		}
+		if c.LLM.MaxInputChars <= 0 {
+			c.LLM.MaxInputChars = DefaultLocalMaxInput
+		}
+		if c.LLM.MaxOutputTokens <= 0 {
+			c.LLM.MaxOutputTokens = DefaultLocalMaxOutput
+		}
+		if c.LLM.TimeoutSeconds <= 0 {
+			c.LLM.TimeoutSeconds = DefaultLocalTimeout
+		}
 
-	if c.LLM.MaxInputChars <= 0 {
-		c.LLM.MaxInputChars = DefaultMaxInputChars
-	}
-
-	if c.LLM.MaxOutputTokens <= 0 {
-		c.LLM.MaxOutputTokens = DefaultMaxOutputToks
+	default:
+		errs = append(errs, fmt.Sprintf("invalid llm.provider %q: must be %q or %q", c.LLM.Provider, ProviderGemini, ProviderLocal))
 	}
 
 	// Digest

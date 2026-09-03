@@ -248,3 +248,63 @@ The following architectural items are intentionally deferred beyond the foundati
 6. **Production Image Optimization**: Multi-stage image minimization to prune intermediate Node/pnpm build caches and unneeded build tools from the final collector image.
 7. **Channel Catalog Live Publication**: The `catalog.json` schema and reader are implemented; live in-process extraction via Discord client stores is deferred to future UI milestones.
 8. **Long-Duration Soak Testing**: Multi-day stress testing under high-traffic multi-guild scenarios.
+
+---
+
+## 10. The Digest Processing Transaction & Idempotency
+
+### Canonical 10-Step Processing Transaction
+
+To guarantee crash resilience and zero message loss, the Core digest generation executes as a strict one-way transaction:
+
+1. **Load Committed Cursor**: Read committed `(segment, offset)` from `/var/cordbrief/exchange/core-ack.json`.
+2. **Capture Watermark**: Read current segment list and exact immutable byte boundaries (`CaptureWatermark`).
+3. **Read Records**: Read complete journal records from the cursor to the watermark boundary.
+4. **Construct Deterministic DigestBatch**:
+   - Filter excluded events (e.g. bots when `ignore_bots = true`).
+   - Assign sequential local source IDs (`S000001`, `S000002`...) mapping to `(guild_id, channel_id, message_id)`.
+   - Calculate deterministic `BatchID = SHA-256(version, start_cursor, end_cursor, canonical_messages)`.
+5. **Check Existing Artifact (Idempotency Check)**:
+   - Check if `/var/cordbrief/data/digests/<batch-id>.json` already exists.
+   - If an artifact exists with identical cursor boundaries: validate it and advance the cursor immediately **without** calling the LLM.
+   - If an artifact exists with mismatched boundaries: fail loudly (never overwrite conflicting history).
+6. **Generate Digest via LLM**:
+   - Single-Chunk Fast Path: If total input characters <= `max_input_chars`, execute a single completion call.
+   - Chunk/Reduce Path: If over budget, split messages deterministically into chunks without splitting individual records, generate structured chunk summaries, and reduce into the final digest while preserving original `Sxxxxxx` source IDs.
+7. **Strict Validation**:
+   - Verify every cited source ID exists in the batch.
+   - Reject unknown IDs, invalid item kinds, or ungrounded substantive claims.
+8. **Persist Digest Artifact**:
+   - Write `/var/cordbrief/data/digests/<batch-id>.json` using crash-resistant safe replacement (`.tmp` write, sync, close, rename).
+9. **Verify Artifact on Disk**: Ensure file exists and is readable.
+10. **Commit Journal Cursor**:
+    - Write the advanced cursor to `/var/cordbrief/exchange/core-ack.json` using crash-resistant replacement.
+
+> [!IMPORTANT]
+> If any step prior to Step 10 fails (provider timeout, network error, malformed JSON, invalid citations, disk error), `core-ack.json` is **never** updated. On subsequent runs, the pipeline restarts from the previous uncommitted cursor.
+
+### Prompt-Injection Defense Boundary
+
+Discord message content is untrusted user input:
+- The model has **zero tools** or code execution capabilities.
+- Discord messages are packaged as structured data payloads, clearly separated from system instructions.
+- System prompts instruct the model that messages are conversation content, not instructions, and to ignore any commands inside message text.
+- No Discord message content is ever interpolated into the system prompt.
+
+---
+
+## 11. Supported LLM Providers & Configuration
+
+CordBrief officially supports two primary provider options sharing a single, minimal `net/http` OpenAI-compatible transport:
+
+### 1. Gemini (Cloud Default)
+- **Transport**: Official Google OpenAI-compatible chat completions endpoint (`https://generativelanguage.googleapis.com/v1beta/openai/chat/completions`).
+- **Default Model**: `gemini-3.7-flash` (configurable).
+- **Authentication**: `GEMINI_API_KEY` environment variable passed via `Authorization: Bearer <KEY>`. Keys are never logged or stored in digest artifacts.
+- **Data Path & Privacy**: Gemini API keys are available via Google AI Studio. The free tier may use input data to improve Google products. CordBrief transmits selected Discord messages to the configured provider; users requiring strict on-premises data isolation should select **Local LLM**.
+
+### 2. Local LLM (Self-Hosted / Private)
+- **Transport**: Standard OpenAI-compatible HTTP chat completions (`/v1/chat/completions` or `/chat/completions`).
+- **Target Runtimes**: llama.cpp server, LM Studio, vLLM, Ollama (OpenAI compatibility mode).
+- **Configuration**: Requires `base_url` (e.g. `http://host.docker.internal:8081/v1` when Core runs in Docker) and `model`. API key is optional.
+- **Docker Networking**: Inside Docker containers, servers running on the host machine must typically be reached via `host.docker.internal` rather than `localhost`.

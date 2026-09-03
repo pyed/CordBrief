@@ -12,8 +12,10 @@ import (
 	"time"
 
 	"cordbrief/internal/config"
+	"cordbrief/internal/digest"
 	"cordbrief/internal/discord"
 	"cordbrief/internal/journal"
+	"cordbrief/internal/llm"
 )
 
 const Version = "v0.1.0-dev"
@@ -53,6 +55,9 @@ func Run(args []string, stdout, stderr io.Writer) int {
 
 	case "exchange":
 		return runExchange(subArgs, stdout, stderr)
+
+	case "digest":
+		return runDigest(subArgs, stdout, stderr)
 
 	case "doctor":
 		return runDoctor(subArgs, stdout, stderr)
@@ -412,6 +417,200 @@ func runExchange(args []string, stdout, stderr io.Writer) int {
 	}
 }
 
+func getDataDir(flagVal string) string {
+	if flagVal != "" {
+		return flagVal
+	}
+	if env := os.Getenv("CORDBRIEF_DATA_DIR"); env != "" {
+		return env
+	}
+	return "/var/cordbrief/data"
+}
+
+func runDigest(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "error: missing digest subcommand (preview, run)")
+		return 1
+	}
+
+	sub := args[0]
+	subArgs := args[1:]
+
+	if sub != "preview" && sub != "run" && sub != "test-llm" {
+		fmt.Fprintf(stderr, "error: unknown digest subcommand %q (expected 'preview', 'run', or 'test-llm')\n", sub)
+		return 1
+	}
+
+	fs := flag.NewFlagSet("digest "+sub, flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	cfgPath := fs.String("config", "config.json", "path to configuration file")
+	exchangeDir := fs.String("exchange-dir", "", "path to exchange directory")
+	dataDir := fs.String("data-dir", "", "path to data directory")
+	limit := fs.Int("limit", 1000, "maximum events to read in batch")
+
+	if err := fs.Parse(subArgs); err != nil {
+		return 2
+	}
+
+	// 1. Resolve configuration
+	providerType := config.ProviderGemini
+	llmBaseURL := config.DefaultGeminiBaseURL
+	llmModel := config.DefaultGeminiModel
+	apiKeyEnv := config.DefaultGeminiKeyEnv
+	maxInputChars := config.DefaultGeminiMaxInput
+	maxOutputTokens := config.DefaultGeminiMaxOutput
+	timeoutSecs := config.DefaultGeminiTimeout
+	lang := config.DefaultLanguage
+	var focus []string
+	var ignoreBots bool
+
+	if *cfgPath != "" {
+		if cfg, err := config.Load(*cfgPath); err == nil {
+			providerType = cfg.LLM.Provider
+			llmBaseURL = cfg.LLM.BaseURL
+			llmModel = cfg.LLM.Model
+			apiKeyEnv = cfg.LLM.APIKeyEnv
+			maxInputChars = cfg.LLM.MaxInputChars
+			maxOutputTokens = cfg.LLM.MaxOutputTokens
+			timeoutSecs = cfg.LLM.TimeoutSeconds
+			if cfg.Digest.OutputLanguage != "" {
+				lang = cfg.Digest.OutputLanguage
+			}
+			focus = cfg.Digest.Focus
+			ignoreBots = cfg.Digest.IgnoreBots
+		} else if !os.IsNotExist(err) && *cfgPath != "config.json" {
+			fmt.Fprintf(stderr, "error loading config: %v\n", err)
+			return 1
+		}
+	}
+
+	// Environment overrides
+	if env := os.Getenv("CORDBRIEF_LLM_PROVIDER"); env != "" {
+		providerType = strings.ToLower(strings.TrimSpace(env))
+	}
+	if env := os.Getenv("CORDBRIEF_LLM_BASE_URL"); env != "" {
+		llmBaseURL = env
+	}
+	if env := os.Getenv("CORDBRIEF_LLM_MODEL"); env != "" {
+		llmModel = env
+	}
+
+	var llmAPIKey string
+	if apiKeyEnv != "" {
+		llmAPIKey = os.Getenv(apiKeyEnv)
+	}
+	if envKey := os.Getenv("GEMINI_API_KEY"); envKey != "" && providerType == config.ProviderGemini && llmAPIKey == "" {
+		llmAPIKey = envKey
+	}
+	if envKey := os.Getenv("CORDBRIEF_LLM_API_KEY"); envKey != "" && llmAPIKey == "" {
+		llmAPIKey = envKey
+	}
+
+	// Validation
+	switch providerType {
+	case config.ProviderGemini:
+		if llmBaseURL == "" {
+			llmBaseURL = config.DefaultGeminiBaseURL
+		}
+		if llmModel == "" {
+			llmModel = config.DefaultGeminiModel
+		}
+		if llmAPIKey == "" {
+			fmt.Fprintln(stderr, "error: GEMINI_API_KEY is not set. Get an API key from Google AI Studio and set the GEMINI_API_KEY environment variable.")
+			return 1
+		}
+	case config.ProviderLocal:
+		if llmBaseURL == "" {
+			fmt.Fprintln(stderr, "error: llm.base_url is required for provider 'local' (e.g. 'http://host.docker.internal:8081/v1')")
+			return 1
+		}
+		if llmModel == "" {
+			fmt.Fprintln(stderr, "error: llm.model is required for provider 'local'")
+			return 1
+		}
+	default:
+		fmt.Fprintf(stderr, "error: unsupported llm.provider %q (must be 'gemini' or 'local')\n", providerType)
+		return 1
+	}
+
+	providerDisplayName := "Gemini"
+	if providerType == config.ProviderLocal {
+		providerDisplayName = "Local"
+	}
+
+	// 2. Initialize provider & pipeline
+	provider := llm.NewOpenAICompatibleProvider(llmBaseURL, llmModel, llmAPIKey, maxOutputTokens, time.Duration(timeoutSecs)*time.Second)
+
+	if sub == "test-llm" {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Duration(timeoutSecs)*time.Second)
+		defer cancel()
+		resp, err := provider.GenerateText(ctx, "You are a test responder.", "Respond with the single word PONG")
+		if err != nil {
+			fmt.Fprintf(stderr, "error connecting to %s (%s): %v\n", providerDisplayName, llmModel, err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "[PASS] LLM Connectivity Verified: %s (%s)\nResponse: %s\n", providerDisplayName, llmModel, strings.TrimSpace(resp))
+		return 0
+	}
+
+	pipe := llm.NewPipeline(provider, maxInputChars, llm.PromptConfig{
+		Language: lang,
+		Focus:    focus,
+	})
+
+	// 3. Execute transaction
+	commit := (sub == "run")
+	opts := digest.TransactionOptions{
+		ExchangeDir:  getExchangeDir(*exchangeDir),
+		DataDir:      getDataDir(*dataDir),
+		IgnoreBots:   ignoreBots,
+		BatchLimit:   *limit,
+		ProviderName: providerType,
+		ModelName:    llmModel,
+		Commit:       commit,
+	}
+
+	res, err := digest.RunTransaction(context.Background(), pipe, opts)
+	if err != nil {
+		fmt.Fprintf(stderr, "digest error: %v\n", err)
+		return 1
+	}
+
+	if res.Empty {
+		fmt.Fprintln(stdout, "[INFO] No new journal events to process.")
+		return 0
+	}
+
+	if res.AllExcluded {
+		fmt.Fprintln(stdout, "[INFO] Journal events contained only excluded messages (e.g. bots). Cursor advanced past range.")
+		return 0
+	}
+
+	if res.WasIdempotentHit {
+		fmt.Fprintf(stdout, "[IDEMPOTENT HIT] Found existing artifact on disk for batch %s\n", res.Batch.BatchID)
+		fmt.Fprintf(stdout, "Artifact: %s\n", res.ArtifactPath)
+		fmt.Fprintf(stdout, "Committed Cursor: segment=%d, offset=%d\n\n", res.CommittedCursor.Segment, res.CommittedCursor.Offset)
+		fmt.Fprint(stdout, digest.RenderMarkdown(res.Digest, res.Batch))
+		return 0
+	}
+
+	fmt.Fprintf(stdout, "Batch ID:          %s\n", res.Batch.BatchID)
+	fmt.Fprintf(stdout, "Total Messages:    %d\n", res.Batch.TotalJournalRecords)
+	fmt.Fprintf(stdout, "Included Messages: %d\n", len(res.Batch.IncludedMessages))
+	fmt.Fprintf(stdout, "Provider:          %s\n", providerDisplayName)
+	fmt.Fprintf(stdout, "Model:             %s\n", llmModel)
+	if commit {
+		fmt.Fprintf(stdout, "Artifact:          %s\n", res.ArtifactPath)
+		fmt.Fprintf(stdout, "Committed Cursor:  segment=%d, offset=%d\n", res.CommittedCursor.Segment, res.CommittedCursor.Offset)
+	} else {
+		fmt.Fprintf(stdout, "[PREVIEW] Cursor untouched: segment=%d, offset=%d\n", res.CommittedCursor.Segment, res.CommittedCursor.Offset)
+	}
+
+	fmt.Fprintln(stdout, "\n--- Rendered Digest ---")
+	fmt.Fprint(stdout, digest.RenderMarkdown(res.Digest, res.Batch))
+	return 0
+}
+
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "CordBrief: A tiny, self-hosted Discord daily-digest application")
 	fmt.Fprintln(w, "")
@@ -422,6 +621,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  doctor      Validate config, Discord permissions, and LLM connectivity")
 	fmt.Fprintln(w, "  channels    List guild channels to assist with configuration")
 	fmt.Fprintln(w, "  exchange    Manage exchange watchlist, inspect status, and ingest events")
+	fmt.Fprintln(w, "  digest      Generate structured digest from exchange journal (preview, run, test-llm)")
 	fmt.Fprintln(w, "  run         Execute a digest cycle (supports --dry-run)")
 	fmt.Fprintln(w, "  serve       Run the scheduled digest service")
 	fmt.Fprintln(w, "  version     Print version information")

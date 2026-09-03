@@ -11,6 +11,7 @@ import (
 
 	"cordbrief/internal/config"
 	"cordbrief/internal/discord"
+	"cordbrief/internal/llm"
 )
 
 func TestCLI_Version(t *testing.T) {
@@ -312,5 +313,73 @@ func TestCLI_Exchange(t *testing.T) {
 	}
 	if !strings.Contains(stdout.String(), "Events Read: 0") {
 		t.Fatalf("expected 0 events on second ingest, got: %s", stdout.String())
+	}
+}
+
+func TestCLI_Digest(t *testing.T) {
+	fakeServer := llm.NewFakeLLMServer()
+	defer fakeServer.Close()
+
+	fakeServer.ResponseContent = `{"title":"Test Digest Title","overview":"Test digest overview paragraph","items":[{"kind":"finding","text":"Observed drawdown difference","source_ids":["S000001"]}]}`
+
+	t.Setenv("CORDBRIEF_LLM_BASE_URL", fakeServer.URL)
+	t.Setenv("CORDBRIEF_LLM_MODEL", "mock-model")
+	t.Setenv("GEMINI_API_KEY", "test-api-key")
+
+	tmpDir := t.TempDir()
+	exchangeDir := filepath.Join(tmpDir, "exchange")
+	eventsDir := filepath.Join(exchangeDir, "events")
+	dataDir := filepath.Join(tmpDir, "data")
+	_ = os.MkdirAll(eventsDir, 0755)
+	_ = os.MkdirAll(dataDir, 0755)
+
+	// Write 1 message to segment
+	seg1 := filepath.Join(eventsDir, "0000000000000001.ndjson")
+	eventLine := []byte(`{"version":1,"event":"message_create","message_id":"15451001","guild_id":"g1","channel_id":"ch-a","timestamp":"2026-09-03T12:00:00Z","captured_at":"2026-09-03T12:00:00Z","author":{"id":"u1","name":"alice","display_name":"Alice","bot":false},"content":"Test grinder drawdown"}` + "\n")
+	if err := os.WriteFile(seg1, eventLine, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Preview
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"digest", "preview", "-config=", "-exchange-dir=" + exchangeDir, "-data-dir=" + dataDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("digest preview failed with code %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "[PREVIEW] Cursor untouched") || !strings.Contains(stdout.String(), "# CordBrief — Test Digest Title") {
+		t.Fatalf("unexpected preview output: %s", stdout.String())
+	}
+
+	// Verify cursor was NOT advanced
+	ackFile := filepath.Join(exchangeDir, "core-ack.json")
+	if _, err := os.Stat(ackFile); !os.IsNotExist(err) {
+		t.Fatal("expected core-ack.json to NOT exist after preview")
+	}
+
+	// 2. Run (with commit)
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"digest", "run", "-config=", "-exchange-dir=" + exchangeDir, "-data-dir=" + dataDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("digest run failed with code %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Committed Cursor:") || !strings.Contains(stdout.String(), "Artifact:") {
+		t.Fatalf("unexpected run output: %s", stdout.String())
+	}
+
+	// Verify core-ack.json was created
+	if _, err := os.Stat(ackFile); err != nil {
+		t.Fatalf("expected core-ack.json to exist after run, got: %v", err)
+	}
+
+	// 3. Run again immediately (should report no new events)
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"digest", "run", "-config=", "-exchange-dir=" + exchangeDir, "-data-dir=" + dataDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("second digest run failed with code %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "[INFO] No new journal events to process.") {
+		t.Fatalf("expected no new events output, got: %s", stdout.String())
 	}
 }
