@@ -1,0 +1,66 @@
+# CordBrief Architecture v2: Two-Service Production Docker Compose Foundation
+#
+# Security Boundary:
+# - cordbrief-collector: Runs Discord Desktop + Vencord. Has Discord profile/keyring/session access.
+#   Has NO access to LLM credentials, prompts, or delivery secrets.
+# - cordbrief-core: Runs Go core application. Reads journal events and manages watchlist.
+#   Has NO access to Discord profile, session storage, or keyring.
+# - The ONLY integration between services is the shared filesystem exchange volume.
+
+services:
+  # 1. Ingestion Service: Official Discord Desktop + Vencord Collector
+  cordbrief-collector:
+    build:
+      context: ../collector
+      dockerfile: Dockerfile
+    container_name: cordbrief-collector
+    restart: unless-stopped
+    shm_size: "1gb"
+    user: "1000:1000"
+    ports:
+      # Expose Xpra HTML5 client exclusively to localhost for first-time login
+      - "127.0.0.1:14500:14500"
+    environment:
+      - CORDBRIEF_EXCHANGE_DIR=/var/cordbrief/exchange
+      - XPRA_PORT=14500
+      - DISPLAY=:100
+    volumes:
+      # Persistent Discord authenticated session & profile
+      - cordbrief_discord_profile:/home/cordbrief/.config/discord
+      # Persistent GNOME Keyring for Discord secret token storage
+      - cordbrief_discord_keyring:/home/cordbrief/.local/share/keyrings
+      # Shared filesystem exchange (events, status, watchlist, catalog)
+      - cordbrief_exchange:/var/cordbrief/exchange
+
+  # 2. Core Service: Journal consumer, watchlist manager, and future summarization/delivery
+  cordbrief-core:
+    build:
+      context: ..
+      dockerfile: docker/Dockerfile.core
+    container_name: cordbrief-core
+    restart: unless-stopped
+    depends_on:
+      - cordbrief-collector
+    user: "1000:1000"
+    environment:
+      - CORDBRIEF_EXCHANGE_DIR=/var/cordbrief/exchange
+      - CORDBRIEF_DATA_DIR=/var/cordbrief/data
+      # Future LLM secrets will be provided here, inaccessible to the collector
+    volumes:
+      # Shared filesystem exchange (reads events/status/catalog, writes watchlist/core-ack)
+      - cordbrief_exchange:/var/cordbrief/exchange
+      # Core internal data and state
+      - cordbrief_core_data:/var/cordbrief/data
+
+volumes:
+  # Shared exchange volume (inter-service boundary)
+  cordbrief_exchange:
+    name: cordbrief_exchange
+  # Collector-private Discord profile & keyring
+  cordbrief_discord_profile:
+    name: cordbrief_discord_profile
+  cordbrief_discord_keyring:
+    name: cordbrief_discord_keyring
+  # Core-private application data
+  cordbrief_core_data:
+    name: cordbrief_core_data

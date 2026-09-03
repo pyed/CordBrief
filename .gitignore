@@ -15,8 +15,6 @@ build/
 
 # Node / JS dependencies and build products
 node_modules/
-package-lock.json
-pnpm-lock.yaml
 
 # Local configs and secrets (must never be committed)
 config.json
