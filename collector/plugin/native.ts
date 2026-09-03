@@ -18,7 +18,7 @@ export interface CollectorStatusRecord {
     version: number;
     updated_at: string;
     collector_state: "starting" | "running" | "error";
-    discord_authenticated: boolean;
+    discord_authenticated: boolean | null;
     watched_generation: number;
     watched_channel_count: number;
     active_segment: number;
@@ -52,6 +52,7 @@ let currentSegmentPath = "";
 let currentSegmentSize = 0;
 let lastEventTime: string | null = null;
 let lastErrorMsg: string | null = null;
+let discordAuthenticatedState: boolean | null = null;
 
 // In-memory cached watchlist
 let cachedWatchlist: WatchlistConfig = { valid: false, generation: -1, channel_ids: [] };
@@ -238,14 +239,17 @@ export function loadWatchlist(): WatchlistConfig {
 }
 
 // Safe update of collector-status.json
-export function writeStatus(state: "starting" | "running" | "error" = "running", authenticated = true): void {
+export function writeStatus(state: "starting" | "running" | "error" = "running", authenticated?: boolean | null): void {
     try {
+        if (typeof authenticated !== "undefined") {
+            discordAuthenticatedState = authenticated;
+        }
         const wl = loadWatchlist();
         const statusRecord: CollectorStatusRecord = {
             version: 1,
             updated_at: new Date().toISOString(),
             collector_state: state,
-            discord_authenticated: authenticated,
+            discord_authenticated: discordAuthenticatedState,
             watched_generation: wl.generation,
             watched_channel_count: wl.valid ? wl.channel_ids.length : 0,
             active_segment: currentSegmentNumber,
@@ -259,6 +263,12 @@ export function writeStatus(state: "starting" | "running" | "error" = "running",
 }
 
 // IPC Handlers callable from renderer userplugin
+
+export async function reportAuthState(_: IpcMainInvokeEvent, auth: boolean | null): Promise<boolean> {
+    discordAuthenticatedState = auth;
+    writeStatus("running", auth);
+    return true;
+}
 
 export async function getWatchlistConfig(_?: IpcMainInvokeEvent): Promise<WatchlistConfig> {
     return loadWatchlist();

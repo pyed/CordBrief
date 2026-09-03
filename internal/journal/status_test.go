@@ -28,7 +28,7 @@ func TestStatus_ReadCollectorStatus(t *testing.T) {
 		t.Fatalf("ReadCollectorStatus error: %v", err)
 	}
 
-	if st.Version != 1 || st.CollectorState != "running" || !st.DiscordAuthenticated || st.WatchedGeneration != 42 || st.ActiveSegment != 3 {
+	if st.Version != 1 || st.CollectorState != "running" || st.DiscordAuthenticated == nil || !*st.DiscordAuthenticated || st.WatchedGeneration != 42 || st.ActiveSegment != 3 {
 		t.Fatalf("unexpected collector status values: %+v", st)
 	}
 

@@ -239,3 +239,78 @@ func TestCLI_HelpAndUsage(t *testing.T) {
 		t.Errorf("expected unknown command error, got: %s", stderr.String())
 	}
 }
+
+func TestCLI_Exchange(t *testing.T) {
+	tmpDir := t.TempDir()
+	eventsDir := filepath.Join(tmpDir, "events")
+	if err := os.MkdirAll(eventsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Write watchlist via CLI
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"exchange", "write-watchlist", "-exchange-dir=" + tmpDir, "-generation=1", "-channels=ch-a,ch-b"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("write-watchlist failed with code %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "[PASS] Watchlist written: generation 1, 2 channels") {
+		t.Fatalf("unexpected write-watchlist output: %s", stdout.String())
+	}
+
+	// 2. Read watchlist via CLI
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"exchange", "read-watchlist", "-exchange-dir=" + tmpDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("read-watchlist failed with code %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Watchlist Generation: 1") || !strings.Contains(stdout.String(), "ch-a") {
+		t.Fatalf("unexpected read-watchlist output: %s", stdout.String())
+	}
+
+	// 3. Populate a test segment file
+	seg1 := filepath.Join(eventsDir, "0000000000000001.ndjson")
+	eventLine := []byte(`{"version":1,"event":"message_create","message_id":"msg-101","guild_id":"g1","channel_id":"ch-a","timestamp":"2026-09-03T12:00:00Z","captured_at":"2026-09-03T12:00:00Z","author":{"id":"u1","name":"alice","display_name":"Alice","bot":false},"content":"hello"}` + "\n")
+	if err := os.WriteFile(seg1, eventLine, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 4. Ingest without commit (dry-run)
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"exchange", "ingest", "-exchange-dir=" + tmpDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("ingest dry-run failed with code %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Events Read: 1") || !strings.Contains(stdout.String(), "Dry-run read: cursor not committed") {
+		t.Fatalf("unexpected dry-run output: %s", stdout.String())
+	}
+
+	// Cursor should still be default because it was not committed
+	ackFile := filepath.Join(tmpDir, "core-ack.json")
+	if _, err := os.Stat(ackFile); !os.IsNotExist(err) {
+		t.Fatal("expected core-ack.json to NOT exist after dry run")
+	}
+
+	// 5. Ingest with commit
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"exchange", "ingest", "-exchange-dir=" + tmpDir, "-commit"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("ingest with commit failed with code %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Events Read: 1") || !strings.Contains(stdout.String(), "[PASS] Committed new cursor to core-ack.json") {
+		t.Fatalf("unexpected committed ingest output: %s", stdout.String())
+	}
+
+	// 6. Ingest again immediately (should return 0 events)
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"exchange", "ingest", "-exchange-dir=" + tmpDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("second ingest failed with code %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "Events Read: 0") {
+		t.Fatalf("expected 0 events on second ingest, got: %s", stdout.String())
+	}
+}

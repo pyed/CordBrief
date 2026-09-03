@@ -78,7 +78,7 @@ type CollectorStatus struct {
 	Version              int        `json:"version"`
 	UpdatedAt            time.Time  `json:"updated_at"`
 	CollectorState       string     `json:"collector_state"`
-	DiscordAuthenticated bool       `json:"discord_authenticated"`
+	DiscordAuthenticated *bool      `json:"discord_authenticated"`
 	WatchedGeneration    int64      `json:"watched_generation"`
 	WatchedChannelCount  int        `json:"watched_channel_count"`
 	ActiveSegment        uint64     `json:"active_segment"`

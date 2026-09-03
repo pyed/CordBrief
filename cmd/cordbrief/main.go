@@ -6,12 +6,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strings"
 	"time"
 
 	"cordbrief/internal/config"
 	"cordbrief/internal/discord"
+	"cordbrief/internal/journal"
 )
 
 const Version = "v0.1.0-dev"
@@ -48,6 +50,9 @@ func Run(args []string, stdout, stderr io.Writer) int {
 
 	case "channels":
 		return runChannels(subArgs, stdout, stderr)
+
+	case "exchange":
+		return runExchange(subArgs, stdout, stderr)
 
 	case "doctor":
 		return runDoctor(subArgs, stdout, stderr)
@@ -253,6 +258,160 @@ func runDoctor(args []string, stdout, stderr io.Writer) int {
 	return 0
 }
 
+func getExchangeDir(flagVal string) string {
+	if flagVal != "" {
+		return flagVal
+	}
+	if env := os.Getenv("CORDBRIEF_EXCHANGE_DIR"); env != "" {
+		return env
+	}
+	return "/var/cordbrief/exchange"
+}
+
+func runExchange(args []string, stdout, stderr io.Writer) int {
+	if len(args) == 0 {
+		fmt.Fprintln(stderr, "error: missing exchange subcommand (write-watchlist, read-watchlist, status, ingest)")
+		return 1
+	}
+
+	sub := args[0]
+	subArgs := args[1:]
+
+	switch sub {
+	case "write-watchlist":
+		fs := flag.NewFlagSet("exchange write-watchlist", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		dirFlag := fs.String("exchange-dir", "", "path to exchange directory")
+		genFlag := fs.Int64("generation", 1, "watchlist generation number")
+		channelsFlag := fs.String("channels", "", "comma-separated channel IDs")
+		if err := fs.Parse(subArgs); err != nil {
+			return 2
+		}
+		if *channelsFlag == "" {
+			fmt.Fprintln(stderr, "error: --channels is required (comma-separated IDs)")
+			return 1
+		}
+		rawIDs := strings.Split(*channelsFlag, ",")
+		w := &journal.Watchlist{
+			Version:    journal.CurrentSchemaVersion,
+			Generation: *genFlag,
+			ChannelIDs: rawIDs,
+		}
+		targetPath := filepath.Join(getExchangeDir(*dirFlag), journal.DefaultWatchlistFilename)
+		if err := journal.WriteWatchlist(targetPath, w); err != nil {
+			fmt.Fprintf(stderr, "error writing watchlist: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "[PASS] Watchlist written: generation %d, %d channels -> %s\n", w.Generation, len(w.ChannelIDs), targetPath)
+		return 0
+
+	case "read-watchlist":
+		fs := flag.NewFlagSet("exchange read-watchlist", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		dirFlag := fs.String("exchange-dir", "", "path to exchange directory")
+		if err := fs.Parse(subArgs); err != nil {
+			return 2
+		}
+		targetPath := filepath.Join(getExchangeDir(*dirFlag), journal.DefaultWatchlistFilename)
+		w, err := journal.ReadWatchlist(targetPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "error reading watchlist: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Watchlist Generation: %d\n", w.Generation)
+		fmt.Fprintf(stdout, "Channel Count: %d\n", len(w.ChannelIDs))
+		for i, ch := range w.ChannelIDs {
+			fmt.Fprintf(stdout, "  [%d] %s\n", i+1, ch)
+		}
+		return 0
+
+	case "status":
+		fs := flag.NewFlagSet("exchange status", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		dirFlag := fs.String("exchange-dir", "", "path to exchange directory")
+		if err := fs.Parse(subArgs); err != nil {
+			return 2
+		}
+		targetPath := filepath.Join(getExchangeDir(*dirFlag), journal.DefaultStatusFilename)
+		st, err := journal.ReadCollectorStatus(targetPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "error reading collector status: %v\n", err)
+			return 1
+		}
+		authStr := "unknown"
+		if st.DiscordAuthenticated != nil {
+			authStr = fmt.Sprintf("%t", *st.DiscordAuthenticated)
+		}
+		fmt.Fprintf(stdout, "Collector State:       %s\n", st.CollectorState)
+		fmt.Fprintf(stdout, "Discord Authenticated: %s\n", authStr)
+		fmt.Fprintf(stdout, "Watched Generation:    %d\n", st.WatchedGeneration)
+		fmt.Fprintf(stdout, "Watched Channel Count: %d\n", st.WatchedChannelCount)
+		fmt.Fprintf(stdout, "Active Segment:        %d\n", st.ActiveSegment)
+		fmt.Fprintf(stdout, "Updated At:            %s\n", st.UpdatedAt.Format(time.RFC3339))
+		if st.LastEventAt != nil {
+			fmt.Fprintf(stdout, "Last Event At:         %s\n", st.LastEventAt.Format(time.RFC3339))
+		}
+		return 0
+
+	case "ingest":
+		fs := flag.NewFlagSet("exchange ingest", flag.ContinueOnError)
+		fs.SetOutput(stderr)
+		dirFlag := fs.String("exchange-dir", "", "path to exchange directory")
+		limitFlag := fs.Int("limit", 100, "maximum events to read in batch")
+		commitFlag := fs.Bool("commit", false, "commit advanced cursor to core-ack.json after reading")
+		if err := fs.Parse(subArgs); err != nil {
+			return 2
+		}
+
+		exchangeDir := getExchangeDir(*dirFlag)
+		ackPath := filepath.Join(exchangeDir, journal.DefaultAckFilename)
+		eventsDir := filepath.Join(exchangeDir, "events")
+
+		cur, err := journal.LoadCursor(ackPath)
+		if err != nil {
+			fmt.Fprintf(stderr, "error loading cursor: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Cursor Before: segment=%d, offset=%d\n", cur.Segment, cur.Offset)
+
+		wm, err := journal.CaptureWatermark(eventsDir)
+		if err != nil {
+			fmt.Fprintf(stderr, "error capturing watermark: %v\n", err)
+			return 1
+		}
+		fmt.Fprintf(stdout, "Watermark: max_segment=%d, total_segments=%d\n", wm.MaxSegment, len(wm.Segments))
+
+		reader := journal.NewReader(eventsDir, wm)
+		records, nextCur, err := reader.ReadBatch(*cur, *limitFlag)
+		if err != nil {
+			fmt.Fprintf(stderr, "error reading batch: %v\n", err)
+			return 1
+		}
+
+		fmt.Fprintf(stdout, "Events Read: %d\n", len(records))
+		for i, rec := range records {
+			fmt.Fprintf(stdout, "  [%d] msg_id=%s ch_id=%s author=%s (seg=%d, off=%d, next_off=%d)\n",
+				i+1, rec.Event.MessageID, rec.Event.ChannelID, rec.Event.Author.Name, rec.Segment, rec.Offset, rec.NextOffset)
+		}
+		fmt.Fprintf(stdout, "Cursor After:  segment=%d, offset=%d\n", nextCur.Segment, nextCur.Offset)
+
+		if *commitFlag {
+			if err := journal.SaveCursor(ackPath, &nextCur); err != nil {
+				fmt.Fprintf(stderr, "error committing cursor: %v\n", err)
+				return 1
+			}
+			fmt.Fprintln(stdout, "[PASS] Committed new cursor to core-ack.json")
+		} else {
+			fmt.Fprintln(stdout, "[NOTE] Dry-run read: cursor not committed")
+		}
+		return 0
+
+	default:
+		fmt.Fprintf(stderr, "error: unknown exchange subcommand %q\n", sub)
+		return 1
+	}
+}
+
 func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "CordBrief: A tiny, self-hosted Discord daily-digest application")
 	fmt.Fprintln(w, "")
@@ -262,6 +421,7 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "Commands:")
 	fmt.Fprintln(w, "  doctor      Validate config, Discord permissions, and LLM connectivity")
 	fmt.Fprintln(w, "  channels    List guild channels to assist with configuration")
+	fmt.Fprintln(w, "  exchange    Manage exchange watchlist, inspect status, and ingest events")
 	fmt.Fprintln(w, "  run         Execute a digest cycle (supports --dry-run)")
 	fmt.Fprintln(w, "  serve       Run the scheduled digest service")
 	fmt.Fprintln(w, "  version     Print version information")

@@ -122,9 +122,32 @@ export default definePlugin({
 
     start() {
         console.log("[CordBrief] Production Collector plugin initialized.");
+        const checkAndReportAuth = () => {
+            try {
+                if (typeof window !== "undefined" && window.location) {
+                    const path = window.location.pathname || "";
+                    if (path.startsWith("/channels")) {
+                        Native.reportAuthState(true);
+                    } else if (path.startsWith("/login") || path.startsWith("/register")) {
+                        Native.reportAuthState(false);
+                    } else {
+                        Native.reportAuthState(null);
+                    }
+                }
+            } catch {
+                // Ignore during early startup
+            }
+        };
+
+        checkAndReportAuth();
+        const authInterval = setInterval(checkAndReportAuth, 5000);
+        (this as any)._authInterval = authInterval;
     },
 
     stop() {
         console.log("[CordBrief] Production Collector plugin stopped.");
+        if ((this as any)._authInterval) {
+            clearInterval((this as any)._authInterval);
+        }
     }
 });

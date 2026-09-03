@@ -221,3 +221,30 @@ To prevent race conditions with in-flight collector writes during batch processi
    - Container reboots directly into the authenticated session with Vencord + `CordBriefCollector` loaded.
    - No browser client needs to remain attached.
    - The collector monitors Gateway `MESSAGE_CREATE` events in the background, applies `watchlist.json`, and writes segments to `/var/cordbrief/exchange/events/`.
+
+---
+
+## 8. Operational Telemetry & Authentication Status
+
+In `collector-status.json`, the field `discord_authenticated` is a nullable boolean (`true`, `false`, or `null`):
+- `true`: The collector renderer observes that Discord is currently mounted and active on the authenticated app route (`window.location.pathname.startsWith("/channels")`).
+- `false`: The collector renderer observes an explicit unauthenticated route (`/login` or `/register`).
+- `null`: Indeterminate or initial startup state before renderer route observation.
+
+> [!NOTE]
+> This is an **operational observation** of the client's rendered application route, **not** a cryptographic token inspection or verification. CordBrief deliberately avoids inspecting, extracting, or validating private Discord authentication tokens.
+
+---
+
+## 9. Known Future Hardening Items
+
+The following architectural items are intentionally deferred beyond the foundational milestones:
+
+1. **Electron Sandbox Hardening**: The production collector currently executes with `ELECTRON_DISABLE_SANDBOX=1` to allow Discord and updater relaunches inside standard unprivileged Docker containers. Future hardening should evaluate Linux user namespaces (`CLONE_NEWUSER`) or explicit unprivileged sandbox capabilities (`SYS_ADMIN` / seccomp filters).
+2. **Journal Retention & Garbage Collection**: Segments are append-only and monotonically numbered. A future lifecycle worker will safely delete segments where `segment < core_committed_segment` and older than the raw-message retention policy.
+3. **History Gap Recovery Across Downtime**: If the collector container is stopped during message delivery, Discord Gateway does not backfill missed events upon reconnect. A gap-recovery mechanism will be evaluated.
+4. **Discord Reauthentication Lifecycle**: Handling session expiration or credential revocation through automated notification or health alerts rather than manual inspection.
+5. **Discord & Vencord Update Lifecycle**: Automating upstream Discord `.deb` updates and Vencord git bumps without manual container rebuilds.
+6. **Production Image Optimization**: Multi-stage image minimization to prune intermediate Node/pnpm build caches and unneeded build tools from the final collector image.
+7. **Channel Catalog Live Publication**: The `catalog.json` schema and reader are implemented; live in-process extraction via Discord client stores is deferred to future UI milestones.
+8. **Long-Duration Soak Testing**: Multi-day stress testing under high-traffic multi-guild scenarios.
