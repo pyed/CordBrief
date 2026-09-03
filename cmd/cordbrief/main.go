@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"errors"
+	"net/http"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -16,6 +18,7 @@ import (
 	"cordbrief/internal/discord"
 	"cordbrief/internal/journal"
 	"cordbrief/internal/llm"
+	"cordbrief/internal/web"
 )
 
 const Version = "v0.1.0-dev"
@@ -74,14 +77,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return 1
 
 	case "serve":
-		fs := flag.NewFlagSet("serve", flag.ContinueOnError)
-		fs.SetOutput(stderr)
-		_ = fs.String("config", "config.json", "path to configuration file")
-		if err := fs.Parse(subArgs); err != nil {
-			return 2
-		}
-		fmt.Fprintln(stderr, "error: 'serve' is not implemented in Milestone 2")
-		return 1
+		return runServe(subArgs, stdout, stderr)
 
 	case "help", "-help", "--help", "-h":
 		printUsage(stdout)
@@ -349,6 +345,12 @@ func runExchange(args []string, stdout, stderr io.Writer) int {
 		}
 		fmt.Fprintf(stdout, "Collector State:       %s\n", st.CollectorState)
 		fmt.Fprintf(stdout, "Discord Authenticated: %s\n", authStr)
+		if st.CatalogState != "" {
+			fmt.Fprintf(stdout, "Catalog State:         %s\n", st.CatalogState)
+		}
+		if st.CatalogUpdatedAt != nil {
+			fmt.Fprintf(stdout, "Catalog Updated At:    %s\n", st.CatalogUpdatedAt.Format(time.RFC3339))
+		}
 		fmt.Fprintf(stdout, "Watched Generation:    %d\n", st.WatchedGeneration)
 		fmt.Fprintf(stdout, "Watched Channel Count: %d\n", st.WatchedChannelCount)
 		fmt.Fprintf(stdout, "Active Segment:        %d\n", st.ActiveSegment)
@@ -623,6 +625,65 @@ func printUsage(w io.Writer) {
 	fmt.Fprintln(w, "  exchange    Manage exchange watchlist, inspect status, and ingest events")
 	fmt.Fprintln(w, "  digest      Generate structured digest from exchange journal (preview, run, test-llm)")
 	fmt.Fprintln(w, "  run         Execute a digest cycle (supports --dry-run)")
-	fmt.Fprintln(w, "  serve       Run the scheduled digest service")
+	fmt.Fprintln(w, "  serve       Run the web setup control plane")
 	fmt.Fprintln(w, "  version     Print version information")
+}
+
+func runServe(args []string, stdout, stderr io.Writer) int {
+	defaultAddr := "127.0.0.1"
+	if env := os.Getenv("CORDBRIEF_HTTP_ADDR"); env != "" {
+		defaultAddr = env
+	} else if os.Getenv("CORDBRIEF_DATA_DIR") != "" || os.Getenv("CORDBRIEF_EXCHANGE_DIR") != "" {
+		// Inside Docker container, bind to 0.0.0.0 so host port mapping (127.0.0.1:8080:8080) can forward traffic
+		defaultAddr = "0.0.0.0"
+	}
+
+	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	addrFlag := fs.String("addr", defaultAddr, "HTTP listen address")
+	portFlag := fs.Int("port", 8080, "HTTP listen port")
+	cfgPath := fs.String("config", "config.json", "path to configuration file")
+	exchangeDir := fs.String("exchange-dir", "", "path to exchange directory")
+	dataDir := fs.String("data-dir", "", "path to data directory")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	actualDataDir := getDataDir(*dataDir)
+	actualExchangeDir := getExchangeDir(*exchangeDir)
+
+	store, err := config.NewStore(actualDataDir, *cfgPath)
+	if err != nil {
+		fmt.Fprintf(stderr, "error initializing config store: %v\n", err)
+		return 1
+	}
+
+	server, err := web.NewServer(web.ServerOptions{
+		ExchangeDir: actualExchangeDir,
+		DataDir:     actualDataDir,
+		Store:       store,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "error initializing web server: %v\n", err)
+		return 1
+	}
+
+	listenAddr := fmt.Sprintf("%s:%d", *addrFlag, *portFlag)
+	fmt.Fprintf(stdout, "Starting CordBrief Setup Control Plane on http://%s\n", listenAddr)
+	fmt.Fprintf(stdout, "Exchange directory: %s\n", actualExchangeDir)
+	fmt.Fprintf(stdout, "Data directory:     %s\n", actualDataDir)
+
+	httpServer := &http.Server{
+		Addr:         listenAddr,
+		Handler:      server,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 60 * time.Second,
+	}
+
+	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		fmt.Fprintf(stderr, "server error: %v\n", err)
+		return 1
+	}
+	return 0
 }

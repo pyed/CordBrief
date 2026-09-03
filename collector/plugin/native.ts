@@ -19,6 +19,8 @@ export interface CollectorStatusRecord {
     updated_at: string;
     collector_state: "starting" | "running" | "error";
     discord_authenticated: boolean | null;
+    catalog_state: "unavailable" | "ready" | "error";
+    catalog_updated_at: string | null;
     watched_generation: number;
     watched_channel_count: number;
     active_segment: number;
@@ -26,18 +28,20 @@ export interface CollectorStatusRecord {
     last_error: string | null;
 }
 
+export interface CatalogChannel {
+    id: string;
+    name: string;
+    type: number;
+}
+
 export interface CatalogGuild {
-    guild_id: string;
-    guild_name: string;
-    channels: Array<{
-        channel_id: string;
-        channel_name: string;
-        channel_type: string;
-    }>;
+    id: string;
+    name: string;
+    channels: CatalogChannel[];
 }
 
 export interface CatalogRecord {
-    version: number;
+    version: 1;
     updated_at: string;
     guilds: CatalogGuild[];
 }
@@ -53,6 +57,9 @@ let currentSegmentSize = 0;
 let lastEventTime: string | null = null;
 let lastErrorMsg: string | null = null;
 let discordAuthenticatedState: boolean | null = null;
+let catalogState: "unavailable" | "ready" | "error" = "unavailable";
+let catalogUpdatedAt: string | null = null;
+let lastCatalogContentHash = "";
 
 // In-memory cached watchlist
 let cachedWatchlist: WatchlistConfig = { valid: false, generation: -1, channel_ids: [] };
@@ -250,6 +257,8 @@ export function writeStatus(state: "starting" | "running" | "error" = "running",
             updated_at: new Date().toISOString(),
             collector_state: state,
             discord_authenticated: discordAuthenticatedState,
+            catalog_state: catalogState,
+            catalog_updated_at: catalogUpdatedAt,
             watched_generation: wl.generation,
             watched_channel_count: wl.valid ? wl.channel_ids.length : 0,
             active_segment: currentSegmentNumber,
@@ -307,15 +316,64 @@ export async function appendEventToJournal(_: IpcMainInvokeEvent, eventJson: str
 
 export async function publishCatalog(_: IpcMainInvokeEvent, guilds: CatalogGuild[]): Promise<boolean> {
     try {
+        if (!Array.isArray(guilds)) {
+            catalogState = "error";
+            lastErrorMsg = "publishCatalog received invalid non-array payload";
+            writeStatus();
+            return false;
+        }
+
+        // Validate and clean guilds and channels
+        const validatedGuilds: CatalogGuild[] = [];
+        for (const g of guilds) {
+            if (!g || typeof g.id !== "string" || !g.id || typeof g.name !== "string") continue;
+            const validChannels: CatalogChannel[] = [];
+            for (const ch of (g.channels || [])) {
+                if (!ch || typeof ch.id !== "string" || !ch.id || typeof ch.name !== "string") continue;
+                validChannels.push({
+                    id: ch.id,
+                    name: ch.name,
+                    type: typeof ch.type === "number" ? ch.type : 0
+                });
+            }
+            // Deterministic sort: channels by name then ID
+            validChannels.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+            validatedGuilds.push({
+                id: g.id,
+                name: g.name,
+                channels: validChannels
+            });
+        }
+
+        // Deterministic sort: guilds by name then ID
+        validatedGuilds.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+
+        const canonicalPayload = JSON.stringify(validatedGuilds);
+        const catalogPath = path.join(EXCHANGE_DIR, "catalog.json");
+
+        // Avoid rewriting catalog.json and status continuously when nothing changed
+        if (canonicalPayload === lastCatalogContentHash && fs.existsSync(catalogPath)) {
+            catalogState = "ready";
+            return true;
+        }
+
+        const now = new Date().toISOString();
         const record: CatalogRecord = {
             version: 1,
-            updated_at: new Date().toISOString(),
-            guilds: guilds || []
+            updated_at: now,
+            guilds: validatedGuilds
         };
-        safeReplaceJSON(path.join(EXCHANGE_DIR, "catalog.json"), record);
+
+        safeReplaceJSON(catalogPath, record);
+        lastCatalogContentHash = canonicalPayload;
+        catalogState = "ready";
+        catalogUpdatedAt = now;
+        writeStatus();
         return true;
     } catch (err: any) {
+        catalogState = "error";
         lastErrorMsg = `publishCatalog failed: ${err?.message || String(err)}`;
+        writeStatus();
         return false;
     }
 }

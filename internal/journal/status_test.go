@@ -15,6 +15,8 @@ func TestStatus_ReadCollectorStatus(t *testing.T) {
   "updated_at": "2026-09-03T12:00:00Z",
   "collector_state": "running",
   "discord_authenticated": true,
+  "catalog_state": "ready",
+  "catalog_updated_at": "2026-09-03T12:00:00Z",
   "watched_generation": 42,
   "watched_channel_count": 2,
   "active_segment": 3
@@ -28,7 +30,7 @@ func TestStatus_ReadCollectorStatus(t *testing.T) {
 		t.Fatalf("ReadCollectorStatus error: %v", err)
 	}
 
-	if st.Version != 1 || st.CollectorState != "running" || st.DiscordAuthenticated == nil || !*st.DiscordAuthenticated || st.WatchedGeneration != 42 || st.ActiveSegment != 3 {
+	if st.Version != 1 || st.CollectorState != "running" || st.DiscordAuthenticated == nil || !*st.DiscordAuthenticated || st.CatalogState != "ready" || st.CatalogUpdatedAt == nil || st.WatchedGeneration != 42 || st.ActiveSegment != 3 {
 		t.Fatalf("unexpected collector status values: %+v", st)
 	}
 

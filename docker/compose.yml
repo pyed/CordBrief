@@ -42,6 +42,9 @@ services:
     depends_on:
       - cordbrief-collector
     user: "1000:1000"
+    command: ["serve"]
+    ports:
+      - "127.0.0.1:8080:8080"
     environment:
       - CORDBRIEF_EXCHANGE_DIR=/var/cordbrief/exchange
       - CORDBRIEF_DATA_DIR=/var/cordbrief/data

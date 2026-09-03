@@ -220,6 +220,116 @@ assert(seg2Lines.some(l => JSON.parse(l).message_id === "m6"), "Record m6 was ap
 
 console.log("  ✔ Crash recovery on torn record verified (zero record merging).");
 
+// 4. Test Catalog Validation, Deduplication & Atomic Publication
+console.log("[Test 4] Catalog Validation, Deduplication & Atomic Publication...");
+
+const catalogFile = path.join(exchangeDir, "catalog.json");
+let lastCatalogContentHash = "";
+
+function safeReplaceJSON(destinationPath, data) {
+    const dir = path.dirname(destinationPath);
+    if (!fs.existsSync(dir)) {
+        fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
+    }
+    const tmpPath = path.join(dir, `.${path.basename(destinationPath)}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`);
+    const payload = JSON.stringify(data, null, 2) + "\n";
+    const fd = fs.openSync(tmpPath, "w", 0o644);
+    try {
+        fs.writeSync(fd, payload);
+        fs.fsyncSync(fd);
+    } finally {
+        fs.closeSync(fd);
+    }
+    fs.renameSync(tmpPath, destinationPath);
+}
+
+function publishCatalog(guilds) {
+    if (!Array.isArray(guilds)) {
+        return false;
+    }
+    const validatedGuilds = [];
+    for (const g of guilds) {
+        if (!g || typeof g.id !== "string" || !g.id || typeof g.name !== "string") continue;
+        const validChannels = [];
+        for (const ch of (g.channels || [])) {
+            if (!ch || typeof ch.id !== "string" || !ch.id || typeof ch.name !== "string") continue;
+            validChannels.push({
+                id: ch.id,
+                name: ch.name,
+                type: typeof ch.type === "number" ? ch.type : 0
+            });
+        }
+        validChannels.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+        validatedGuilds.push({
+            id: g.id,
+            name: g.name,
+            channels: validChannels
+        });
+    }
+    validatedGuilds.sort((a, b) => a.name.localeCompare(b.name) || a.id.localeCompare(b.id));
+
+    const canonicalPayload = JSON.stringify(validatedGuilds);
+    if (canonicalPayload === lastCatalogContentHash && fs.existsSync(catalogFile)) {
+        return true; // deduplicated, no write
+    }
+
+    const record = {
+        version: 1,
+        updated_at: new Date().toISOString(),
+        guilds: validatedGuilds
+    };
+    safeReplaceJSON(catalogFile, record);
+    lastCatalogContentHash = canonicalPayload;
+    return true;
+}
+
+// A. Publish valid catalog
+const sampleGuilds = [
+    {
+        id: "g2",
+        name: "Beta Guild",
+        channels: [
+            { id: "c2", name: "general", type: 0 },
+            { id: "c1", name: "announcements", type: 5 }
+        ]
+    },
+    {
+        id: "g1",
+        name: "Alpha Guild",
+        channels: [
+            { id: "c3", name: "chat", type: 0 }
+        ]
+    }
+];
+
+const ok = publishCatalog(sampleGuilds);
+assert.strictEqual(ok, true, "Publish must succeed");
+assert(fs.existsSync(catalogFile), "catalog.json must exist");
+
+const parsedCat = JSON.parse(fs.readFileSync(catalogFile, "utf8"));
+assert.strictEqual(parsedCat.version, 1);
+assert.strictEqual(parsedCat.guilds.length, 2);
+// Verified deterministic sorting: Alpha Guild before Beta Guild
+assert.strictEqual(parsedCat.guilds[0].name, "Alpha Guild");
+assert.strictEqual(parsedCat.guilds[1].name, "Beta Guild");
+// Verified channel sorting: announcements before general
+assert.strictEqual(parsedCat.guilds[1].channels[0].name, "announcements");
+assert.strictEqual(parsedCat.guilds[1].channels[1].name, "general");
+
+// B. Deduplication: second publish of identical content does NOT rewrite
+const statBefore = fs.statSync(catalogFile);
+const ok2 = publishCatalog(sampleGuilds);
+assert.strictEqual(ok2, true);
+const statAfter = fs.statSync(catalogFile);
+assert.strictEqual(statBefore.mtimeMs, statAfter.mtimeMs, "Deduplication must avoid rewrite when unchanged");
+
+// C. Malformed payload rejected without corrupting existing catalog
+const okFail = publishCatalog("not an array");
+assert.strictEqual(okFail, false, "Malformed payload must fail");
+const catIntact = JSON.parse(fs.readFileSync(catalogFile, "utf8"));
+assert.strictEqual(catIntact.version, 1, "Catalog remains valid after bad payload");
+console.log("  ✔ Catalog validation, deduplication & atomic publication verified.");
+
 // Cleanup
 fs.rmSync(testDir, { recursive: true, force: true });
 console.log("=== All Enhanced Collector Tests: PASSED ===\n");

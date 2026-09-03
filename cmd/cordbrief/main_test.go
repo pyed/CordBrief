@@ -28,7 +28,7 @@ func TestCLI_Version(t *testing.T) {
 }
 
 func TestCLI_UnimplementedCommands(t *testing.T) {
-	commands := []string{"run", "serve"}
+	commands := []string{"run"}
 
 	for _, cmd := range commands {
 		t.Run(cmd, func(t *testing.T) {
@@ -383,3 +383,15 @@ func TestCLI_Digest(t *testing.T) {
 		t.Fatalf("expected no new events output, got: %s", stdout.String())
 	}
 }
+
+func TestCLI_ServeUsage(t *testing.T) {
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"help"}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("help failed with code %d: %s", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "serve       Run the web setup control plane") {
+		t.Errorf("usage missing serve command: %s", stdout.String())
+	}
+}
+

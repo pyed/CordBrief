@@ -122,12 +122,59 @@ export default definePlugin({
 
     start() {
         console.log("[CordBrief] Production Collector plugin initialized.");
+
+        const extractAndPublishCatalog = async () => {
+            try {
+                const W = (window as any).Vencord?.Webpack;
+                if (!W) return;
+                const GuildStore = W.findStore("GuildStore");
+                const ChannelStore = W.findStore("ChannelStore");
+                if (!GuildStore || !ChannelStore || !GuildStore.getGuilds) return;
+
+                const guildsObj = GuildStore.getGuilds();
+                if (!guildsObj) return;
+
+                const guildsList = Object.values(guildsObj) as any[];
+                const catalogGuilds: NativeTypes.CatalogGuild[] = [];
+
+                for (const g of guildsList) {
+                    if (!g || !g.id || !g.name) continue;
+                    let channels: NativeTypes.CatalogChannel[] = [];
+                    if (ChannelStore.getMutableGuildChannelsForGuild) {
+                        const map = ChannelStore.getMutableGuildChannelsForGuild(g.id);
+                        if (map) {
+                            channels = (Object.values(map) as any[])
+                                .filter(c => c && (c.type === 0 || c.type === 5)) // text or announcement only
+                                .map(c => ({
+                                    id: String(c.id),
+                                    name: String(c.name || "unnamed"),
+                                    type: Number(c.type) || 0
+                                }));
+                        }
+                    }
+                    catalogGuilds.push({
+                        id: String(g.id),
+                        name: String(g.name),
+                        channels
+                    });
+                }
+
+                if (catalogGuilds.length > 0) {
+                    await Native.publishCatalog(catalogGuilds);
+                }
+            } catch (err) {
+                console.error("[CordBrief] Catalog extraction error:", err);
+            }
+        };
+
         const checkAndReportAuth = () => {
             try {
                 if (typeof window !== "undefined" && window.location) {
                     const path = window.location.pathname || "";
                     if (path.startsWith("/channels")) {
                         Native.reportAuthState(true);
+                        // Trigger catalog extraction once authenticated
+                        extractAndPublishCatalog();
                     } else if (path.startsWith("/login") || path.startsWith("/register")) {
                         Native.reportAuthState(false);
                     } else {
@@ -141,13 +188,19 @@ export default definePlugin({
 
         checkAndReportAuth();
         const authInterval = setInterval(checkAndReportAuth, 5000);
+        const catalogInterval = setInterval(extractAndPublishCatalog, 30000);
+
         (this as any)._authInterval = authInterval;
+        (this as any)._catalogInterval = catalogInterval;
     },
 
     stop() {
         console.log("[CordBrief] Production Collector plugin stopped.");
         if ((this as any)._authInterval) {
             clearInterval((this as any)._authInterval);
+        }
+        if ((this as any)._catalogInterval) {
+            clearInterval((this as any)._catalogInterval);
         }
     }
 });
