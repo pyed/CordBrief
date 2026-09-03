@@ -1,0 +1,68 @@
+# Binaries and compiled products
+bin/
+dist/
+build/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/cordbrief
+
+# Go test and coverage artifacts
+*.out
+*.test
+
+# Node / JS dependencies and build products
+node_modules/
+package-lock.json
+pnpm-lock.yaml
+
+# Local configs and secrets (must never be committed)
+config.json
+.env
+.env.*
+!.env.example
+
+# State, journals, and runtime data
+cordbrief-state*.json
+*.ndjson
+*.log
+*.tmp
+*.temp
+
+# Discord and Desktop runtime state (if mounted or dropped locally)
+.config/
+keyrings/
+Crashpad/
+Local Storage/
+Session Storage/
+Cache/
+GPUCache/
+Cookies*
+
+# Diagnostic image captures and screenshots
+*.png
+*.jpg
+*.jpeg
+*.gif
+*.webp
+
+# Editor and IDE caches
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Operating system artifacts
+.DS_Store
+Thumbs.db
+ehthumbs.db
+[Dd]esktop.ini
+
+# Agent / unlazy local caches and locks
+.agents/
+.unlazy/
+.unlazy-hook-state.json
+.claude/
