@@ -69,6 +69,12 @@ type Batch struct {
 	SourceMap           map[string]SourceMessage `json:"source_map"`
 }
 
+// TriggerInfo records whether the digest was initiated manually or by the daily scheduler.
+type TriggerInfo struct {
+	Type   string `json:"type"`              // "scheduled" or "manual"
+	SlotID string `json:"slot_id,omitempty"` // e.g. "Asia/Riyadh/2026-09-04/08:00"
+}
+
 // Artifact represents the durable on-disk record of a completed digest.
 type Artifact struct {
 	Version              int            `json:"version"`
@@ -80,5 +86,6 @@ type Artifact struct {
 	IncludedMessageCount int            `json:"included_message_count"`
 	Provider             string         `json:"provider"`
 	Model                string         `json:"model"`
+	Trigger              *TriggerInfo   `json:"trigger,omitempty"`
 	Digest               *Digest        `json:"digest"`
 }

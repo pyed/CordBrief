@@ -9,6 +9,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"cordbrief/internal/config"
 	"cordbrief/internal/llm"
@@ -405,5 +406,427 @@ func TestServer_ContentTypeValidation(t *testing.T) {
 
 	if rec.Code != http.StatusUnsupportedMediaType {
 		t.Fatalf("expected 415 Unsupported Media Type, got %d", rec.Code)
+	}
+}
+
+func TestServer_Inbox_EmptyAndPopulated(t *testing.T) {
+	srv, _, dataDir := setupTestEnv(t)
+	digestsDir := filepath.Join(dataDir, "digests")
+	_ = os.MkdirAll(digestsDir, 0755)
+
+	// 1. Empty Inbox
+	req := httptest.NewRequest(http.MethodGet, "/inbox", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /inbox, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Inbox is empty") {
+		t.Errorf("expected empty inbox message, got: %s", body)
+	}
+	if !strings.Contains(body, "0 Digests") {
+		t.Errorf("expected 0 Digests badge, got: %s", body)
+	}
+
+	// 2. Populate with 2 valid digests and 1 corrupt file
+	id1 := strings.Repeat("a", 64)
+	id2 := strings.Repeat("b", 64)
+
+	art1 := `{
+  "version": 1,
+  "batch_id": "` + id1 + `",
+  "created_at": "2026-09-04T01:00:00Z",
+  "cursor_start": {"segment": 1, "offset": 0},
+  "cursor_end": {"segment": 1, "offset": 100},
+  "input_message_count": 5,
+  "included_message_count": 5,
+  "provider": "gemini",
+  "model": "gemini-3.7-flash",
+  "trigger": {"type": "manual"},
+  "digest": {
+    "title": "Manual Test Digest",
+    "overview": "Overview of manual digest",
+    "items": [{"kind": "finding", "text": "Finding 1", "source_ids": ["S000001"]}]
+  }
+}`
+
+	art2 := `{
+  "version": 1,
+  "batch_id": "` + id2 + `",
+  "created_at": "2026-09-04T02:00:00Z",
+  "cursor_start": {"segment": 1, "offset": 100},
+  "cursor_end": {"segment": 1, "offset": 200},
+  "input_message_count": 8,
+  "included_message_count": 6,
+  "provider": "gemini",
+  "model": "gemini-3.7-flash",
+  "trigger": {"type": "scheduled", "slot_id": "Asia/Riyadh/2026-09-04/02:00"},
+  "digest": {
+    "title": "Scheduled Test Digest",
+    "overview": "Overview of scheduled digest",
+    "items": [{"kind": "important", "text": "Important item", "source_ids": ["S000002"]}]
+  }
+}`
+
+	_ = os.WriteFile(filepath.Join(digestsDir, id1+".json"), []byte(art1), 0644)
+	_ = os.WriteFile(filepath.Join(digestsDir, id2+".json"), []byte(art2), 0644)
+	_ = os.WriteFile(filepath.Join(digestsDir, strings.Repeat("c", 64)+".json"), []byte("{corrupt json"), 0644)
+
+	rec = httptest.NewRecorder()
+	req = httptest.NewRequest(http.MethodGet, "/inbox", nil)
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+	body = rec.Body.String()
+
+	if !strings.Contains(body, "2 Digests") {
+		t.Errorf("expected 2 Digests badge, got: %s", body)
+	}
+	if !strings.Contains(body, "Manual Test Digest") || !strings.Contains(body, "Scheduled Test Digest") {
+		t.Errorf("expected both digest titles in inbox list")
+	}
+	if !strings.Contains(body, "Scheduled") || !strings.Contains(body, "Manual") {
+		t.Errorf("expected trigger badges in inbox list")
+	}
+	if !strings.Contains(body, "1 corrupted digest artifact(s) were isolated") {
+		t.Errorf("expected corrupt alert in inbox list, got: %s", body)
+	}
+}
+
+func TestServer_DigestDetail_ValidAndNotFound(t *testing.T) {
+	srv, exchangeDir, dataDir := setupTestEnv(t)
+	digestsDir := filepath.Join(dataDir, "digests")
+	_ = os.MkdirAll(digestsDir, 0755)
+
+	validID := strings.Repeat("d", 64)
+	art := `{
+  "version": 1,
+  "batch_id": "` + validID + `",
+  "created_at": "2026-09-04T02:00:00Z",
+  "cursor_start": {"segment": 1, "offset": 0},
+  "cursor_end": {"segment": 1, "offset": 230},
+  "input_message_count": 1,
+  "included_message_count": 1,
+  "provider": "gemini",
+  "model": "gemini-3.7-flash",
+  "trigger": {"type": "scheduled", "slot_id": "Asia/Riyadh/2026-09-04/02:00"},
+  "digest": {
+    "title": "Deep Dive Digest",
+    "overview": "Detailed overview of discussions",
+    "items": [
+      {
+        "kind": "finding",
+        "text": "Core stability proven",
+        "source_ids": ["S000001"],
+        "channel_context": "general"
+      }
+    ]
+  }
+}`
+	_ = os.WriteFile(filepath.Join(digestsDir, validID+".json"), []byte(art), 0644)
+
+	// Write journal event to test Discord jump link reconstruction
+	eventsDir := filepath.Join(exchangeDir, "events")
+	seg1 := filepath.Join(eventsDir, "0000000000000001.ndjson")
+	eventLine := []byte(`{"version":1,"event":"message_create","message_id":"999888","guild_id":"111222","channel_id":"333444","timestamp":"2026-09-04T01:50:00Z","captured_at":"2026-09-04T01:50:00Z","author":{"id":"u1","name":"alice","display_name":"Alice","bot":false},"content":"Verified stability"}` + "\n")
+	_ = os.WriteFile(seg1, eventLine, 0644)
+
+	// 1. Valid detail request
+	req := httptest.NewRequest(http.MethodGet, "/digests/"+validID, nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d: %s", rec.Code, rec.Body.String())
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "Deep Dive Digest") {
+		t.Errorf("missing title in detail view")
+	}
+	if !strings.Contains(body, "Detailed overview of discussions") {
+		t.Errorf("missing overview in detail view")
+	}
+	if !strings.Contains(body, "Core stability proven") {
+		t.Errorf("missing item text in detail view")
+	}
+	if !strings.Contains(body, "Scheduled (Asia/Riyadh/2026-09-04/02:00)") {
+		t.Errorf("missing scheduled badge with slot_id in detail view")
+	}
+	if !strings.Contains(body, "#general") {
+		t.Errorf("missing channel context tag in detail view")
+	}
+	// Verify jump link reconstructed from journal
+	expectedJumpLink := "https://discord.com/channels/111222/333444/999888"
+	if !strings.Contains(body, expectedJumpLink) {
+		t.Errorf("expected jump link %s in detail view, got: %s", expectedJumpLink, body)
+	}
+
+	// 2. Non-existent 64-hex ID returns 404
+	missingID := strings.Repeat("0", 64)
+	req = httptest.NewRequest(http.MethodGet, "/digests/"+missingID, nil)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for missing ID, got %d", rec.Code)
+	}
+
+	// 3. Malformed ID returns 404
+	badIDs := []string{"1234", validID + ";rm", "not-a-valid-hex-id", strings.Repeat("A", 64)}
+	for _, badID := range badIDs {
+		req = httptest.NewRequest(http.MethodGet, "/digests/"+badID, nil)
+		rec = httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("expected 404 for bad ID %q, got %d", badID, rec.Code)
+		}
+	}
+}
+
+func TestServer_ScheduleSettings(t *testing.T) {
+	srv, _, _ := setupTestEnv(t)
+
+	// 1. Valid schedule update
+	form := url.Values{}
+	form.Set("enabled", "true")
+	form.Set("time", "14:30")
+	form.Set("timezone", "Asia/Riyadh")
+
+	req := httptest.NewRequest(http.MethodPost, "/api/schedule", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Host = "127.0.0.1:8080"
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 redirect, got %d", rec.Code)
+	}
+	loc := rec.Header().Get("Location")
+	if !strings.Contains(loc, "flash=Schedule+settings+saved") {
+		t.Errorf("expected success flash, got: %s", loc)
+	}
+
+	cfg := srv.store.GetScheduleConfig()
+	if !cfg.Enabled || cfg.Time != "14:30" || cfg.Timezone != "Asia/Riyadh" {
+		t.Errorf("saved config mismatch: %+v", cfg)
+	}
+
+	// 2. Invalid time
+	form.Set("time", "25:00")
+	req = httptest.NewRequest(http.MethodPost, "/api/schedule", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Host = "127.0.0.1:8080"
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 redirect, got %d", rec.Code)
+	}
+	loc = rec.Header().Get("Location")
+	if !strings.Contains(loc, "error=Invalid+schedule+settings") {
+		t.Errorf("expected error redirect for invalid time, got: %s", loc)
+	}
+
+	// 3. Invalid timezone
+	form.Set("time", "14:30")
+	form.Set("timezone", "Fantasy/Land")
+	req = httptest.NewRequest(http.MethodPost, "/api/schedule", strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Host = "127.0.0.1:8080"
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 redirect, got %d", rec.Code)
+	}
+	loc = rec.Header().Get("Location")
+	if !strings.Contains(loc, "error=Invalid+schedule+settings") {
+		t.Errorf("expected error redirect for invalid timezone, got: %s", loc)
+	}
+}
+
+func TestServer_InboxAndDetail_XSSSanitization(t *testing.T) {
+	srv, _, dataDir := setupTestEnv(t)
+	digestsDir := filepath.Join(dataDir, "digests")
+	_ = os.MkdirAll(digestsDir, 0755)
+
+	xssID := strings.Repeat("9", 64)
+	maliciousArt := `{
+  "version": 1,
+  "batch_id": "` + xssID + `",
+  "created_at": "2026-09-04T00:00:00Z",
+  "cursor_start": {"segment": 1, "offset": 0},
+  "cursor_end": {"segment": 1, "offset": 100},
+  "input_message_count": 1,
+  "included_message_count": 1,
+  "provider": "gemini",
+  "model": "gemini-3.7-flash",
+  "trigger": {"type": "scheduled", "slot_id": "<script>alert('slot-xss')</script>"},
+  "digest": {
+    "title": "<script>alert('title-xss')</script>",
+    "overview": "<img src=x onerror=alert('overview-xss')>",
+    "items": [
+      {
+        "kind": "finding",
+        "text": "<b onmouseover=alert('item-xss')>clickme</b>",
+        "source_ids": ["<script>s1</script>"],
+        "channel_context": "\"><script>alert('channel-xss')</script>"
+      }
+    ]
+  }
+}`
+	_ = os.WriteFile(filepath.Join(digestsDir, xssID+".json"), []byte(maliciousArt), 0644)
+
+	// Check /inbox
+	req := httptest.NewRequest(http.MethodGet, "/inbox", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	inboxBody := rec.Body.String()
+	dangerousInboxStrings := []string{
+		"<script>alert('title-xss')</script>",
+		"<img src=x onerror=alert('overview-xss')>",
+	}
+	for _, s := range dangerousInboxStrings {
+		if strings.Contains(inboxBody, s) {
+			t.Fatalf("XSS VULNERABILITY in /inbox: found unescaped %s", s)
+		}
+	}
+
+	// Check /digests/{id}
+	req = httptest.NewRequest(http.MethodGet, "/digests/"+xssID, nil)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	detailBody := rec.Body.String()
+	dangerousDetailStrings := []string{
+		"<script>alert('slot-xss')</script>",
+		"<script>alert('title-xss')</script>",
+		"<img src=x onerror=alert('overview-xss')>",
+		"<b onmouseover=alert('item-xss')>clickme</b>",
+		"<script>s1</script>",
+		"\"><script>alert('channel-xss')</script>",
+	}
+	for _, s := range dangerousDetailStrings {
+		if strings.Contains(detailBody, s) {
+			t.Fatalf("XSS VULNERABILITY in /digests/{id}: found unescaped %s", s)
+		}
+	}
+
+	// Ensure escaped representations exist
+	if !strings.Contains(detailBody, "&lt;script&gt;alert(&#39;title-xss&#39;)&lt;/script&gt;") &&
+		!strings.Contains(detailBody, "&lt;script&gt;alert('title-xss')&lt;/script&gt;") {
+		t.Errorf("expected escaped title in detail view")
+	}
+}
+
+func TestFormatDisplayTime(t *testing.T) {
+	utcTime := time.Date(2026, time.September, 4, 0, 17, 7, 0, time.UTC)
+
+	cases := []struct {
+		tz       string
+		expected string
+	}{
+		{"Asia/Riyadh", "Sep 04, 2026 03:17 — Asia/Riyadh"},
+		{"America/New_York", "Sep 03, 2026 20:17 — America/New_York"},
+		{"UTC", "Sep 04, 2026 00:17 — UTC"},
+		{"", "Sep 04, 2026 00:17 — UTC"},
+		{"Invalid/Timezone", "Sep 04, 2026 00:17 — UTC"},
+	}
+
+	for _, tc := range cases {
+		got := FormatDisplayTime(utcTime, tc.tz)
+		if got != tc.expected {
+			t.Errorf("FormatDisplayTime(..., %q) = %q, want %q", tc.tz, got, tc.expected)
+		}
+	}
+}
+
+func TestServer_TimezoneDisplayRendering(t *testing.T) {
+	srv, _, dataDir := setupTestEnv(t)
+	digestsDir := filepath.Join(dataDir, "digests")
+	_ = os.MkdirAll(digestsDir, 0755)
+
+	// Configure schedule with Asia/Riyadh, disabled
+	cfg := srv.store.GetAppConfig()
+	cfg.Schedule.Enabled = false
+	cfg.Schedule.Timezone = "Asia/Riyadh"
+	cfg.Schedule.Time = "03:17"
+	if err := srv.store.SaveAppConfig(cfg); err != nil {
+		t.Fatalf("failed saving config: %v", err)
+	}
+
+	batchID := strings.Repeat("d", 64)
+	art := `{
+  "version": 1,
+  "batch_id": "` + batchID + `",
+  "created_at": "2026-09-04T00:17:00Z",
+  "cursor_start": {"segment": 1, "offset": 0},
+  "cursor_end": {"segment": 1, "offset": 100},
+  "input_message_count": 4,
+  "included_message_count": 4,
+  "provider": "gemini",
+  "model": "gemini-3.7-flash",
+  "trigger": {"type": "scheduled", "slot_id": "Asia/Riyadh/2026-09-04/03:17"},
+  "digest": {
+    "title": "Timezone Display Test",
+    "overview": "Overview for timezone test",
+    "items": [{"kind": "finding", "text": "Item 1", "source_ids": ["S000001"]}]
+  }
+}`
+	if err := os.WriteFile(filepath.Join(digestsDir, batchID+".json"), []byte(art), 0644); err != nil {
+		t.Fatalf("failed writing test artifact: %v", err)
+	}
+
+	// 1. Verify /inbox renders Asia/Riyadh
+	req := httptest.NewRequest(http.MethodGet, "/inbox", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+	body := rec.Body.String()
+	expectedTimeStr := "Sep 04, 2026 03:17 — Asia/Riyadh"
+	if !strings.Contains(body, expectedTimeStr) {
+		t.Errorf("inbox view does not contain expected timezone formatted time %q, body:\n%s", expectedTimeStr, body)
+	}
+
+	// 2. Verify /digests/{id} renders Asia/Riyadh
+	req = httptest.NewRequest(http.MethodGet, "/digests/"+batchID, nil)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+	detailBody := rec.Body.String()
+	if !strings.Contains(detailBody, "Generated on "+expectedTimeStr) {
+		t.Errorf("detail view does not contain %q, body:\n%s", "Generated on "+expectedTimeStr, detailBody)
+	}
+
+	// 3. Switch timezone to America/New_York (-04:00 EDT)
+	cfg.Schedule.Timezone = "America/New_York"
+	if err := srv.store.SaveAppConfig(cfg); err != nil {
+		t.Fatalf("failed updating config: %v", err)
+	}
+
+	req = httptest.NewRequest(http.MethodGet, "/inbox", nil)
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+	bodyNY := rec.Body.String()
+	expectedNY := "Sep 03, 2026 20:17 — America/New_York"
+	if !strings.Contains(bodyNY, expectedNY) {
+		t.Errorf("inbox view does not contain NY formatted time %q, body:\n%s", expectedNY, bodyNY)
 	}
 }

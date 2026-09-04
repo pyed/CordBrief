@@ -17,15 +17,21 @@ type Secrets struct {
 	GeminiAPIKey string `json:"gemini_api_key,omitempty"`
 }
 
-// AppConfig represents non-secret runtime configuration for LLM and Digest parameters.
+// AppConfig represents non-secret runtime configuration for Schedule, LLM, and Digest parameters.
 type AppConfig struct {
-	LLM    LLMConfig    `json:"llm"`
-	Digest DigestConfig `json:"digest"`
+	Schedule ScheduleConfig `json:"schedule"`
+	LLM      LLMConfig      `json:"llm"`
+	Digest   DigestConfig   `json:"digest"`
 }
 
 // DefaultAppConfig returns a safe, production-ready default application configuration.
 func DefaultAppConfig() AppConfig {
 	return AppConfig{
+		Schedule: ScheduleConfig{
+			Enabled:  false,
+			Time:     "08:00",
+			Timezone: "UTC",
+		},
 		LLM: LLMConfig{
 			Provider:        ProviderGemini,
 			BaseURL:         DefaultGeminiBaseURL,
@@ -81,8 +87,9 @@ func NewStore(dataDir, initialConfigPath string) (*Store, error) {
 	if !loaded && initialConfigPath != "" {
 		if cfg, err := Load(initialConfigPath); err == nil {
 			s.config = AppConfig{
-				LLM:    cfg.LLM,
-				Digest: cfg.Digest,
+				Schedule: cfg.Schedule,
+				LLM:      cfg.LLM,
+				Digest:   cfg.Digest,
 			}
 			loaded = true
 		}
@@ -149,6 +156,31 @@ func (s *Store) applyDefaultsAndValidate(cfg *AppConfig) {
 	if cfg.Digest.MaxMessagesPerChannel <= 0 {
 		cfg.Digest.MaxMessagesPerChannel = DefaultMaxMessagesPerChannel
 	}
+
+	// Schedule validation & defaults
+	if strings.TrimSpace(cfg.Schedule.Time) == "" {
+		cfg.Schedule.Time = "08:00"
+	}
+	t, err := time.Parse("15:04", strings.TrimSpace(cfg.Schedule.Time))
+	if err == nil {
+		cfg.Schedule.Hour = t.Hour()
+		cfg.Schedule.Minute = t.Minute()
+	} else {
+		cfg.Schedule.Time = "08:00"
+		cfg.Schedule.Hour = 8
+		cfg.Schedule.Minute = 0
+	}
+
+	if strings.TrimSpace(cfg.Schedule.Timezone) == "" {
+		cfg.Schedule.Timezone = "UTC"
+	}
+	loc, err := time.LoadLocation(strings.TrimSpace(cfg.Schedule.Timezone))
+	if err == nil {
+		cfg.Schedule.Location = loc
+	} else {
+		cfg.Schedule.Timezone = "UTC"
+		cfg.Schedule.Location = time.UTC
+	}
 }
 
 // GetAppConfig returns a safe copy of non-secret application settings.
@@ -162,6 +194,18 @@ func (s *Store) GetAppConfig() AppConfig {
 func (s *Store) SaveAppConfig(newCfg AppConfig) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// Validate schedule time & timezone format before saving
+	if newCfg.Schedule.Time != "" {
+		if _, err := time.Parse("15:04", strings.TrimSpace(newCfg.Schedule.Time)); err != nil {
+			return fmt.Errorf("invalid schedule time %q (must be HH:MM in 24-hour format): %w", newCfg.Schedule.Time, err)
+		}
+	}
+	if newCfg.Schedule.Timezone != "" {
+		if _, err := time.LoadLocation(strings.TrimSpace(newCfg.Schedule.Timezone)); err != nil {
+			return fmt.Errorf("invalid schedule timezone %q: %w", newCfg.Schedule.Timezone, err)
+		}
+	}
 
 	s.applyDefaultsAndValidate(&newCfg)
 
@@ -181,6 +225,42 @@ func (s *Store) SaveAppConfig(newCfg AppConfig) error {
 	}
 
 	s.config = newCfg
+	return nil
+}
+
+// GetScheduleConfig returns a safe copy of the schedule configuration.
+func (s *Store) GetScheduleConfig() ScheduleConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.config.Schedule
+}
+
+// SaveScheduleConfig updates schedule configuration and persists it.
+func (s *Store) SaveScheduleConfig(sch ScheduleConfig) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if sch.Time != "" {
+		if _, err := time.Parse("15:04", strings.TrimSpace(sch.Time)); err != nil {
+			return fmt.Errorf("invalid schedule time %q: %w", sch.Time, err)
+		}
+	}
+	if sch.Timezone != "" {
+		if _, err := time.LoadLocation(strings.TrimSpace(sch.Timezone)); err != nil {
+			return fmt.Errorf("invalid schedule timezone %q: %w", sch.Timezone, err)
+		}
+	}
+
+	cfg := s.config
+	cfg.Schedule = sch
+	s.applyDefaultsAndValidate(&cfg)
+
+	persistedConfigPath := filepath.Join(s.dataDir, "config.json")
+	if err := safeWriteJSON(persistedConfigPath, cfg, 0644); err != nil {
+		return fmt.Errorf("saving schedule config: %w", err)
+	}
+
+	s.config = cfg
 	return nil
 }
 

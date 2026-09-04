@@ -24,6 +24,7 @@ type TransactionOptions struct {
 	ProviderName string
 	ModelName    string
 	Commit       bool // true for 'run', false for 'preview'
+	Trigger      *TriggerInfo
 }
 
 // TransactionResult encapsulates the outcome of a digest transaction execution.
@@ -152,6 +153,7 @@ func RunTransaction(ctx context.Context, s Summarizer, opts TransactionOptions) 
 		IncludedMessageCount: len(batch.IncludedMessages),
 		Provider:             opts.ProviderName,
 		Model:                opts.ModelName,
+		Trigger:              opts.Trigger,
 		Digest:               d,
 	}
 

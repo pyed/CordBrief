@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"testing"
+	"time"
 )
 
 func TestStore_DefaultsAndPersistence(t *testing.T) {
@@ -130,5 +131,69 @@ func TestStore_SecretSource(t *testing.T) {
 	}
 	if key := store.GetGeminiKey(); key != "env-secret" {
 		t.Errorf("expected GetGeminiKey to return environment secret, got %s", key)
+	}
+}
+
+func TestConfig_Schedule(t *testing.T) {
+	tmpDir := t.TempDir()
+	store, err := NewStore(tmpDir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Default schedule
+	sch := store.GetScheduleConfig()
+	if sch.Enabled {
+		t.Errorf("expected schedule disabled by default, got enabled")
+	}
+	if sch.Time != "08:00" {
+		t.Errorf("expected default time 08:00, got %s", sch.Time)
+	}
+	if sch.Timezone != "UTC" {
+		t.Errorf("expected default timezone UTC, got %s", sch.Timezone)
+	}
+
+	// 2. Save valid schedule (Asia/Riyadh)
+	validSch := ScheduleConfig{
+		Enabled:  true,
+		Time:     "15:30",
+		Timezone: "Asia/Riyadh",
+	}
+	if err := store.SaveScheduleConfig(validSch); err != nil {
+		t.Fatalf("expected valid schedule to save, got error: %v", err)
+	}
+
+	// Verify persistence and parsed cache
+	store2, err := NewStore(tmpDir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	sch2 := store2.GetScheduleConfig()
+	if !sch2.Enabled || sch2.Time != "15:30" || sch2.Timezone != "Asia/Riyadh" {
+		t.Fatalf("persisted schedule mismatch: %+v", sch2)
+	}
+	if sch2.Hour != 15 || sch2.Minute != 30 || sch2.Location == nil {
+		t.Errorf("parsed cache missing on reload: hour=%d min=%d loc=%v", sch2.Hour, sch2.Minute, sch2.Location)
+	}
+
+	// 3. Embedded timezone portability test
+	embeddedZones := []string{"Asia/Riyadh", "Europe/London", "America/New_York", "UTC"}
+	for _, z := range embeddedZones {
+		loc, err := time.LoadLocation(z)
+		if err != nil || loc == nil {
+			t.Errorf("embedded timezone %s failed to load: %v", z, err)
+		}
+	}
+
+	// 4. Invalid time format
+	invalidTime := ScheduleConfig{Enabled: true, Time: "99:99", Timezone: "UTC"}
+	if err := store.SaveScheduleConfig(invalidTime); err == nil {
+		t.Error("expected error saving invalid time 99:99, got nil")
+	}
+
+	// 5. Invalid timezone
+	invalidTZ := ScheduleConfig{Enabled: true, Time: "08:00", Timezone: "NonExistent/Zone"}
+	if err := store.SaveScheduleConfig(invalidTZ); err == nil {
+		t.Error("expected error saving invalid timezone, got nil")
 	}
 }

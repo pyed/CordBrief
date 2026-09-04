@@ -10,13 +10,17 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"time"
+	_ "time/tzdata"
 
 	"cordbrief/internal/catalog"
 	"cordbrief/internal/config"
 	"cordbrief/internal/digest"
+	"cordbrief/internal/inbox"
 	"cordbrief/internal/journal"
 	"cordbrief/internal/llm"
+	"cordbrief/internal/scheduler"
 )
 
 // ServerOptions configures the Core Web Control Plane.
@@ -24,6 +28,8 @@ type ServerOptions struct {
 	ExchangeDir string
 	DataDir     string
 	Store       *config.Store
+	Scheduler   *scheduler.Service
+	Lock        *sync.Mutex
 }
 
 // Server serves the Core Web Control Plane.
@@ -31,6 +37,8 @@ type Server struct {
 	exchangeDir string
 	dataDir     string
 	store       *config.Store
+	scheduler   *scheduler.Service
+	lock        *sync.Mutex
 	mux         *http.ServeMux
 }
 
@@ -45,11 +53,16 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	if opts.DataDir == "" {
 		opts.DataDir = "/var/cordbrief/data"
 	}
+	if opts.Lock == nil {
+		opts.Lock = &sync.Mutex{}
+	}
 
 	s := &Server{
 		exchangeDir: opts.ExchangeDir,
 		dataDir:     opts.DataDir,
 		store:       opts.Store,
+		scheduler:   opts.Scheduler,
+		lock:        opts.Lock,
 		mux:         http.NewServeMux(),
 	}
 
@@ -67,6 +80,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) routes() {
 	s.mux.HandleFunc("/", s.handleIndex)
+	s.mux.HandleFunc("/inbox", s.handleInbox)
+	s.mux.HandleFunc("/digests/", s.handleDigestDetail)
+	s.mux.HandleFunc("/api/schedule", s.handleSchedule)
 	s.mux.HandleFunc("/api/watchlist", s.handleWatchlist)
 	s.mux.HandleFunc("/api/llm", s.handleLLMSettings)
 	s.mux.HandleFunc("/api/llm/test", s.handleLLMTest)
@@ -81,7 +97,6 @@ func (s *Server) validateCSRF(r *http.Request) bool {
 	}
 	origin := r.Header.Get("Origin")
 	if origin == "" {
-		// Origin is optional for same-origin form posts in some browsers; check Referer
 		referer := r.Header.Get("Referer")
 		if referer == "" {
 			return true // Local CLI or script access allowed
@@ -100,24 +115,27 @@ func (s *Server) validateCSRF(r *http.Request) bool {
 }
 
 type indexViewModel struct {
-	CollectorRunning     bool
-	DiscordAuthenticated bool
-	CatalogState         string
-	CatalogGuildCount    int
-	CatalogChannelCount  int
-	WatchedGeneration    int
-	WatchedChannelCount  int
-	WatchedSet           map[string]bool
-	CommittedCursor      journal.Cursor
-	ActiveSegment        int
-	JournalFinalOffset   int64
-	Config               config.AppConfig
-	GeminiConfigured     bool
-	GeminiKeySource      config.SecretSource
-	FocusJoined          string
-	Catalog              *catalog.Catalog
-	FlashMessage         string
-	FlashError           string
+	CollectorRunning          bool
+	DiscordAuthenticated      bool
+	CatalogState              string
+	CatalogGuildCount         int
+	CatalogChannelCount       int
+	WatchedGeneration         int
+	WatchedChannelCount       int
+	WatchedSet                map[string]bool
+	CommittedCursor           journal.Cursor
+	ActiveSegment             int
+	JournalFinalOffset        int64
+	Config                    config.AppConfig
+	GeminiConfigured          bool
+	GeminiKeySource           config.SecretSource
+	FocusJoined               string
+	Catalog                   *catalog.Catalog
+	FlashMessage              string
+	FlashError                string
+	ScheduleState             scheduler.State
+	ScheduleNextDue           time.Time
+	ScheduleNextDueFormatted string
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -210,8 +228,242 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	vm.GeminiConfigured = (vm.GeminiKeySource != config.SecretSourceNone)
 	vm.FocusJoined = strings.Join(vm.Config.Digest.Focus, ", ")
 
+	// 6. Scheduler status & next due evaluation
+	if s.scheduler != nil {
+		status, st := s.scheduler.GetStatus()
+		vm.ScheduleState = st
+		if status.NextRunTime != nil {
+			vm.ScheduleNextDue = *status.NextRunTime
+		}
+	} else {
+		if st, err := scheduler.LoadState(s.dataDir); err == nil {
+			vm.ScheduleState = *st
+		}
+		status := scheduler.EvaluateSlot(vm.Config.Schedule, &vm.ScheduleState, time.Now())
+		if status.NextRunTime != nil {
+			vm.ScheduleNextDue = *status.NextRunTime
+		}
+	}
+	if !vm.ScheduleNextDue.IsZero() {
+		vm.ScheduleNextDueFormatted = vm.ScheduleNextDue.Format("2006-01-02 15:04 MST")
+	}
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = IndexTemplate.Execute(w, vm)
+}
+
+func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	ct := r.Header.Get("Content-Type")
+	if !strings.HasPrefix(ct, "application/x-www-form-urlencoded") && !strings.HasPrefix(ct, "multipart/form-data") {
+		http.Error(w, "Unsupported Media Type", http.StatusUnsupportedMediaType)
+		return
+	}
+	if !s.validateCSRF(r) {
+		http.Error(w, "CSRF verification failed", http.StatusForbidden)
+		return
+	}
+
+	if err := r.ParseForm(); err != nil {
+		http.Redirect(w, r, "/?error=Failed+parsing+form", http.StatusSeeOther)
+		return
+	}
+
+	enabled := (r.FormValue("enabled") == "true" || r.FormValue("enabled") == "on")
+	wallTime := strings.TrimSpace(r.FormValue("time"))
+	timezone := strings.TrimSpace(r.FormValue("timezone"))
+
+	newSched := config.ScheduleConfig{
+		Enabled:  enabled,
+		Time:     wallTime,
+		Timezone: timezone,
+	}
+
+	if err := newSched.Validate(); err != nil {
+		http.Redirect(w, r, fmt.Sprintf("/?error=Invalid+schedule+settings:+%s", url.QueryEscape(err.Error())), http.StatusSeeOther)
+		return
+	}
+
+	if err := s.store.SaveScheduleConfig(newSched); err != nil {
+		http.Redirect(w, r, fmt.Sprintf("/?error=Failed+saving+schedule:+%s", url.QueryEscape(err.Error())), http.StatusSeeOther)
+		return
+	}
+
+	http.Redirect(w, r, "/?flash=Schedule+settings+saved+successfully", http.StatusSeeOther)
+}
+
+type inboxItemViewModel struct {
+	inbox.DigestSummary
+	CreatedAtFormatted string
+	ShortBatchID       string
+}
+
+type inboxViewModel struct {
+	Digests      []inboxItemViewModel
+	CorruptCount int
+}
+
+func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	digestsDir := filepath.Join(s.dataDir, "digests")
+	summaries, corrupt, err := inbox.ListDigests(digestsDir)
+	if err != nil {
+		http.Error(w, fmt.Sprintf("Failed reading inbox: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	tzName := s.getDisplayTimezone()
+	var items []inboxItemViewModel
+	for _, sum := range summaries {
+		shortID := sum.BatchID
+		if len(shortID) > 12 {
+			shortID = shortID[:12]
+		}
+		items = append(items, inboxItemViewModel{
+			DigestSummary:      sum,
+			CreatedAtFormatted: FormatDisplayTime(sum.CreatedAt, tzName),
+			ShortBatchID:       shortID,
+		})
+	}
+
+	vm := inboxViewModel{
+		Digests:      items,
+		CorruptCount: corrupt,
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = InboxTemplate.Execute(w, vm)
+}
+
+// FormatDisplayTime renders a UTC time into the user's configured display timezone.
+// If tzName is empty or invalid, it falls back to UTC.
+// Output format: "Jan 02, 2006 15:04 — <Timezone>" (e.g. "Sep 04, 2026 03:17 — Asia/Riyadh").
+func FormatDisplayTime(t time.Time, tzName string) string {
+	loc := time.UTC
+	displayTZ := "UTC"
+	if tz := strings.TrimSpace(tzName); tz != "" {
+		if l, err := time.LoadLocation(tz); err == nil {
+			loc = l
+			displayTZ = tz
+		}
+	}
+	return fmt.Sprintf("%s — %s", t.In(loc).Format("Jan 02, 2006 15:04"), displayTZ)
+}
+
+func (s *Server) getDisplayTimezone() string {
+	if s.store != nil {
+		appCfg := s.store.GetAppConfig()
+		if tz := strings.TrimSpace(appCfg.Schedule.Timezone); tz != "" {
+			return tz
+		}
+	}
+	return "UTC"
+}
+
+type SourceLinkView struct {
+	ID  string
+	URL string
+}
+
+type DetailItemView struct {
+	Kind           string
+	Text           string
+	ChannelContext string
+	Sources        []SourceLinkView
+}
+
+type detailViewModel struct {
+	Artifact           *digest.Artifact
+	CreatedAtFormatted string
+	Items              []DetailItemView
+}
+
+func (s *Server) handleDigestDetail(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	batchID := strings.TrimPrefix(r.URL.Path, "/digests/")
+	batchID = strings.TrimSpace(batchID)
+
+	if !inbox.ValidBatchIDRegex.MatchString(batchID) {
+		http.NotFound(w, r)
+		return
+	}
+
+	digestsDir := filepath.Join(s.dataDir, "digests")
+	art, err := inbox.GetDigest(digestsDir, batchID)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			http.NotFound(w, r)
+			return
+		}
+		http.Error(w, fmt.Sprintf("Failed loading digest: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	// Attempt to reconstruct source message links from journal if available
+	sourceMap := make(map[string]digest.SourceMessage)
+	eventsDir := filepath.Join(s.exchangeDir, "events")
+	startCur := art.CursorStart
+	if startCur.Version == 0 {
+		startCur.Version = journal.CurrentSchemaVersion
+	}
+	endCur := art.CursorEnd
+	if endCur.Version == 0 {
+		endCur.Version = journal.CurrentSchemaVersion
+	}
+	if wm, err := journal.CaptureWatermark(eventsDir); err == nil && wm != nil {
+		reader := journal.NewReader(eventsDir, wm)
+		records, _, err := reader.ReadBatch(startCur, art.InputMessageCount+100)
+		if err == nil && len(records) > 0 {
+			batch, err := digest.BuildBatch(records, startCur, endCur, wm, false)
+			if err == nil && batch != nil {
+				sourceMap = batch.SourceMap
+			}
+		}
+	}
+
+	var items []DetailItemView
+	if art.Digest != nil {
+		for _, item := range art.Digest.Items {
+			var sources []SourceLinkView
+			for _, sID := range item.SourceIDs {
+				var jumpURL string
+				if sm, ok := sourceMap[sID]; ok {
+					jumpURL = digest.JumpLink(sm)
+				}
+				sources = append(sources, SourceLinkView{
+					ID:  sID,
+					URL: jumpURL,
+				})
+			}
+			items = append(items, DetailItemView{
+				Kind:           item.Kind,
+				Text:           item.Text,
+				ChannelContext: item.ChannelContext,
+				Sources:        sources,
+			})
+		}
+	}
+
+	tzName := s.getDisplayTimezone()
+	vm := detailViewModel{
+		Artifact:           art,
+		CreatedAtFormatted: FormatDisplayTime(art.CreatedAt, tzName),
+		Items:              items,
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = DigestDetailTemplate.Execute(w, vm)
 }
 
 func (s *Server) handleWatchlist(w http.ResponseWriter, r *http.Request) {
@@ -453,6 +705,10 @@ func (s *Server) handleDigestPreview(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "CSRF verification failed", http.StatusForbidden)
 		return
 	}
+
+	// Single-flight lock: coordinate with scheduler service
+	s.lock.Lock()
+	defer s.lock.Unlock()
 
 	appCfg := s.store.GetAppConfig()
 	var apiKey string

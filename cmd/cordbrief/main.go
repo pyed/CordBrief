@@ -6,11 +6,14 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"os/signal"
 	"errors"
 	"net/http"
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 
 	"cordbrief/internal/config"
@@ -18,6 +21,7 @@ import (
 	"cordbrief/internal/discord"
 	"cordbrief/internal/journal"
 	"cordbrief/internal/llm"
+	"cordbrief/internal/scheduler"
 	"cordbrief/internal/web"
 )
 
@@ -659,10 +663,36 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
+	digestLock := &sync.Mutex{}
+	runner := &scheduler.CoreDigestRunner{
+		ExchangeDir: actualExchangeDir,
+		DataDir:     actualDataDir,
+		Store:       store,
+	}
+
+	sched, err := scheduler.NewService(scheduler.ServiceOptions{
+		Store:         store,
+		DataDir:       actualDataDir,
+		Runner:        runner,
+		Clock:         time.Now,
+		CheckInterval: 15 * time.Second,
+		Lock:          digestLock,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "error initializing scheduler service: %v\n", err)
+		return 1
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go sched.Start(ctx)
+
 	server, err := web.NewServer(web.ServerOptions{
 		ExchangeDir: actualExchangeDir,
 		DataDir:     actualDataDir,
 		Store:       store,
+		Scheduler:   sched,
+		Lock:        digestLock,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "error initializing web server: %v\n", err)
@@ -670,7 +700,7 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 	}
 
 	listenAddr := fmt.Sprintf("%s:%d", *addrFlag, *portFlag)
-	fmt.Fprintf(stdout, "Starting CordBrief Setup Control Plane on http://%s\n", listenAddr)
+	fmt.Fprintf(stdout, "Starting CordBrief Setup Control Plane & Daily Scheduler on http://%s\n", listenAddr)
 	fmt.Fprintf(stdout, "Exchange directory: %s\n", actualExchangeDir)
 	fmt.Fprintf(stdout, "Data directory:     %s\n", actualDataDir)
 
@@ -680,6 +710,17 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		ReadTimeout:  30 * time.Second,
 		WriteTimeout: 60 * time.Second,
 	}
+
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
+	go func() {
+		<-sigChan
+		fmt.Fprintln(stdout, "\nShutting down CordBrief server and scheduler...")
+		cancel()
+		shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer shutdownCancel()
+		_ = httpServer.Shutdown(shutdownCtx)
+	}()
 
 	if err := httpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		fmt.Fprintf(stderr, "server error: %v\n", err)

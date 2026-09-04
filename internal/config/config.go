@@ -40,6 +40,7 @@ const (
 
 // ScheduleConfig defines scheduling and timezone properties.
 type ScheduleConfig struct {
+	Enabled  bool   `json:"enabled"`
 	Time     string `json:"time"`
 	Timezone string `json:"timezone"`
 
@@ -47,6 +48,31 @@ type ScheduleConfig struct {
 	Location *time.Location `json:"-"`
 	Hour     int            `json:"-"`
 	Minute   int            `json:"-"`
+}
+
+// Validate validates the schedule configuration fields and caches parsed location and time.
+func (s *ScheduleConfig) Validate() error {
+	trimmedTime := strings.TrimSpace(s.Time)
+	if trimmedTime == "" {
+		return errors.New("schedule.time is required (format HH:MM)")
+	}
+	t, err := time.Parse("15:04", trimmedTime)
+	if err != nil {
+		return fmt.Errorf("invalid schedule.time %q: must be HH:MM (24-hour)", s.Time)
+	}
+	s.Hour = t.Hour()
+	s.Minute = t.Minute()
+
+	trimmedTz := strings.TrimSpace(s.Timezone)
+	if trimmedTz == "" {
+		return errors.New("schedule.timezone is required (e.g. 'America/New_York' or 'UTC')")
+	}
+	loc, err := time.LoadLocation(trimmedTz)
+	if err != nil {
+		return fmt.Errorf("invalid schedule.timezone %q: %w", s.Timezone, err)
+	}
+	s.Location = loc
+	return nil
 }
 
 // LLMConfig defines language model connection settings for Gemini and Local LLM.
@@ -131,27 +157,8 @@ func (c *Config) Validate() error {
 	}
 
 	// Schedule
-	if strings.TrimSpace(c.Schedule.Time) == "" {
-		errs = append(errs, "schedule.time is required (format HH:MM)")
-	} else {
-		t, err := time.Parse("15:04", strings.TrimSpace(c.Schedule.Time))
-		if err != nil {
-			errs = append(errs, fmt.Sprintf("invalid schedule.time %q: must be HH:MM (24-hour)", c.Schedule.Time))
-		} else {
-			c.Schedule.Hour = t.Hour()
-			c.Schedule.Minute = t.Minute()
-		}
-	}
-
-	if strings.TrimSpace(c.Schedule.Timezone) == "" {
-		errs = append(errs, "schedule.timezone is required (e.g. 'America/New_York' or 'UTC')")
-	} else {
-		loc, err := time.LoadLocation(strings.TrimSpace(c.Schedule.Timezone))
-		if err != nil {
-			errs = append(errs, fmt.Sprintf("invalid schedule.timezone %q: %v", c.Schedule.Timezone, err))
-		} else {
-			c.Schedule.Location = loc
-		}
+	if err := c.Schedule.Validate(); err != nil {
+		errs = append(errs, err.Error())
 	}
 
 	// LLM validation
