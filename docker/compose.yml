@@ -31,6 +31,8 @@ services:
       - cordbrief_discord_keyring:/home/cordbrief/.local/share/keyrings
       # Shared filesystem exchange (events, status, watchlist, catalog)
       - cordbrief_exchange:/var/cordbrief/exchange
+      # Collector-private CordBrief application data (recovery state, internal metadata)
+      - cordbrief_collector_data:/var/lib/cordbrief
 
   # 2. Core Service: Journal consumer, watchlist manager, and future summarization/delivery
   cordbrief-core:
@@ -68,6 +70,9 @@ volumes:
     name: cordbrief_discord_profile
   cordbrief_discord_keyring:
     name: cordbrief_discord_keyring
+  # Collector-private application data
+  cordbrief_collector_data:
+    name: cordbrief_collector_data
   # Core-private application data
   cordbrief_core_data:
     name: cordbrief_core_data

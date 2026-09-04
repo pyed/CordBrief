@@ -133,6 +133,9 @@ type indexViewModel struct {
 	Catalog                   *catalog.Catalog
 	FlashMessage              string
 	FlashError                string
+	RecoveryState             string
+	RecoveryPendingChannels   int
+	RecoveryLastError         string
 	ScheduleState             scheduler.State
 	ScheduleNextDue           time.Time
 	ScheduleNextDueFormatted string
@@ -143,10 +146,15 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
 
+	appConfig := s.store.GetAppConfig()
 	vm := indexViewModel{
+		Config:     appConfig,
 		WatchedSet: make(map[string]bool),
-		Config:     s.store.GetAppConfig(),
 	}
 
 	// Flash messages from query params
@@ -154,15 +162,18 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	vm.FlashError = r.URL.Query().Get("error")
 
 	// 1. Read collector-status.json
-	statusPath := filepath.Join(s.exchangeDir, "collector-status.json")
-	if statData, err := os.ReadFile(statusPath); err == nil {
+	statPath := filepath.Join(s.exchangeDir, "collector-status.json")
+	if statData, err := os.ReadFile(statPath); err == nil {
 		var st struct {
-			CollectorState       string `json:"collector_state"`
-			DiscordAuthenticated *bool  `json:"discord_authenticated"`
-			CatalogState         string `json:"catalog_state"`
-			WatchedGeneration    int    `json:"watched_generation"`
-			WatchedChannelCount  int    `json:"watched_channel_count"`
-			ActiveSegment        int    `json:"active_segment"`
+			CollectorState          string  `json:"collector_state"`
+			DiscordAuthenticated    *bool   `json:"discord_authenticated"`
+			CatalogState            string  `json:"catalog_state"`
+			WatchedGeneration       int     `json:"watched_generation"`
+			WatchedChannelCount     int     `json:"watched_channel_count"`
+			ActiveSegment           int     `json:"active_segment"`
+			RecoveryState           string  `json:"recovery_state"`
+			RecoveryPendingChannels int     `json:"recovery_pending_channels"`
+			RecoveryLastError       *string `json:"recovery_last_error"`
 		}
 		if err := json.Unmarshal(statData, &st); err == nil {
 			vm.CollectorRunning = (st.CollectorState == "running")
@@ -171,6 +182,11 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 			vm.WatchedGeneration = st.WatchedGeneration
 			vm.WatchedChannelCount = st.WatchedChannelCount
 			vm.ActiveSegment = st.ActiveSegment
+			vm.RecoveryState = st.RecoveryState
+			vm.RecoveryPendingChannels = st.RecoveryPendingChannels
+			if st.RecoveryLastError != nil {
+				vm.RecoveryLastError = *st.RecoveryLastError
+			}
 		}
 	}
 
@@ -425,7 +441,8 @@ func (s *Server) handleDigestDetail(w http.ResponseWriter, r *http.Request) {
 		reader := journal.NewReader(eventsDir, wm)
 		records, _, err := reader.ReadBatch(startCur, art.InputMessageCount+100)
 		if err == nil && len(records) > 0 {
-			batch, err := digest.BuildBatch(records, startCur, endCur, wm, false)
+			cat, _ := catalog.Load(s.exchangeDir)
+			batch, err := digest.BuildBatch(records, startCur, endCur, wm, false, cat)
 			if err == nil && batch != nil {
 				sourceMap = batch.SourceMap
 			}

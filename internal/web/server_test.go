@@ -830,3 +830,39 @@ func TestServer_TimezoneDisplayRendering(t *testing.T) {
 		t.Errorf("inbox view does not contain NY formatted time %q, body:\n%s", expectedNY, bodyNY)
 	}
 }
+
+func TestServer_ContinuityStatusTile(t *testing.T) {
+	srv, exchangeDir, _ := setupTestEnv(t)
+	statPath := filepath.Join(exchangeDir, "collector-status.json")
+
+	// 1. Ready status -> ✓ Up to date
+	statusReady := `{"version":1,"updated_at":"2026-09-04T00:00:00Z","collector_state":"running","discord_authenticated":true,"watched_generation":1,"watched_channel_count":1,"active_segment":1,"recovery_state":"ready","recovery_pending_channels":0}`
+	_ = os.WriteFile(statPath, []byte(statusReady), 0644)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if !strings.Contains(rec.Body.String(), "✓ Up to date") {
+		t.Errorf("expected '✓ Up to date' in body, got: %s", rec.Body.String())
+	}
+
+	// 2. Recovering status -> Recovering (2 remaining)
+	statusRec := `{"version":1,"updated_at":"2026-09-04T00:00:00Z","collector_state":"running","discord_authenticated":true,"watched_generation":1,"watched_channel_count":1,"active_segment":1,"recovery_state":"recovering","recovery_pending_channels":2}`
+	_ = os.WriteFile(statPath, []byte(statusRec), 0644)
+
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if !strings.Contains(rec.Body.String(), "Recovering (2 remaining)") {
+		t.Errorf("expected 'Recovering (2 remaining)' in body, got: %s", rec.Body.String())
+	}
+
+	// 3. Error status -> Recovery Warning
+	statusErr := `{"version":1,"updated_at":"2026-09-04T00:00:00Z","collector_state":"running","discord_authenticated":true,"watched_generation":1,"watched_channel_count":1,"active_segment":1,"recovery_state":"error","recovery_last_error":"REST 429"}`
+	_ = os.WriteFile(statPath, []byte(statusErr), 0644)
+
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if !strings.Contains(rec.Body.String(), "Recovery Warning") {
+		t.Errorf("expected 'Recovery Warning' in body, got: %s", rec.Body.String())
+	}
+}

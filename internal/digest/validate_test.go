@@ -8,8 +8,8 @@ import (
 func TestValidateDigest_SuccessAndDeduplication(t *testing.T) {
 	batch := &Batch{
 		SourceMap: map[string]SourceMessage{
-			"S000001": {SourceID: "S000001"},
-			"S000002": {SourceID: "S000002"},
+			"S000001": {SourceID: "S000001", GuildID: "g1"},
+			"S000002": {SourceID: "S000002", GuildID: "g1"},
 		},
 	}
 
@@ -38,7 +38,7 @@ func TestValidateDigest_SuccessAndDeduplication(t *testing.T) {
 func TestValidateDigest_InvalidKind(t *testing.T) {
 	batch := &Batch{
 		SourceMap: map[string]SourceMessage{
-			"S000001": {SourceID: "S000001"},
+			"S000001": {SourceID: "S000001", GuildID: "g1"},
 		},
 	}
 
@@ -63,7 +63,7 @@ func TestValidateDigest_InvalidKind(t *testing.T) {
 func TestValidateDigest_UnknownSourceID(t *testing.T) {
 	batch := &Batch{
 		SourceMap: map[string]SourceMessage{
-			"S000001": {SourceID: "S000001"},
+			"S000001": {SourceID: "S000001", GuildID: "g1"},
 		},
 	}
 
@@ -88,7 +88,7 @@ func TestValidateDigest_UnknownSourceID(t *testing.T) {
 func TestValidateDigest_EmptySourceIDs(t *testing.T) {
 	batch := &Batch{
 		SourceMap: map[string]SourceMessage{
-			"S000001": {SourceID: "S000001"},
+			"S000001": {SourceID: "S000001", GuildID: "g1"},
 		},
 	}
 
@@ -107,5 +107,30 @@ func TestValidateDigest_EmptySourceIDs(t *testing.T) {
 	err := ValidateDigest(d, batch)
 	if err == nil || !strings.Contains(err.Error(), "no source grounding") {
 		t.Errorf("expected no source grounding error, got: %v", err)
+	}
+}
+
+func TestValidateDigest_UnresolvedGuildID(t *testing.T) {
+	batch := &Batch{
+		SourceMap: map[string]SourceMessage{
+			"S000001": {SourceID: "S000001", GuildID: ""}, // Empty GuildID
+		},
+	}
+
+	d := &Digest{
+		Title:    "Title",
+		Overview: "Overview",
+		Items: []Item{
+			{
+				Kind:      KindFinding,
+				Text:      "Insight citing message with unresolved guild",
+				SourceIDs: []string{"S000001"},
+			},
+		},
+	}
+
+	err := ValidateDigest(d, batch)
+	if err == nil || !strings.Contains(err.Error(), "unresolved guild_id") {
+		t.Fatalf("expected unresolved guild_id error, got: %v", err)
 	}
 }

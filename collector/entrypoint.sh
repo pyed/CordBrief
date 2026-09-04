@@ -10,9 +10,11 @@ mkdir -p -m 0700 "$XDG_RUNTIME_DIR"
 # 2. Globally disable Electron sandbox so container execution succeeds
 export ELECTRON_DISABLE_SANDBOX=1
 
-# 3. Exchange directory preparation
+# 3. Exchange and private data directory preparation
 EXCHANGE_DIR="${CORDBRIEF_EXCHANGE_DIR:-/var/cordbrief/exchange}"
 mkdir -p "$EXCHANGE_DIR/events"
+COLLECTOR_DATA_DIR="${CORDBRIEF_COLLECTOR_DATA_DIR:-/var/lib/cordbrief}"
+mkdir -p -m 0700 "$COLLECTOR_DATA_DIR"
 
 # 4. Official Discord configuration and endpoint
 DISCORD_CONFIG_DIR="/home/cordbrief/.config/discord"
@@ -103,6 +105,7 @@ exec xpra start-desktop \
     --env="DISCORD_WEBAPP_ENDPOINT=https://discord.com" \
     --env="ELECTRON_DISABLE_SANDBOX=1" \
     --env="CORDBRIEF_EXCHANGE_DIR=${EXCHANGE_DIR}" \
+    --env="CORDBRIEF_COLLECTOR_DATA_DIR=${COLLECTOR_DATA_DIR}" \
     --xvfb="Xvfb -screen 0 1280x800x24 +extension GLX +extension RANDR +extension RENDER +extension Composite -nolisten tcp -noreset" \
     --start-child="openbox" \
     --start-child="discord --no-sandbox --remote-debugging-port=9222 --enable-logging" \

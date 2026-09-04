@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"cordbrief/internal/catalog"
 	"cordbrief/internal/journal"
 )
 
@@ -133,3 +134,72 @@ func TestBatch_BotFiltering(t *testing.T) {
 		t.Errorf("expected 2 messages, got %d", len(bAll.IncludedMessages))
 	}
 }
+
+func TestBatch_CatalogGuildEnrichment(t *testing.T) {
+	t1 := time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC)
+	records := []journal.Record{
+		{
+			Segment: 1,
+			Offset:  0,
+			Event: journal.Event{
+				Version:   1,
+				Event:     "message_create",
+				MessageID: "msg-no-guild",
+				GuildID:   "", // Empty guild ID
+				ChannelID: "ch-catalog",
+				Timestamp: t1,
+				Author:    journal.Author{ID: "u1", Name: "alice", Bot: false},
+				Content:   "Recovered message with empty guild_id",
+			},
+		},
+	}
+
+	cat := &catalog.Catalog{
+		Version: 1,
+		Guilds: []catalog.Guild{
+			{
+				ID: "g-from-catalog",
+				Channels: []catalog.Channel{
+					{ID: "ch-catalog", Name: "test-channel"},
+				},
+			},
+		},
+	}
+
+	start := journal.Cursor{Segment: 1, Offset: 0}
+	end := journal.Cursor{Segment: 1, Offset: 100}
+
+	// With catalog enrichment
+	batch, err := BuildBatch(records, start, end, nil, false, cat)
+	if err != nil {
+		t.Fatalf("BuildBatch failed: %v", err)
+	}
+
+	if len(batch.IncludedMessages) != 1 {
+		t.Fatalf("expected 1 message, got %d", len(batch.IncludedMessages))
+	}
+	sm := batch.IncludedMessages[0]
+	if sm.GuildID != "g-from-catalog" {
+		t.Errorf("expected enriched guild_id 'g-from-catalog', got %q", sm.GuildID)
+	}
+
+	// Verify JumpLink
+	link := JumpLink(sm)
+	expectedLink := "https://discord.com/channels/g-from-catalog/ch-catalog/msg-no-guild"
+	if link != expectedLink {
+		t.Errorf("expected JumpLink %q, got %q", expectedLink, link)
+	}
+
+	// Without catalog (nil)
+	batchNoCat, err := BuildBatch(records, start, end, nil, false)
+	if err != nil {
+		t.Fatalf("BuildBatch failed: %v", err)
+	}
+	if batchNoCat.IncludedMessages[0].GuildID != "" {
+		t.Errorf("expected empty guild_id without catalog, got %q", batchNoCat.IncludedMessages[0].GuildID)
+	}
+	if JumpLink(batchNoCat.IncludedMessages[0]) != "" {
+		t.Errorf("expected empty JumpLink when guild_id is empty, got %q", JumpLink(batchNoCat.IncludedMessages[0]))
+	}
+}
+

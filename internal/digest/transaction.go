@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"cordbrief/internal/catalog"
 	"cordbrief/internal/journal"
 )
 
@@ -83,7 +84,8 @@ func RunTransaction(ctx context.Context, s Summarizer, opts TransactionOptions) 
 	}
 
 	// 4. Construct deterministic DigestBatch
-	batch, err := BuildBatch(records, *cur, nextCur, wm, opts.IgnoreBots)
+	cat, _ := catalog.Load(opts.ExchangeDir)
+	batch, err := BuildBatch(records, *cur, nextCur, wm, opts.IgnoreBots, cat)
 	if err != nil {
 		return nil, fmt.Errorf("build batch: %w", err)
 	}

@@ -83,3 +83,73 @@ func TestLoad_UnsupportedVersion(t *testing.T) {
 		t.Fatal("expected error on version 99, got nil")
 	}
 }
+
+func TestResolveGuildForChannel(t *testing.T) {
+	cat := &Catalog{
+		Version: 1,
+		Guilds: []Guild{
+			{
+				ID: "g1",
+				Channels: []Channel{
+					{ID: "c1", Name: "general"},
+					{ID: "c2", Name: "announcements"},
+				},
+			},
+			{
+				ID: "g2",
+				Channels: []Channel{
+					{ID: "c3", Name: "dev"},
+					{ID: "c_dup", Name: "duplicate"},
+				},
+			},
+			{
+				ID: "", // empty guild id
+				Channels: []Channel{
+					{ID: "c_noguild", Name: "orphan"},
+				},
+			},
+			{
+				ID: "g3",
+				Channels: []Channel{
+					{ID: "c_dup", Name: "duplicate2"},
+				},
+			},
+		},
+	}
+
+	// 1. Success
+	gid, err := cat.ResolveGuildForChannel("c1")
+	if err != nil || gid != "g1" {
+		t.Errorf("expected g1, got gid=%q, err=%v", gid, err)
+	}
+
+	gid, err = cat.ResolveGuildForChannel("c3")
+	if err != nil || gid != "g2" {
+		t.Errorf("expected g2, got gid=%q, err=%v", gid, err)
+	}
+
+	// 2. Not found
+	_, err = cat.ResolveGuildForChannel("c_missing")
+	if err == nil {
+		t.Error("expected error for missing channel, got nil")
+	}
+
+	// 3. Ambiguous (in g2 and g3)
+	_, err = cat.ResolveGuildForChannel("c_dup")
+	if err == nil {
+		t.Error("expected error for ambiguous channel, got nil")
+	}
+
+	// 4. Empty guild ID
+	_, err = cat.ResolveGuildForChannel("c_noguild")
+	if err == nil {
+		t.Error("expected error for channel with empty guild id, got nil")
+	}
+
+	// 5. Nil catalog
+	var nilCat *Catalog
+	_, err = nilCat.ResolveGuildForChannel("c1")
+	if err == nil {
+		t.Error("expected error for nil catalog, got nil")
+	}
+}

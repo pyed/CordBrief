@@ -51,8 +51,12 @@ func ValidateDigest(d *Digest, b *Batch) error {
 			if sID == "" {
 				continue
 			}
-			if _, exists := b.SourceMap[sID]; !exists {
+			sm, exists := b.SourceMap[sID]
+			if !exists {
 				return fmt.Errorf("digest item [%d] cites unknown source_id %q (not present in current batch)", i, sID)
+			}
+			if strings.TrimSpace(sm.GuildID) == "" {
+				return fmt.Errorf("digest item [%d] cites source_id %q with unresolved guild_id", i, sID)
 			}
 			if _, dup := seen[sID]; !dup {
 				seen[sID] = struct{}{}

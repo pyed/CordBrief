@@ -85,7 +85,9 @@ RUN useradd -u 1000 -m -s /bin/bash cordbrief \
     && mkdir -p /home/cordbrief/.xpra \
     && mkdir -p /home/cordbrief/.config/openbox \
     && mkdir -p /var/cordbrief/exchange \
-    && chown -R cordbrief:cordbrief /home/cordbrief /var/cordbrief
+    && mkdir -p /var/lib/cordbrief \
+    && chown -R cordbrief:cordbrief /home/cordbrief /var/cordbrief /var/lib/cordbrief \
+    && chmod 0700 /var/lib/cordbrief
 
 # 7. Clone Vencord, integrate CordBriefCollector userplugin, and pre-build
 USER cordbrief
@@ -109,6 +111,6 @@ WORKDIR /home/cordbrief
 
 EXPOSE 14500
 
-VOLUME ["/home/cordbrief/.config/discord", "/home/cordbrief/.local/share/keyrings", "/var/cordbrief/exchange"]
+VOLUME ["/home/cordbrief/.config/discord", "/home/cordbrief/.local/share/keyrings", "/var/cordbrief/exchange", "/var/lib/cordbrief"]
 
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]

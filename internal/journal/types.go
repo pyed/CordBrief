@@ -83,7 +83,11 @@ type CollectorStatus struct {
 	CatalogUpdatedAt     *time.Time `json:"catalog_updated_at,omitempty"`
 	WatchedGeneration    int64      `json:"watched_generation"`
 	WatchedChannelCount  int        `json:"watched_channel_count"`
-	ActiveSegment        uint64     `json:"active_segment"`
-	LastEventAt          *time.Time `json:"last_event_at,omitempty"`
-	LastError            *string    `json:"last_error,omitempty"`
+	ActiveSegment           uint64     `json:"active_segment"`
+	LastEventAt             *time.Time `json:"last_event_at,omitempty"`
+	LastError               *string    `json:"last_error,omitempty"`
+	RecoveryState           string     `json:"recovery_state,omitempty"`
+	RecoveryLastAt          *time.Time `json:"recovery_last_at,omitempty"`
+	RecoveryPendingChannels int        `json:"recovery_pending_channels,omitempty"`
+	RecoveryLastError       *string    `json:"recovery_last_error,omitempty"`
 }

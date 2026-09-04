@@ -266,6 +266,18 @@ const indexTemplateHTML = `<!DOCTYPE html>
             Seg {{.ActiveSegment}}, Off {{.JournalFinalOffset}}
           </div>
         </div>
+        <div class="status-item">
+          <div class="status-label">Discord Continuity</div>
+          <div class="status-value">
+            {{if eq .RecoveryState "recovering"}}
+              <span class="badge badge-warn">Recovering ({{.RecoveryPendingChannels}} remaining)</span>
+            {{else if eq .RecoveryState "error"}}
+              <span class="badge badge-err">Recovery Warning</span>
+            {{else}}
+              <span class="badge badge-ok">✓ Up to date</span>
+            {{end}}
+          </div>
+        </div>
       </div>
     </div>
 

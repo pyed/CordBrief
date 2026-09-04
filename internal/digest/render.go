@@ -6,8 +6,15 @@ import (
 )
 
 // JumpLink returns the canonical Discord web jump link for a trusted source message.
+// Returns an empty string if any of GuildID, ChannelID, or MessageID are missing.
 func JumpLink(m SourceMessage) string {
-	return fmt.Sprintf("https://discord.com/channels/%s/%s/%s", m.GuildID, m.ChannelID, m.MessageID)
+	g := strings.TrimSpace(m.GuildID)
+	c := strings.TrimSpace(m.ChannelID)
+	msg := strings.TrimSpace(m.MessageID)
+	if g == "" || c == "" || msg == "" {
+		return ""
+	}
+	return fmt.Sprintf("https://discord.com/channels/%s/%s/%s", g, c, msg)
 }
 
 // RenderMarkdown formats the structured digest into human-readable Markdown for CLI inspection.
@@ -30,8 +37,10 @@ func RenderMarkdown(d *Digest, b *Batch) string {
 			for _, sID := range item.SourceIDs {
 				if b != nil {
 					if sm, ok := b.SourceMap[sID]; ok {
-						links = append(links, fmt.Sprintf("[%s](%s)", sID, JumpLink(sm)))
-						continue
+						if link := JumpLink(sm); link != "" {
+							links = append(links, fmt.Sprintf("[%s](%s)", sID, link))
+							continue
+						}
 					}
 				}
 				links = append(links, sID)

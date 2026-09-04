@@ -2,6 +2,8 @@ package catalog
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -73,4 +75,39 @@ func (c *Catalog) ValidateChannelIDs(ids []string) (valid []string, invalid []st
 		}
 	}
 	return valid, invalid
+}
+
+// ResolveGuildForChannel uniquely resolves the owning guild ID for an exact channel ID.
+// Fails if the catalog is nil, channel is not found, appears in multiple guilds, or has empty guild ID.
+func (c *Catalog) ResolveGuildForChannel(channelID string) (string, error) {
+	if c == nil {
+		return "", errors.New("catalog unavailable")
+	}
+	channelID = strings.TrimSpace(channelID)
+	if channelID == "" {
+		return "", errors.New("channel ID cannot be empty")
+	}
+
+	var matchedGuildID string
+	matchCount := 0
+	for _, g := range c.Guilds {
+		gID := strings.TrimSpace(g.ID)
+		for _, ch := range g.Channels {
+			if ch.ID == channelID {
+				matchedGuildID = gID
+				matchCount++
+			}
+		}
+	}
+
+	if matchCount == 0 {
+		return "", fmt.Errorf("channel %s not found in catalog", channelID)
+	}
+	if matchCount > 1 {
+		return "", fmt.Errorf("channel %s found in multiple guilds in catalog", channelID)
+	}
+	if matchedGuildID == "" {
+		return "", fmt.Errorf("channel %s has empty guild ID in catalog", channelID)
+	}
+	return matchedGuildID, nil
 }

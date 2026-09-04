@@ -19,7 +19,11 @@ func TestStatus_ReadCollectorStatus(t *testing.T) {
   "catalog_updated_at": "2026-09-03T12:00:00Z",
   "watched_generation": 42,
   "watched_channel_count": 2,
-  "active_segment": 3
+  "active_segment": 3,
+  "recovery_state": "ready",
+  "recovery_last_at": "2026-09-03T12:00:00Z",
+  "recovery_pending_channels": 0,
+  "recovery_last_error": null
 }`
 	if err := os.WriteFile(statusPath, []byte(data), 0644); err != nil {
 		t.Fatal(err)
@@ -30,7 +34,7 @@ func TestStatus_ReadCollectorStatus(t *testing.T) {
 		t.Fatalf("ReadCollectorStatus error: %v", err)
 	}
 
-	if st.Version != 1 || st.CollectorState != "running" || st.DiscordAuthenticated == nil || !*st.DiscordAuthenticated || st.CatalogState != "ready" || st.CatalogUpdatedAt == nil || st.WatchedGeneration != 42 || st.ActiveSegment != 3 {
+	if st.Version != 1 || st.CollectorState != "running" || st.DiscordAuthenticated == nil || !*st.DiscordAuthenticated || st.CatalogState != "ready" || st.CatalogUpdatedAt == nil || st.WatchedGeneration != 42 || st.ActiveSegment != 3 || st.RecoveryState != "ready" || st.RecoveryLastAt == nil || st.RecoveryPendingChannels != 0 {
 		t.Fatalf("unexpected collector status values: %+v", st)
 	}
 

@@ -7,13 +7,20 @@ import (
 	"sort"
 	"strings"
 
+	"cordbrief/internal/catalog"
 	"cordbrief/internal/journal"
 )
 
 // BuildBatch constructs a deterministic DigestBatch from raw journal records.
-func BuildBatch(records []journal.Record, startCur, endCur journal.Cursor, wm *journal.Watermark, ignoreBots bool) (*Batch, error) {
+// Accepts an optional Catalog parameter for trusted metadata enrichment (e.g. resolving guild_id if missing).
+func BuildBatch(records []journal.Record, startCur, endCur journal.Cursor, wm *journal.Watermark, ignoreBots bool, cat ...*catalog.Catalog) (*Batch, error) {
 	if wm == nil {
 		wm = &journal.Watermark{}
+	}
+
+	var catalogRef *catalog.Catalog
+	if len(cat) > 0 && cat[0] != nil {
+		catalogRef = cat[0]
 	}
 
 	// Sort records deterministically: chronological first, then segment/offset tie-break
@@ -57,9 +64,16 @@ func BuildBatch(records []journal.Record, startCur, endCur journal.Cursor, wm *j
 			}
 		}
 
+		guildID := strings.TrimSpace(ev.GuildID)
+		if guildID == "" && catalogRef != nil {
+			if resolved, err := catalogRef.ResolveGuildForChannel(ev.ChannelID); err == nil {
+				guildID = resolved
+			}
+		}
+
 		sm := SourceMessage{
 			SourceID:        sourceID,
-			GuildID:         ev.GuildID,
+			GuildID:         guildID,
 			ChannelID:       ev.ChannelID,
 			MessageID:       ev.MessageID,
 			Timestamp:       ev.Timestamp,
