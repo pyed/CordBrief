@@ -75,14 +75,15 @@ type ChannelCatalog struct {
 
 // CollectorStatus represents the operational telemetry in collector-status.json.
 type CollectorStatus struct {
-	Version              int        `json:"version"`
-	UpdatedAt            time.Time  `json:"updated_at"`
-	CollectorState       string     `json:"collector_state"`
-	DiscordAuthenticated *bool      `json:"discord_authenticated"`
-	CatalogState         string     `json:"catalog_state,omitempty"`
-	CatalogUpdatedAt     *time.Time `json:"catalog_updated_at,omitempty"`
-	WatchedGeneration    int64      `json:"watched_generation"`
-	WatchedChannelCount  int        `json:"watched_channel_count"`
+	Version                 int        `json:"version"`
+	UpdatedAt               time.Time  `json:"updated_at"`
+	Mode                    string     `json:"mode,omitempty"`
+	CollectorState          string     `json:"collector_state"`
+	DiscordAuthenticated    *bool      `json:"discord_authenticated"`
+	CatalogState            string     `json:"catalog_state,omitempty"`
+	CatalogUpdatedAt        *time.Time `json:"catalog_updated_at,omitempty"`
+	WatchedGeneration       int64      `json:"watched_generation"`
+	WatchedChannelCount     int        `json:"watched_channel_count"`
 	ActiveSegment           uint64     `json:"active_segment"`
 	LastEventAt             *time.Time `json:"last_event_at,omitempty"`
 	LastError               *string    `json:"last_error,omitempty"`
@@ -90,4 +91,22 @@ type CollectorStatus struct {
 	RecoveryLastAt          *time.Time `json:"recovery_last_at,omitempty"`
 	RecoveryPendingChannels int        `json:"recovery_pending_channels,omitempty"`
 	RecoveryLastError       *string    `json:"recovery_last_error,omitempty"`
+}
+
+// CollectorCommand represents an atomic control command sent from Core to Collector via exchange.
+type CollectorCommand struct {
+	Version     int       `json:"version"`
+	Command     string    `json:"command"`
+	RequestID   string    `json:"request_id"`
+	RequestedAt time.Time `json:"requested_at"`
+}
+
+// CollectorCommandAck represents the acknowledgement written by Collector upon processing a command.
+type CollectorCommandAck struct {
+	Version   int       `json:"version"`
+	RequestID string    `json:"request_id"`
+	Command   string    `json:"command"`
+	Status    string    `json:"status"`
+	AppliedAt time.Time `json:"applied_at"`
+	Error     *string   `json:"error"`
 }

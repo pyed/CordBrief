@@ -104,7 +104,10 @@ RUN cd /home/cordbrief/vencord \
 
 USER root
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
-RUN chmod +x /usr/local/bin/entrypoint.sh
+RUN apt-get update && apt-get install -y --no-install-recommends x11-utils && rm -rf /var/lib/apt/lists/*
+COPY supervisor.mjs /home/cordbrief/supervisor.mjs
+RUN chmod +x /usr/local/bin/entrypoint.sh /home/cordbrief/supervisor.mjs \
+    && chown cordbrief:cordbrief /home/cordbrief/supervisor.mjs
 
 USER cordbrief
 WORKDIR /home/cordbrief

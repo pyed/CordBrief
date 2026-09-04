@@ -217,12 +217,20 @@ const indexTemplateHTML = `<!DOCTYPE html>
       <div class="card-title">System Readiness</div>
       <div class="status-grid">
         <div class="status-item">
-          <div class="status-label">Discord Authentication</div>
+          <div class="status-label">Discord Session</div>
           <div class="status-value">
-            {{if .DiscordAuthenticated}}
+            {{if .CollectorStale}}
+              <span class="badge badge-err">Collector Offline</span>
+            {{else if .SetupRequired}}
+              <span class="badge badge-warn">Setup Required</span>
+            {{else if .ReauthRequired}}
+              <span class="badge badge-err">Reauth Required</span>
+            {{else if .DiscordAuthenticated}}
               <span class="badge badge-ok">Connected</span>
+            {{else if eq .CollectorStateStr "starting"}}
+              <span class="badge badge-info">Starting...</span>
             {{else}}
-              <span class="badge badge-warn">Reauth Required</span>
+              <span class="badge badge-warn">Disconnected</span>
             {{end}}
           </div>
         </div>
@@ -269,17 +277,80 @@ const indexTemplateHTML = `<!DOCTYPE html>
         <div class="status-item">
           <div class="status-label">Discord Continuity</div>
           <div class="status-value">
-            {{if eq .RecoveryState "recovering"}}
+            {{if .CollectorStale}}
+              <span class="badge badge-err">Unavailable</span>
+            {{else if eq .RecoveryState "recovering"}}
               <span class="badge badge-warn">Recovering ({{.RecoveryPendingChannels}} remaining)</span>
             {{else if eq .RecoveryState "error"}}
               <span class="badge badge-err">Recovery Warning</span>
-            {{else}}
+            {{else if eq .RecoveryState "ready"}}
               <span class="badge badge-ok">✓ Up to date</span>
+            {{else}}
+              <span class="badge badge-warn">Unavailable</span>
             {{end}}
           </div>
         </div>
       </div>
     </div>
+
+    <!-- DISCORD SESSION CONTROL -->
+    {{if or .SetupRequired .ReauthRequired}}
+      <div class="card" style="border-left: 4px solid var(--warning);">
+        <div class="card-title">
+          <span>Discord Authentication Required</span>
+          {{if .SetupRequired}}
+            <span class="badge badge-warn">First-Run Setup</span>
+          {{else}}
+            <span class="badge badge-err">Reauthentication Needed</span>
+          {{end}}
+        </div>
+        <p style="margin-bottom: 12px; font-size: 0.95rem;">
+          {{if .SetupRequired}}
+            CordBrief requires an official Discord login to discover your channels and monitor updates.
+          {{else}}
+            Your Discord session has expired or requires reauthentication.
+          {{end}}
+          Sign in normally using the secure local setup viewer. CordBrief will automatically return to collection mode once logged in.
+        </p>
+        <div class="btn-group">
+          <a href="http://127.0.0.1:14500/" target="_blank" class="btn btn-primary">
+            🖥 Open Discord Setup Viewer (:14500)
+          </a>
+          <form method="POST" action="/api/collector/command" style="display: inline;">
+            <input type="hidden" name="command" value="return_normal">
+            <button type="submit" class="btn btn-secondary">Resume Normal Mode</button>
+          </form>
+        </div>
+        <div class="help-text" style="margin-top: 10px; line-height: 1.5;">
+          <strong>Security Note:</strong> Port <code>14500</code> is bound to <code>127.0.0.1</code> (localhost) only to protect your Discord desktop session.<br>
+          If managing CordBrief remotely on a NAS, forward ports over SSH:<br>
+          <code style="background: var(--code-bg); padding: 2px 6px; border-radius: 4px;">ssh -L 8080:127.0.0.1:8080 -L 14500:127.0.0.1:14500 user@nas</code><br>
+          Then open <a href="http://127.0.0.1:14500/" target="_blank" style="color: var(--primary);">http://127.0.0.1:14500/</a> on your local machine.
+        </div>
+      </div>
+    {{else if .DiscordAuthenticated}}
+      <div class="card">
+        <div class="card-title">
+          <span>Discord Desktop Session</span>
+          <span class="badge badge-ok">Active Session</span>
+        </div>
+        <p class="help-text" style="margin-bottom: 12px;">
+          Discord Desktop is running and capturing messages in background. If you need to switch accounts or refresh session tokens:
+        </p>
+        <div class="btn-group" style="margin-top: 0; margin-bottom: 10px;">
+          <form method="POST" action="/api/collector/command" onsubmit="return confirm('This will temporarily pause collection and launch the Discord setup viewer so you can re-authenticate. Proceed?');" style="display: inline-block;">
+            <input type="hidden" name="command" value="enter_reauth">
+            <button type="submit" class="btn btn-secondary">Reauthenticate Discord</button>
+          </form>
+          <a href="http://127.0.0.1:14500/" target="_blank" class="btn btn-secondary">
+            Open Setup Viewer (:14500)
+          </a>
+        </div>
+        <div class="help-text">
+          Port <code>14500</code> is bound to <code>127.0.0.1</code>. For remote NAS access, use SSH port forwarding: <code>ssh -L 14500:127.0.0.1:14500 user@nas</code>.
+        </div>
+      </div>
+    {{end}}
 
     <!-- 2. DAILY DIGEST SCHEDULER -->
     <div class="card">

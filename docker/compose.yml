@@ -33,6 +33,12 @@ services:
       - cordbrief_exchange:/var/cordbrief/exchange
       # Collector-private CordBrief application data (recovery state, internal metadata)
       - cordbrief_collector_data:/var/lib/cordbrief
+    healthcheck:
+      test: ["CMD-SHELL", "node -e 'const fs=require(\"fs\"); const s=JSON.parse(fs.readFileSync(\"/var/cordbrief/exchange/collector-status.json\")); if(Date.now()-new Date(s.updated_at).getTime()>30000) process.exit(1);' || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
 
   # 2. Core Service: Journal consumer, watchlist manager, and future summarization/delivery
   cordbrief-core:
@@ -60,6 +66,12 @@ services:
       - cordbrief_exchange:/var/cordbrief/exchange
       # Core internal data and state
       - cordbrief_core_data:/var/cordbrief/data
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8080/ > /dev/null || exit 1"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
 
 volumes:
   # Shared exchange volume (inter-service boundary)

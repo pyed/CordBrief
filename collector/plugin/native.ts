@@ -17,7 +17,8 @@ export interface WatchlistConfig {
 export interface CollectorStatusRecord {
     version: number;
     updated_at: string;
-    collector_state: "starting" | "running" | "error";
+    mode?: "setup" | "normal" | "reauth" | "error";
+    collector_state: "starting" | "running" | "setup_required" | "reauth_required" | "error";
     discord_authenticated: boolean | null;
     catalog_state: "unavailable" | "ready" | "error";
     catalog_updated_at: string | null;
@@ -528,18 +529,16 @@ export function loadWatchlist(): WatchlistConfig {
     }
 }
 
-// Safe update of collector-status.json
-export function writeStatus(state: "starting" | "running" | "error" = "running", authenticated?: boolean | null): void {
+// Safe update of collector-runtime-status.json (collector-private, consumed by supervisor)
+export function writeStatus(state: "starting" | "running" | "setup_required" | "reauth_required" | "error" = "running", authenticated?: boolean | null): void {
     try {
         if (typeof authenticated !== "undefined") {
             discordAuthenticatedState = authenticated;
         }
         const wl = loadWatchlist();
-        const statusRecord: CollectorStatusRecord = {
+        const runtimeRecord = {
             version: 1,
             updated_at: new Date().toISOString(),
-            collector_state: state,
-            discord_authenticated: discordAuthenticatedState,
             catalog_state: catalogState,
             catalog_updated_at: catalogUpdatedAt,
             watched_generation: wl.generation,
@@ -552,7 +551,8 @@ export function writeStatus(state: "starting" | "running" | "error" = "running",
             recovery_pending_channels: recoveryPendingChannels,
             recovery_last_error: recoveryLastError
         };
-        safeReplaceJSON(path.join(EXCHANGE_DIR, "collector-status.json"), statusRecord);
+        const runtimeDir = fs.existsSync(COLLECTOR_DATA_DIR) ? COLLECTOR_DATA_DIR : EXCHANGE_DIR;
+        safeReplaceJSON(path.join(runtimeDir, "collector-runtime-status.json"), runtimeRecord);
     } catch (err: any) {
         lastErrorMsg = err?.message || String(err);
     }

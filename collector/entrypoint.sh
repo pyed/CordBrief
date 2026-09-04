@@ -82,6 +82,13 @@ cat << 'EOF' > /home/cordbrief/.config/openbox/rc.xml
     </application>
     <application class="discord" type="normal">
       <maximized>true</maximized>
+      <iconic>no</iconic>
+      <focus>yes</focus>
+    </application>
+    <application class="discord" title="*Updater*">
+      <maximized>false</maximized>
+      <iconic>no</iconic>
+      <focus>yes</focus>
     </application>
   </applications>
 </openbox_config>
@@ -108,5 +115,5 @@ exec xpra start-desktop \
     --env="CORDBRIEF_COLLECTOR_DATA_DIR=${COLLECTOR_DATA_DIR}" \
     --xvfb="Xvfb -screen 0 1280x800x24 +extension GLX +extension RANDR +extension RENDER +extension Composite -nolisten tcp -noreset" \
     --start-child="openbox" \
-    --start-child="discord --no-sandbox --remote-debugging-port=9222 --enable-logging" \
+    --start-child="node /home/cordbrief/supervisor.mjs" \
     "${DISPLAY_NUM}"

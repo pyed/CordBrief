@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"cordbrief/internal/config"
+	"cordbrief/internal/journal"
 	"cordbrief/internal/llm"
 )
 
@@ -834,9 +835,10 @@ func TestServer_TimezoneDisplayRendering(t *testing.T) {
 func TestServer_ContinuityStatusTile(t *testing.T) {
 	srv, exchangeDir, _ := setupTestEnv(t)
 	statPath := filepath.Join(exchangeDir, "collector-status.json")
+	nowStr := time.Now().UTC().Format(time.RFC3339)
 
 	// 1. Ready status -> ✓ Up to date
-	statusReady := `{"version":1,"updated_at":"2026-09-04T00:00:00Z","collector_state":"running","discord_authenticated":true,"watched_generation":1,"watched_channel_count":1,"active_segment":1,"recovery_state":"ready","recovery_pending_channels":0}`
+	statusReady := `{"version":1,"updated_at":"` + nowStr + `","collector_state":"running","discord_authenticated":true,"watched_generation":1,"watched_channel_count":1,"active_segment":1,"recovery_state":"ready","recovery_pending_channels":0}`
 	_ = os.WriteFile(statPath, []byte(statusReady), 0644)
 
 	req := httptest.NewRequest(http.MethodGet, "/", nil)
@@ -847,7 +849,7 @@ func TestServer_ContinuityStatusTile(t *testing.T) {
 	}
 
 	// 2. Recovering status -> Recovering (2 remaining)
-	statusRec := `{"version":1,"updated_at":"2026-09-04T00:00:00Z","collector_state":"running","discord_authenticated":true,"watched_generation":1,"watched_channel_count":1,"active_segment":1,"recovery_state":"recovering","recovery_pending_channels":2}`
+	statusRec := `{"version":1,"updated_at":"` + nowStr + `","collector_state":"running","discord_authenticated":true,"watched_generation":1,"watched_channel_count":1,"active_segment":1,"recovery_state":"recovering","recovery_pending_channels":2}`
 	_ = os.WriteFile(statPath, []byte(statusRec), 0644)
 
 	rec = httptest.NewRecorder()
@@ -857,12 +859,106 @@ func TestServer_ContinuityStatusTile(t *testing.T) {
 	}
 
 	// 3. Error status -> Recovery Warning
-	statusErr := `{"version":1,"updated_at":"2026-09-04T00:00:00Z","collector_state":"running","discord_authenticated":true,"watched_generation":1,"watched_channel_count":1,"active_segment":1,"recovery_state":"error","recovery_last_error":"REST 429"}`
+	statusErr := `{"version":1,"updated_at":"` + nowStr + `","collector_state":"running","discord_authenticated":true,"watched_generation":1,"watched_channel_count":1,"active_segment":1,"recovery_state":"error","recovery_last_error":"REST 429"}`
 	_ = os.WriteFile(statPath, []byte(statusErr), 0644)
 
 	rec = httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if !strings.Contains(rec.Body.String(), "Recovery Warning") {
 		t.Errorf("expected 'Recovery Warning' in body, got: %s", rec.Body.String())
+	}
+}
+
+func TestServer_StaleCollectorStatus(t *testing.T) {
+	srv, exchangeDir, _ := setupTestEnv(t)
+	statPath := filepath.Join(exchangeDir, "collector-status.json")
+
+	// Timestamp is 2 minutes old -> stale
+	staleTime := time.Now().UTC().Add(-2 * time.Minute).Format(time.RFC3339)
+	statusStale := `{"version":1,"updated_at":"` + staleTime + `","collector_state":"running","discord_authenticated":true,"watched_generation":1,"watched_channel_count":1,"active_segment":1,"recovery_state":"ready","recovery_pending_channels":0}`
+	_ = os.WriteFile(statPath, []byte(statusStale), 0644)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "Collector Offline") {
+		t.Errorf("expected 'Collector Offline' in body for stale status, got: %s", body)
+	}
+	if strings.Contains(body, "✓ Up to date") {
+		t.Errorf("stale collector status should NOT claim '✓ Up to date'")
+	}
+}
+
+func TestServer_CollectorCommand(t *testing.T) {
+	srv, exchangeDir, _ := setupTestEnv(t)
+
+	// 1. Missing CSRF header fails
+	req := httptest.NewRequest(http.MethodPost, "/api/collector/command", strings.NewReader("command=enter_reauth"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://evil.com")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusForbidden {
+		t.Errorf("expected 403 Forbidden for bad CSRF, got %d", rec.Code)
+	}
+
+	// 2. Invalid command fails
+	req = httptest.NewRequest(http.MethodPost, "/api/collector/command", strings.NewReader("command=invalid_cmd"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://example.com")
+	req.Host = "example.com"
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("expected 400 Bad Request for invalid command, got %d", rec.Code)
+	}
+
+	// 3. Valid enter_reauth command writes collector-command.json
+	req = httptest.NewRequest(http.MethodPost, "/api/collector/command", strings.NewReader("command=enter_reauth"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://example.com")
+	req.Host = "example.com"
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusSeeOther {
+		t.Errorf("expected 303 redirect, got %d", rec.Code)
+	}
+
+	cmdFile := filepath.Join(exchangeDir, "collector-command.json")
+	data, err := os.ReadFile(cmdFile)
+	if err != nil {
+		t.Fatalf("failed to read written command file: %v", err)
+	}
+
+	var cmd journal.CollectorCommand
+	if err := json.Unmarshal(data, &cmd); err != nil {
+		t.Fatalf("failed to unmarshal command JSON: %v", err)
+	}
+	if cmd.Command != "enter_reauth" {
+		t.Errorf("expected command 'enter_reauth', got %q", cmd.Command)
+	}
+	if cmd.Version != 1 {
+		t.Errorf("expected version 1, got %d", cmd.Version)
+	}
+	if !strings.HasPrefix(cmd.RequestID, "req-") {
+		t.Errorf("expected request_id prefix 'req-', got %q", cmd.RequestID)
+	}
+
+	// 4. Second command while first is still pending returns 409 Conflict
+	req = httptest.NewRequest(http.MethodPost, "/api/collector/command", strings.NewReader("command=enter_reauth"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Header.Set("Origin", "http://example.com")
+	req.Host = "example.com"
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusConflict {
+		t.Errorf("expected 409 Conflict for duplicate pending command, got %d", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "Command already pending") {
+		t.Errorf("expected 'Command already pending' in body, got: %s", rec.Body.String())
 	}
 }

@@ -1,9 +1,12 @@
 package journal
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 )
 
 func TestStatus_ReadCollectorStatus(t *testing.T) {
@@ -78,5 +81,116 @@ func TestStatus_ReadCatalog(t *testing.T) {
 
 	if cat.Version != 1 || len(cat.Guilds) != 1 || cat.Guilds[0].GuildName != "Test Guild" {
 		t.Fatalf("unexpected catalog values: %+v", cat)
+	}
+}
+
+func TestCollectorStatus_Freshness(t *testing.T) {
+	now := time.Now().UTC()
+
+	// 1. Nil status
+	var nilStat *CollectorStatus
+	if nilStat.IsFresh(now, 30*time.Second) {
+		t.Error("nil status should not be fresh")
+	}
+
+	// 2. Fresh status (10s old)
+	freshStat := &CollectorStatus{
+		UpdatedAt: now.Add(-10 * time.Second),
+	}
+	if !freshStat.IsFresh(now, 30*time.Second) {
+		t.Error("expected status updated 10s ago to be fresh for 30s threshold")
+	}
+
+	// 3. Stale status (45s old)
+	staleStat := &CollectorStatus{
+		UpdatedAt: now.Add(-45 * time.Second),
+	}
+	if staleStat.IsFresh(now, 30*time.Second) {
+		t.Error("expected status updated 45s ago to be stale for 30s threshold")
+	}
+
+	// 4. Minor future clock skew (3s in future)
+	futureStat := &CollectorStatus{
+		UpdatedAt: now.Add(3 * time.Second),
+	}
+	if !futureStat.IsFresh(now, 30*time.Second) {
+		t.Error("expected 3s clock skew to be tolerated")
+	}
+
+	// 5. Excessive future clock skew (20s in future)
+	excessiveFutureStat := &CollectorStatus{
+		UpdatedAt: now.Add(20 * time.Second),
+	}
+	if excessiveFutureStat.IsFresh(now, 30*time.Second) {
+		t.Error("expected 20s future clock skew to be rejected as not fresh")
+	}
+}
+
+func TestCollectorCommand_WriteAndReadAck(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. Write command
+	cmd := CollectorCommand{
+		Version:     1,
+		Command:     "enter_reauth",
+		RequestID:   "req-12345",
+		RequestedAt: time.Now().UTC(),
+	}
+	if err := WriteCollectorCommand(tmpDir, cmd); err != nil {
+		t.Fatalf("WriteCollectorCommand failed: %v", err)
+	}
+
+	// Verify command written
+	cmdPath := filepath.Join(tmpDir, DefaultCommandFilename)
+	data, err := os.ReadFile(cmdPath)
+	if err != nil {
+		t.Fatalf("failed to read command file: %v", err)
+	}
+	if !strings.Contains(string(data), `"command": "enter_reauth"`) {
+		t.Errorf("command file does not contain command: %s", string(data))
+	}
+
+	// 2. Second command while first is pending returns ErrCommandPending
+	secondCmd := CollectorCommand{
+		Version:     1,
+		Command:     "return_normal",
+		RequestID:   "req-second",
+		RequestedAt: time.Now().UTC(),
+	}
+	if err := WriteCollectorCommand(tmpDir, secondCmd); !errors.Is(err, ErrCommandPending) {
+		t.Fatalf("expected ErrCommandPending when command file exists, got: %v", err)
+	}
+
+	// Clean up command file for subsequent tests
+	_ = os.Remove(cmdPath)
+
+	// 3. Missing fields fail
+	if err := WriteCollectorCommand(tmpDir, CollectorCommand{Command: "enter_reauth"}); err == nil {
+		t.Error("expected error for empty request_id, got nil")
+	}
+	if err := WriteCollectorCommand(tmpDir, CollectorCommand{RequestID: "req-1"}); err == nil {
+		t.Error("expected error for empty command, got nil")
+	}
+
+	// 3. Write ack file and read it back
+	ackData := `{
+  "version": 1,
+  "request_id": "req-12345",
+  "command": "enter_reauth",
+  "status": "applied",
+  "applied_at": "2026-09-04T12:00:00Z",
+  "error": null
+}`
+	ackPath := filepath.Join(tmpDir, DefaultCommandAckFilename)
+	if err := os.WriteFile(ackPath, []byte(ackData), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	ack, err := ReadCollectorCommandAck(tmpDir)
+	if err != nil {
+		t.Fatalf("ReadCollectorCommandAck failed: %v", err)
+	}
+	if ack.RequestID != "req-12345" || ack.Status != "applied" || ack.Command != "enter_reauth" || ack.Error != nil {
+		t.Fatalf("unexpected ack contents: %+v", ack)
 	}
 }

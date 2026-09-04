@@ -88,6 +88,7 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/llm/test", s.handleLLMTest)
 	s.mux.HandleFunc("/api/digest/settings", s.handleDigestSettings)
 	s.mux.HandleFunc("/api/digest/preview", s.handleDigestPreview)
+	s.mux.HandleFunc("/api/collector/command", s.handleCollectorCommand)
 }
 
 // validateCSRF enforces Origin / Host check on state-changing requests.
@@ -116,7 +117,12 @@ func (s *Server) validateCSRF(r *http.Request) bool {
 
 type indexViewModel struct {
 	CollectorRunning          bool
+	CollectorStale            bool
+	CollectorMode             string
+	CollectorStateStr         string
 	DiscordAuthenticated      bool
+	SetupRequired             bool
+	ReauthRequired            bool
 	CatalogState              string
 	CatalogGuildCount         int
 	CatalogChannelCount       int
@@ -161,33 +167,37 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	vm.FlashMessage = r.URL.Query().Get("flash")
 	vm.FlashError = r.URL.Query().Get("error")
 
-	// 1. Read collector-status.json
+	// 1. Read collector-status.json with freshness check (30s threshold)
 	statPath := filepath.Join(s.exchangeDir, "collector-status.json")
-	if statData, err := os.ReadFile(statPath); err == nil {
-		var st struct {
-			CollectorState          string  `json:"collector_state"`
-			DiscordAuthenticated    *bool   `json:"discord_authenticated"`
-			CatalogState            string  `json:"catalog_state"`
-			WatchedGeneration       int     `json:"watched_generation"`
-			WatchedChannelCount     int     `json:"watched_channel_count"`
-			ActiveSegment           int     `json:"active_segment"`
-			RecoveryState           string  `json:"recovery_state"`
-			RecoveryPendingChannels int     `json:"recovery_pending_channels"`
-			RecoveryLastError       *string `json:"recovery_last_error"`
-		}
-		if err := json.Unmarshal(statData, &st); err == nil {
-			vm.CollectorRunning = (st.CollectorState == "running")
-			vm.DiscordAuthenticated = (st.DiscordAuthenticated != nil && *st.DiscordAuthenticated)
-			vm.CatalogState = st.CatalogState
-			vm.WatchedGeneration = st.WatchedGeneration
-			vm.WatchedChannelCount = st.WatchedChannelCount
-			vm.ActiveSegment = st.ActiveSegment
-			vm.RecoveryState = st.RecoveryState
-			vm.RecoveryPendingChannels = st.RecoveryPendingChannels
-			if st.RecoveryLastError != nil {
-				vm.RecoveryLastError = *st.RecoveryLastError
+	if stat, err := journal.ReadCollectorStatus(statPath); err == nil {
+		isFresh := stat.IsFresh(time.Now().UTC(), 30*time.Second)
+		vm.CollectorStale = !isFresh
+		vm.CollectorMode = stat.Mode
+		vm.CollectorStateStr = stat.CollectorState
+
+		if isFresh {
+			vm.CollectorRunning = (stat.CollectorState == "running")
+			vm.DiscordAuthenticated = (stat.DiscordAuthenticated != nil && *stat.DiscordAuthenticated)
+			vm.SetupRequired = (stat.CollectorState == "setup_required" || stat.Mode == "setup")
+			vm.ReauthRequired = (stat.CollectorState == "reauth_required" || stat.Mode == "reauth")
+			vm.CatalogState = stat.CatalogState
+			vm.WatchedGeneration = int(stat.WatchedGeneration)
+			vm.WatchedChannelCount = stat.WatchedChannelCount
+			vm.ActiveSegment = int(stat.ActiveSegment)
+			vm.RecoveryState = stat.RecoveryState
+			vm.RecoveryPendingChannels = stat.RecoveryPendingChannels
+			if stat.RecoveryLastError != nil {
+				vm.RecoveryLastError = *stat.RecoveryLastError
 			}
+		} else {
+			vm.CollectorRunning = false
+			vm.DiscordAuthenticated = false
+			vm.RecoveryState = "unavailable"
 		}
+	} else {
+		vm.CollectorRunning = false
+		vm.CollectorStale = true
+		vm.RecoveryState = "unavailable"
 	}
 
 	// 2. Read catalog.json
@@ -782,6 +792,50 @@ func (s *Server) handleDigestPreview(w http.ResponseWriter, r *http.Request) {
 		"model":             appCfg.LLM.Model,
 		"rendered_markdown": renderedMD,
 	})
+}
+
+func (s *Server) handleCollectorCommand(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.validateCSRF(r) {
+		http.Error(w, "Forbidden: CSRF validation failed", http.StatusForbidden)
+		return
+	}
+
+	command := strings.TrimSpace(r.FormValue("command"))
+	validCommands := map[string]bool{
+		"enter_reauth":  true,
+		"return_normal": true,
+		"status":        true,
+	}
+	if !validCommands[command] {
+		http.Error(w, "Invalid command", http.StatusBadRequest)
+		return
+	}
+
+	cmd := journal.CollectorCommand{
+		Version:     1,
+		Command:     command,
+		RequestID:   fmt.Sprintf("req-%d", time.Now().UnixNano()),
+		RequestedAt: time.Now().UTC(),
+	}
+
+	if err := journal.WriteCollectorCommand(s.exchangeDir, cmd); err != nil {
+		if errors.Is(err, journal.ErrCommandPending) {
+			http.Error(w, "Command already pending: a previous collector command has not been processed yet", http.StatusConflict)
+			return
+		}
+		http.Error(w, fmt.Sprintf("Failed to write command: %v", err), http.StatusInternalServerError)
+		return
+	}
+
+	msg := "Reauthentication mode requested. Open Setup Viewer (:14500) to sign in."
+	if command == "return_normal" {
+		msg = "Normal collection mode requested."
+	}
+	http.Redirect(w, r, "/?flash="+url.QueryEscape(msg), http.StatusSeeOther)
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
