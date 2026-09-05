@@ -301,6 +301,7 @@ export default definePlugin({
     description: "Captures in-process Discord Gateway events for allowlisted channels and persists them to segmented NDJSON via native IPC.",
     authors: [Devs.Vendicated],
     required: true,
+    startAt: "DOMContentLoaded",
 
     flux: {
         async MESSAGE_CREATE({ message }: { message: RawDiscordMessage }) {
@@ -409,7 +410,8 @@ export default definePlugin({
             try {
                 if (typeof window !== "undefined" && window.location) {
                     const path = window.location.pathname || "";
-                    if (path.startsWith("/channels")) {
+                    const hasAuthToken = typeof localStorage !== "undefined" && !!localStorage.getItem("token");
+                    if (path.startsWith("/channels") || (path.startsWith("/app") && hasAuthToken)) {
                         Native.reportAuthState(true);
                         extractAndPublishCatalog();
                         // Trigger startup gap recovery

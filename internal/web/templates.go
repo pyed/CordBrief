@@ -310,22 +310,29 @@ const indexTemplateHTML = `<!DOCTYPE html>
           {{else}}
             Your Discord session has expired or requires reauthentication.
           {{end}}
-          Sign in normally using the secure local setup viewer. CordBrief will automatically return to collection mode once logged in.
+          To authenticate, run the ephemeral setup tool:
         </p>
+        <div style="background: var(--code-bg); padding: 10px 12px; border-radius: 6px; font-family: monospace; font-size: 13px; margin-bottom: 12px; line-height: 1.6;">
+          # 1. Stop collector and launch setup viewer:<br>
+          <strong>docker compose stop cordbrief-collector && docker compose --profile setup up cordbrief-setup</strong><br><br>
+          # 2. Open viewer in browser and sign in:<br>
+          <a href="http://127.0.0.1:14500/" target="_blank" style="color: var(--primary); font-weight: bold;">http://127.0.0.1:14500/</a><br><br>
+          # 3. Once signed in, restart collector:<br>
+          <strong>docker compose start cordbrief-collector</strong>
+        </div>
         <div class="btn-group">
           <a href="http://127.0.0.1:14500/" target="_blank" class="btn btn-primary">
-            🖥 Open Discord Setup Viewer (:14500)
+            🖥 Open Setup Viewer (:14500)
           </a>
           <form method="POST" action="/api/collector/command" style="display: inline;">
             <input type="hidden" name="command" value="return_normal">
-            <button type="submit" class="btn btn-secondary">Resume Normal Mode</button>
+            <button type="submit" class="btn btn-secondary">Check Status</button>
           </form>
         </div>
         <div class="help-text" style="margin-top: 10px; line-height: 1.5;">
           <strong>Security Note:</strong> Port <code>14500</code> is bound to <code>127.0.0.1</code> (localhost) only to protect your Discord desktop session.<br>
           If managing CordBrief remotely on a NAS, forward ports over SSH:<br>
-          <code style="background: var(--code-bg); padding: 2px 6px; border-radius: 4px;">ssh -L 8080:127.0.0.1:8080 -L 14500:127.0.0.1:14500 user@nas</code><br>
-          Then open <a href="http://127.0.0.1:14500/" target="_blank" style="color: var(--primary);">http://127.0.0.1:14500/</a> on your local machine.
+          <code style="background: var(--code-bg); padding: 2px 6px; border-radius: 4px;">ssh -L 8080:127.0.0.1:8080 -L 14500:127.0.0.1:14500 user@nas</code>
         </div>
       </div>
     {{else if .DiscordAuthenticated}}
@@ -338,16 +345,13 @@ const indexTemplateHTML = `<!DOCTYPE html>
           Discord Desktop is running and capturing messages in background. If you need to switch accounts or refresh session tokens:
         </p>
         <div class="btn-group" style="margin-top: 0; margin-bottom: 10px;">
-          <form method="POST" action="/api/collector/command" onsubmit="return confirm('This will temporarily pause collection and launch the Discord setup viewer so you can re-authenticate. Proceed?');" style="display: inline-block;">
+          <form method="POST" action="/api/collector/command" onsubmit="return confirm('This will pause collection and request re-authentication. Proceed?');" style="display: inline-block;">
             <input type="hidden" name="command" value="enter_reauth">
             <button type="submit" class="btn btn-secondary">Reauthenticate Discord</button>
           </form>
-          <a href="http://127.0.0.1:14500/" target="_blank" class="btn btn-secondary">
-            Open Setup Viewer (:14500)
-          </a>
         </div>
         <div class="help-text">
-          Port <code>14500</code> is bound to <code>127.0.0.1</code>. For remote NAS access, use SSH port forwarding: <code>ssh -L 14500:127.0.0.1:14500 user@nas</code>.
+          Reauthentication runs via: <code>docker compose stop cordbrief-collector && docker compose --profile setup up cordbrief-setup</code>
         </div>
       </div>
     {{end}}

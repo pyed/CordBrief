@@ -679,6 +679,21 @@ export async function publishCatalog(_: IpcMainInvokeEvent, guilds: CatalogGuild
     }
 }
 
+export function initCatalogState(): void {
+    try {
+        const catalogPath = path.join(EXCHANGE_DIR, "catalog.json");
+        if (fs.existsSync(catalogPath)) {
+            const raw = fs.readFileSync(catalogPath, "utf8");
+            const parsed = JSON.parse(raw);
+            if (parsed && parsed.version === 1 && Array.isArray(parsed.guilds)) {
+                catalogState = "ready";
+                catalogUpdatedAt = parsed.updated_at || null;
+                lastCatalogContentHash = JSON.stringify(parsed.guilds);
+            }
+        }
+    } catch {}
+}
+
 export async function getRecoveryState(_?: IpcMainInvokeEvent): Promise<RecoveryStateRecord> {
     return loadRecoveryState();
 }
@@ -929,6 +944,7 @@ function startWatchlistMonitor(): void {
 try {
     initSegment();
     reconcilePendingRecovery();
+    initCatalogState();
     writeStatus("starting", true);
     startWatchlistMonitor();
 } catch {

@@ -26,6 +26,12 @@ import {
     writeCollectorStatus,
     CollectorSupervisor
 } from "../supervisor.mjs";
+import {
+    acquireRuntimeLock,
+    validateRuntimeManifest,
+    writeRuntimeManifest
+} from "../runtime.mjs";
+import { stageRuntime } from "../stage-runtime.mjs";
 
 function assert(condition, message) {
     if (!condition) {
@@ -819,6 +825,309 @@ async function runTests() {
             cdpServer.close();
         }
         console.log("  ✔ Interactive mode window activation & recovery guarantees verified.");
+    }
+
+    // [Test 12] Shared Runtime Ownership Lock (Mutual Exclusion & Stale Reclamation)
+    {
+        console.log("[Test 12] Shared Runtime Ownership Lock (Mutual Exclusion & Stale Reclamation)...");
+        const tmp = makeTempDir("cb-m11-lock-");
+        const lockFile = path.join(tmp, "runtime.lock");
+
+        // 1. First process (e.g. setup) acquires lock
+        const lock1 = acquireRuntimeLock(lockFile, "setup", {
+            staleMs: 500,
+            heartbeatMs: 100,
+            pid: 1001,
+            hostname: "test-host"
+        });
+        assert(lock1.acquired === true, "Process 1 must acquire lock");
+        assert(fs.existsSync(lockFile), "Lock file must exist on disk");
+
+        const content1 = JSON.parse(fs.readFileSync(lockFile, "utf8"));
+        assert(content1.holder === "setup", "Lock holder must be setup");
+        assert(content1.pid === 1001, "PID must match");
+        assert(content1.version === 1, "Lock version must be 1");
+
+        // 2. Second process (e.g. collector) attempts acquisition -> must fail
+        const lock2 = acquireRuntimeLock(lockFile, "collector", {
+            staleMs: 500,
+            heartbeatMs: 100,
+            pid: 2002,
+            hostname: "test-host"
+        });
+        assert(lock2.acquired === false, "Process 2 must be rejected while process 1 holds lock");
+        assert(lock2.existing.holder === "setup", "Rejected acquisition must identify active holder");
+        assert(lock2.existing.pid === 1001, "Rejected acquisition must identify active PID");
+
+        // 3. Heartbeat update test
+        const initialHb = content1.heartbeat_at;
+        await new Promise(r => setTimeout(r, 150));
+        const contentAfterHb = JSON.parse(fs.readFileSync(lockFile, "utf8"));
+        assert(new Date(contentAfterHb.heartbeat_at).getTime() > new Date(initialHb).getTime(), "Heartbeat must advance timestamp");
+
+        // 4. Process 1 releases lock cleanly
+        lock1.release();
+        assert(!fs.existsSync(lockFile), "Clean release must remove lock file");
+
+        // 5. Now process 2 can acquire lock
+        const lock3 = acquireRuntimeLock(lockFile, "collector", {
+            staleMs: 500,
+            heartbeatMs: 100,
+            pid: 2002,
+            hostname: "test-host"
+        });
+        assert(lock3.acquired === true, "Process 2 acquires lock after release");
+        assert(JSON.parse(fs.readFileSync(lockFile, "utf8")).holder === "collector", "Holder is collector");
+        const ownerFile = path.join(path.dirname(lockFile), "runtime-owner.json");
+        assert(fs.existsSync(ownerFile), "Diagnostic runtime-owner.json created");
+        const ownerData = JSON.parse(fs.readFileSync(ownerFile, "utf8"));
+        assert(ownerData.holder === "collector", "Owner holder recorded in diagnostics");
+
+        // 6. Stale lease reclamation: simulate crashed process without clean release
+        // Clear timer so it stops heartbeating
+        lock3.release();
+        // Artificially create a stale lock file with heartbeat in the past
+        const staleLock = {
+            version: 1,
+            holder: "crashed-process",
+            pid: 9999,
+            hostname: "test-host",
+            acquired_at: new Date(Date.now() - 10000).toISOString(),
+            heartbeat_at: new Date(Date.now() - 5000).toISOString()
+        };
+        fs.writeFileSync(lockFile, JSON.stringify(staleLock, null, 2), "utf8");
+
+        // Attempt acquisition with staleMs = 1000 -> should reclaim stale lock
+        const lock4 = acquireRuntimeLock(lockFile, "collector", {
+            staleMs: 1000,
+            heartbeatMs: 100,
+            pid: 3003,
+            hostname: "test-host"
+        });
+        assert(lock4.acquired === true, "Must reclaim stale lease when heartbeat exceeds staleMs");
+        assert(JSON.parse(fs.readFileSync(lockFile, "utf8")).holder === "collector", "New holder acquired reclaimed lease");
+        lock4.release();
+
+        console.log("  ✔ Shared runtime ownership lock & stale reclamation verified.");
+    }
+
+    // [Test 13] Runtime Manifest Validation & Preparation
+    {
+        console.log("[Test 13] Runtime Manifest Validation & Preparation...");
+        const tmp = makeTempDir("cb-m11-manifest-");
+        const manifestFile = path.join(tmp, "runtime-manifest.json");
+
+        // 1. Non-existent manifest
+        const val1 = validateRuntimeManifest(manifestFile);
+        assert(val1.valid === false, "Missing manifest must be invalid");
+        assert(val1.reason === "manifest_not_found", "Reason is manifest_not_found");
+
+        // 2. Invalid schema (missing patcher_entry)
+        fs.writeFileSync(manifestFile, JSON.stringify({ manifest_version: 1, paths: {} }));
+        const val2 = validateRuntimeManifest(manifestFile);
+        assert(val2.valid === false, "Manifest missing patcher_entry must be invalid");
+
+        // 3. Pointing to missing patcher file
+        const missingPatcher = path.join(tmp, "nonexistent", "patcher.js");
+        fs.writeFileSync(manifestFile, JSON.stringify({
+            manifest_version: 1,
+            paths: { vencord_dist: "nonexistent", vencord_patcher: "nonexistent/patcher.js" }
+        }));
+        const val3 = validateRuntimeManifest(manifestFile);
+        assert(val3.valid === false, "Missing patcher file must be invalid");
+        assert(val3.reason === "patcher_entry_file_missing", "Reason is patcher_entry_file_missing");
+
+        // 4. Valid manifest with relative paths and atomic write
+        const distDir = path.join(tmp, "dist");
+        fs.mkdirSync(distDir, { recursive: true });
+        const patcherPath = path.join(distDir, "patcher.js");
+        fs.writeFileSync(patcherPath, "console.log('vencord patcher');");
+
+        const written = writeRuntimeManifest(manifestFile, {
+            discord_version: "1.0.156",
+            vencord_version: "1.0.0",
+            plugin_version: "1.0.0",
+            paths: {
+                discord_executable: "discord/Discord",
+                vencord_dist: "dist",
+                vencord_patcher: "dist/patcher.js"
+            }
+        });
+        assert(written.manifest_version === 1, "Written manifest version is 1");
+        assert(written.paths.vencord_patcher === "dist/patcher.js", "Relative patcher stored");
+
+        const val4 = validateRuntimeManifest(manifestFile);
+        assert(val4.valid === true, "Valid manifest must pass validation");
+
+        console.log("  ✔ Runtime manifest validation & preparation verified.");
+    }
+
+    // [Test 14] End-to-End Runtime Staging & Patcher Wiring
+    {
+        console.log("[Test 14] End-to-End Runtime Staging & Patcher Wiring...");
+        const tmp = makeTempDir("cb-m11-stage-");
+        const vencordSrc = path.join(tmp, "vencord");
+        const vencordDist = path.join(vencordSrc, "dist");
+        fs.mkdirSync(vencordDist, { recursive: true });
+        fs.writeFileSync(path.join(vencordDist, "patcher.js"), "console.log('staged patcher');");
+        fs.writeFileSync(path.join(vencordDist, "patcher.css"), "body { color: white; }");
+
+        const discordConfigDir = path.join(tmp, "discord-config");
+        const appDir = path.join(discordConfigDir, "app-1.0.156");
+        const resourcesDir = path.join(appDir, "resources");
+        const modulesDir = path.join(appDir, "modules", "discord_desktop_core-1", "discord_desktop_core");
+        fs.mkdirSync(resourcesDir, { recursive: true });
+        fs.mkdirSync(modulesDir, { recursive: true });
+        fs.writeFileSync(path.join(resourcesDir, "app.asar"), "CLEAN_OFFICIAL_DISCORD_ASAR");
+        fs.writeFileSync(path.join(modulesDir, "index.js"), "module.exports = { core: true };");
+
+        const runtimeDir = path.join(tmp, "runtime");
+
+        // Run staging
+        const res = stageRuntime({
+            runtimeDir,
+            vencordSourceDir: vencordSrc,
+            discordConfigDir
+        });
+
+        // 1. Verify files copied to versioned release and activated via current symlink
+        assert(fs.existsSync(path.join(runtimeDir, "current", "vencord", "dist", "patcher.js")), "patcher.js accessible via current symlink");
+        assert(fs.existsSync(path.join(runtimeDir, "current", "vencord", "dist", "patcher.css")), "patcher.css accessible via current symlink");
+        assert(fs.existsSync(path.join(runtimeDir, "current", "discord")), "discord app directory accessible via current symlink");
+
+        // 2. Verify internal module aliasing works
+        assert(fs.existsSync(path.join(runtimeDir, "current", "discord", "modules", "discord_desktop_core", "index.js")), "Internal module alias created");
+
+        // 3. Verify manifest valid under current with relative paths
+        const manifestPath = path.join(runtimeDir, "current", "runtime-manifest.json");
+        const val = validateRuntimeManifest(manifestPath);
+        assert(val.valid === true, "Manifest is valid under current");
+        assert(val.manifest.discord_version === "1.0.156", "Discord version recorded");
+        assert(val.manifest.paths.discord_executable === "discord/Discord", "Relative discord executable path");
+        assert(val.manifest.paths.vencord_patcher === "vencord/dist/patcher.js", "Relative patcher path");
+
+        // 4. Verify staged release directory exists
+        const releaseDir = path.join(runtimeDir, "releases", res.releaseId);
+        assert(fs.existsSync(releaseDir), "Versioned release directory exists on disk");
+
+        // 5. Verify staged Discord asar inside release requires runtime current patcher path
+        const stagedAsar = path.join(runtimeDir, "current", "discord", "resources", "app.asar");
+        assert(fs.existsSync(stagedAsar), "Staged app.asar exists");
+        const patchedAsar = fs.readFileSync(stagedAsar, "utf8");
+        const expectedPatcherPath = path.join(runtimeDir, "current", "vencord", "dist", "patcher.js");
+        const escapedPath = JSON.stringify(expectedPatcherPath).slice(1, -1);
+        assert(patchedAsar.includes(escapedPath), `Patched app.asar must reference runtime current patcher path: ${escapedPath}`);
+
+        // 6. Verify fast reuse without re-staging on REAUTH
+        const res2 = stageRuntime({
+            runtimeDir,
+            vencordSourceDir: vencordSrc,
+            discordConfigDir
+        });
+        assert(res2.reused === true, "Fast reuse must not re-stage when runtime is compatible");
+
+        console.log("  ✔ End-to-end runtime staging & patcher wiring verified.");
+    }
+
+    // [Test 15] Collector Role Manifest Enforcement & Setup Handoff
+    {
+        console.log("[Test 15] Collector Role Manifest Enforcement & Setup Handoff...");
+        const tmp = makeTempDir("cb-m11-role-");
+        const runtimeDir = path.join(tmp, "runtime");
+        const exchangeDir = path.join(tmp, "exchange");
+        const dataDir = path.join(tmp, "data");
+        const discordDir = path.join(tmp, "discord");
+        fs.mkdirSync(exchangeDir, { recursive: true });
+        fs.mkdirSync(dataDir, { recursive: true });
+        fs.mkdirSync(discordDir, { recursive: true });
+
+        // Case A: Missing runtime manifest -> collector halts and publishes setup_required
+        const supA = new CollectorSupervisor({
+            role: "collector",
+            runtimeDir,
+            exchangeDir,
+            collectorDataDir: dataDir,
+            discordConfigDir: discordDir,
+            spawnDiscord: false,
+            enableLock: true
+        });
+
+        const startedA = await supA.start();
+        assert(startedA === false, "Collector must fail to start when manifest is missing");
+        assert(supA.collectorState === "setup_required", "State must be setup_required");
+        assert(supA.mode === MODES.SETUP, "Mode must be setup");
+        assert(supA.lockHandle === null, "Lock must be released when halting for setup");
+
+        const statusFile = path.join(exchangeDir, "collector-status.json");
+        assert(fs.existsSync(statusFile), "Status file must be published");
+        const statusA = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+        assert(statusA.collector_state === "setup_required", "Published status reflects setup_required");
+
+        // Case B: Valid runtime manifest exists under current -> collector boots to NORMAL
+        const currentDir = path.join(runtimeDir, "current");
+        const distDir = path.join(currentDir, "vencord", "dist");
+        fs.mkdirSync(distDir, { recursive: true });
+        fs.writeFileSync(path.join(distDir, "patcher.js"), "console.log('valid');");
+        const manifestFile = path.join(currentDir, "runtime-manifest.json");
+        writeRuntimeManifest(manifestFile, {
+            discord_version: "1.0.156",
+            vencord_version: "1.0.0",
+            plugin_version: "1.0.0",
+            vencord_dist: distDir,
+            patcher_entry: path.join(distDir, "patcher.js")
+        });
+
+        // Set up mock profile with local storage
+        const appDir = path.join(discordDir, "app-1.0.156");
+        const resDir = path.join(appDir, "resources");
+        fs.mkdirSync(resDir, { recursive: true });
+        fs.writeFileSync(path.join(resDir, "app.asar"), "CLEAN");
+        fs.mkdirSync(path.join(discordDir, "Local Storage"), { recursive: true });
+
+        // Create mock CDP server with authenticated route
+        const cdpServer = http.createServer((req, res) => {
+            if (req.url === "/json") {
+                res.writeHead(200, { "Content-Type": "application/json" });
+                res.end(JSON.stringify([{ type: "page", url: "https://discord.com/channels/@me", title: "Discord" }]));
+            } else {
+                res.writeHead(404);
+                res.end();
+            }
+        });
+        await new Promise(r => cdpServer.listen(0, "127.0.0.1", r));
+        const mockPort = cdpServer.address().port;
+
+        const supB = new CollectorSupervisor({
+            role: "collector",
+            runtimeDir,
+            exchangeDir,
+            collectorDataDir: dataDir,
+            discordConfigDir: discordDir,
+            cdpPort: mockPort,
+            spawnDiscord: false,
+            enableLock: true
+        });
+
+        try {
+            await supB.start();
+            assert(supB.collectorState === "running", "State must be running");
+            assert(supB.mode === MODES.NORMAL, "Mode must be normal");
+            assert(supB.discordAuthenticated === true, "Must be authenticated");
+            assert(supB.lockHandle !== null, "Lock must be held while running");
+
+            // Verify lock file exists on disk
+            const lockFile = path.join(runtimeDir, "runtime.lock");
+            assert(fs.existsSync(lockFile), "Lock file must be active");
+            const lockData = JSON.parse(fs.readFileSync(lockFile, "utf8"));
+            assert(lockData.holder === "collector", "Lock holder is collector");
+
+            await supB.stop();
+            assert(!fs.existsSync(lockFile), "Lock must be cleared on stop");
+        } finally {
+            cdpServer.close();
+        }
+
+        console.log("  ✔ Collector role manifest enforcement & setup handoff verified.");
     }
 
     console.log("=== ALL OPERATIONAL TESTS: 100% PASSED ===");

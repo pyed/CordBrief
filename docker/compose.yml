@@ -1,31 +1,37 @@
-# CordBrief Architecture v2: Two-Service Production Docker Compose Foundation
+# CordBrief Architecture v2: Split Setup/Runtime Architecture
 #
-# Security Boundary:
-# - cordbrief-collector: Runs Discord Desktop + Vencord. Has Discord profile/keyring/session access.
-#   Has NO access to LLM credentials, prompts, or delivery secrets.
+# Security & Process Boundary:
+# - cordbrief-collector: Lightweight headless daemon running official Discord + Vencord dist under Xvfb.
+#   Stripped of Xpra, Python, compilers, git, and build tools. No published ports.
+# - cordbrief-setup: Ephemeral setup and reauthentication tool with Xpra HTML5 viewer on 127.0.0.1:14500.
+#   Builds Vencord with CordBrief userplugin, stages runtime volume releases, and yields.
+#   Runs on-demand via: docker compose --profile setup up cordbrief-setup
 # - cordbrief-core: Runs Go core application. Reads journal events and manages watchlist.
-#   Has NO access to Discord profile, session storage, or keyring.
-# - The ONLY integration between services is the shared filesystem exchange volume.
+# - Inter-service boundaries:
+#   - cordbrief_discord_runtime: shared prepared application binaries and runtime releases
+#   - cordbrief_exchange: filesystem events, status, watchlist, and command exchange
+#   - Single-writer / single-ownership enforced by Linux kernel flock(2) on runtime.lock
 
 services:
-  # 1. Ingestion Service: Official Discord Desktop + Vencord Collector
+  # 1. Minimal Production Ingestion Daemon: Headless Discord + Vencord
   cordbrief-collector:
+    image: docker-cordbrief-collector:latest
     build:
       context: ../collector
-      dockerfile: Dockerfile
+      dockerfile: Dockerfile.runtime
     container_name: cordbrief-collector
     restart: unless-stopped
     shm_size: "1gb"
     user: "1000:1000"
-    ports:
-      # Expose Xpra HTML5 client exclusively to localhost for first-time login
-      - "127.0.0.1:14500:14500"
     environment:
       - CORDBRIEF_EXCHANGE_DIR=/var/cordbrief/exchange
-      - XPRA_PORT=14500
+      - CORDBRIEF_COLLECTOR_DATA_DIR=/var/lib/cordbrief
+      - CORDBRIEF_RUNTIME_DIR=/var/cordbrief/runtime
       - DISPLAY=:100
     volumes:
-      # Persistent Discord authenticated session & profile
+      # Prepared Discord application binaries and active release
+      - cordbrief_discord_runtime:/var/cordbrief/runtime
+      # Persistent Discord user session (cookies, LocalStorage - no application binaries)
       - cordbrief_discord_profile:/home/cordbrief/.config/discord
       # Persistent GNOME Keyring for Discord secret token storage
       - cordbrief_discord_keyring:/home/cordbrief/.local/share/keyrings
@@ -40,7 +46,34 @@ services:
       retries: 3
       start_period: 15s
 
-  # 2. Core Service: Journal consumer, watchlist manager, and future summarization/delivery
+  # 2. Ephemeral Setup & Reauthentication Tool (Interactive Xpra HTML5 Viewer)
+  cordbrief-setup:
+    image: docker-cordbrief-setup:latest
+    build:
+      context: ../collector
+      dockerfile: Dockerfile.setup
+    container_name: cordbrief-setup
+    profiles:
+      - setup
+    shm_size: "1gb"
+    user: "1000:1000"
+    ports:
+      # Expose Xpra HTML5 client exclusively to localhost for first-time login / reauth
+      - "127.0.0.1:14500:14500"
+    environment:
+      - CORDBRIEF_EXCHANGE_DIR=/var/cordbrief/exchange
+      - CORDBRIEF_COLLECTOR_DATA_DIR=/var/lib/cordbrief
+      - CORDBRIEF_RUNTIME_DIR=/var/cordbrief/runtime
+      - XPRA_PORT=14500
+      - DISPLAY=:100
+    volumes:
+      - cordbrief_discord_runtime:/var/cordbrief/runtime
+      - cordbrief_discord_profile:/home/cordbrief/.config/discord
+      - cordbrief_discord_keyring:/home/cordbrief/.local/share/keyrings
+      - cordbrief_exchange:/var/cordbrief/exchange
+      - cordbrief_collector_data:/var/lib/cordbrief
+
+  # 3. Core Service: Journal consumer, watchlist manager, and summarization/delivery
   cordbrief-core:
     build:
       context: ..
@@ -74,6 +107,9 @@ services:
       start_period: 10s
 
 volumes:
+  # Shared prepared Discord runtime volume (releases, current symlink, runtime.lock)
+  cordbrief_discord_runtime:
+    name: cordbrief_discord_runtime
   # Shared exchange volume (inter-service boundary)
   cordbrief_exchange:
     name: cordbrief_exchange

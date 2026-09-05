@@ -9,6 +9,9 @@
 import { spawn, execSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
+import * as http from "http";
+import { acquireRuntimeLock, validateRuntimeManifest } from "./runtime.mjs";
+import { stageRuntime } from "./stage-runtime.mjs";
 
 export const MODES = {
     SETUP: "setup",
@@ -84,33 +87,29 @@ export function patchVencord(appDir, vencordDistDir = "/home/cordbrief/vencord/d
     }
 
     // Now install the Vencord loader into app.asar
-    if (fs.existsSync(shimBackup)) {
-        fs.copyFileSync(shimBackup, appAsar);
-    } else {
-        const patcherPath = path.join(vencordDistDir, "patcher.js");
-        const loaderJs = `require(${JSON.stringify(patcherPath)})`;
-        const pkgJson = '{\n\t"name": "discord",\n\t"main": "index.js"\n}\n';
-        const filesObj = {
-            files: {
-                "index.js": { size: Buffer.byteLength(loaderJs), offset: "0" },
-                "package.json": { size: Buffer.byteLength(pkgJson), offset: String(Buffer.byteLength(loaderJs)) }
-            }
-        };
-        const headerJson = JSON.stringify(filesObj);
-        const headerBuf = Buffer.from(headerJson, "utf8");
-        const payloadBuf = Buffer.concat([Buffer.from(loaderJs, "utf8"), Buffer.from(pkgJson, "utf8")]);
+    const patcherPath = path.join(vencordDistDir, "patcher.js");
+    const loaderJs = `require(${JSON.stringify(patcherPath)})`;
+    const pkgJson = '{\n\t"name": "discord",\n\t"main": "index.js"\n}\n';
+    const filesObj = {
+        files: {
+            "index.js": { size: Buffer.byteLength(loaderJs), offset: "0" },
+            "package.json": { size: Buffer.byteLength(pkgJson), offset: String(Buffer.byteLength(loaderJs)) }
+        }
+    };
+    const headerJson = JSON.stringify(filesObj);
+    const headerBuf = Buffer.from(headerJson, "utf8");
+    const payloadBuf = Buffer.concat([Buffer.from(loaderJs, "utf8"), Buffer.from(pkgJson, "utf8")]);
 
-        const buf = Buffer.alloc(16 + headerBuf.length + payloadBuf.length);
-        buf.writeUInt32LE(4, 0);
-        buf.writeUInt32LE(headerBuf.length + 8, 4);
-        buf.writeUInt32LE(headerBuf.length + 4, 8);
-        buf.writeUInt32LE(headerBuf.length, 12);
-        headerBuf.copy(buf, 16);
-        payloadBuf.copy(buf, 16 + headerBuf.length);
+    const buf = Buffer.alloc(16 + headerBuf.length + payloadBuf.length);
+    buf.writeUInt32LE(4, 0);
+    buf.writeUInt32LE(headerBuf.length + 8, 4);
+    buf.writeUInt32LE(headerBuf.length + 4, 8);
+    buf.writeUInt32LE(headerBuf.length, 12);
+    headerBuf.copy(buf, 16);
+    payloadBuf.copy(buf, 16 + headerBuf.length);
 
-        fs.writeFileSync(appAsar, buf);
-        fs.writeFileSync(shimBackup, buf);
-    }
+    fs.writeFileSync(appAsar, buf);
+    fs.writeFileSync(shimBackup, buf);
     return true;
 }
 
@@ -209,6 +208,72 @@ export function ensureMainWindowActive(display = process.env.DISPLAY || ":100", 
     }
 }
 
+export function sendCdpCommand(wsUrl, messageObj, timeoutMs = 2000) {
+    return new Promise((resolve) => {
+        let timer = null;
+        let socket = null;
+        const done = (val) => {
+            if (timer) clearTimeout(timer);
+            if (socket) {
+                try { socket.destroy(); } catch {}
+            }
+            resolve(val);
+        };
+        timer = setTimeout(() => done(null), timeoutMs);
+
+        try {
+            const parsed = new URL(wsUrl);
+            const req = http.request({
+                host: parsed.hostname || "127.0.0.1",
+                port: parsed.port || 9222,
+                path: parsed.pathname + parsed.search,
+                headers: {
+                    "Connection": "Upgrade",
+                    "Upgrade": "websocket",
+                    "Sec-WebSocket-Version": "13",
+                    "Sec-WebSocket-Key": Buffer.from("cdp-cordbrief-key").toString("base64")
+                }
+            });
+
+            req.on("upgrade", (res, sock) => {
+                socket = sock;
+                const payload = Buffer.from(JSON.stringify(messageObj), "utf8");
+                let header;
+                if (payload.length < 126) {
+                    header = Buffer.from([0x81, 0x80 | payload.length, 0, 0, 0, 0]);
+                } else {
+                    header = Buffer.alloc(8);
+                    header[0] = 0x81;
+                    header[1] = 0x80 | 126;
+                    header.writeUInt16BE(payload.length, 2);
+                    header.fill(0, 4, 8);
+                }
+                socket.write(Buffer.concat([header, payload]));
+
+                let raw = Buffer.alloc(0);
+                socket.on("data", (chunk) => {
+                    raw = Buffer.concat([raw, chunk]);
+                    const str = raw.toString("utf8");
+                    const jsonStart = str.indexOf("{");
+                    const jsonEnd = str.lastIndexOf("}");
+                    if (jsonStart !== -1 && jsonEnd !== -1 && jsonEnd > jsonStart) {
+                        try {
+                            const parsedMsg = JSON.parse(str.slice(jsonStart, jsonEnd + 1));
+                            done(parsedMsg);
+                        } catch {}
+                    }
+                });
+                socket.on("error", () => done(null));
+            });
+
+            req.on("error", () => done(null));
+            req.end();
+        } catch {
+            done(null);
+        }
+    });
+}
+
 export async function triggerCdpReload(port = 9222, timeoutMs = 3000) {
     const controller = new AbortController();
     const timer = setTimeout(() => controller.abort(), timeoutMs);
@@ -218,34 +283,43 @@ export async function triggerCdpReload(port = 9222, timeoutMs = 3000) {
         const pages = await resp.json();
         if (!Array.isArray(pages)) return false;
         const appPage = pages.find(item => item.type === "page" && (item.url?.includes("/app") || item.title === "Discord") && !item.url?.includes("splash"));
-        if (!appPage || !appPage.webSocketDebuggerUrl || typeof WebSocket === "undefined") return false;
+        if (!appPage || !appPage.webSocketDebuggerUrl) return false;
 
-        return await new Promise(resolve => {
-            const ws = new WebSocket(appPage.webSocketDebuggerUrl);
-            const wsTimer = setTimeout(() => {
-                try { ws.close(); } catch {}
-                resolve(false);
-            }, 2000);
+        if (typeof WebSocket !== "undefined") {
+            return await new Promise(resolve => {
+                const ws = new WebSocket(appPage.webSocketDebuggerUrl);
+                const wsTimer = setTimeout(() => {
+                    try { ws.close(); } catch {}
+                    resolve(false);
+                }, 2000);
 
-            ws.onopen = () => {
-                ws.send(JSON.stringify({
-                    id: 99,
-                    method: "Page.reload",
-                    params: { ignoreCache: true }
-                }));
-            };
+                ws.onopen = () => {
+                    ws.send(JSON.stringify({
+                        id: 99,
+                        method: "Page.reload",
+                        params: { ignoreCache: true }
+                    }));
+                };
 
-            ws.onmessage = () => {
-                clearTimeout(wsTimer);
-                try { ws.close(); } catch {}
-                resolve(true);
-            };
+                ws.onmessage = () => {
+                    clearTimeout(wsTimer);
+                    try { ws.close(); } catch {}
+                    resolve(true);
+                };
 
-            ws.onerror = () => {
-                clearTimeout(wsTimer);
-                resolve(false);
-            };
-        });
+                ws.onerror = () => {
+                    clearTimeout(wsTimer);
+                    resolve(false);
+                };
+            });
+        }
+
+        const res = await sendCdpCommand(appPage.webSocketDebuggerUrl, {
+            id: 99,
+            method: "Page.reload",
+            params: { ignoreCache: true }
+        }, timeoutMs);
+        return res !== null;
     } catch {
         return false;
     } finally {
@@ -281,55 +355,68 @@ export async function inspectDiscordAuth(port = 9222, timeoutMs = 2000) {
         }
 
         // Discord desktop /app route: inspect authenticated state in localStorage via DevTools WebSocket
-        if (appPage.webSocketDebuggerUrl && typeof WebSocket !== "undefined") {
-            return await new Promise(resolve => {
-                const ws = new WebSocket(appPage.webSocketDebuggerUrl);
-                const wsTimer = setTimeout(() => {
-                    try { ws.close(); } catch {}
-                    resolve({ authenticated: false, url, reason: "ws_timeout" });
-                }, 1500);
+        if (appPage.webSocketDebuggerUrl) {
+            let parsed = null;
+            if (typeof WebSocket !== "undefined") {
+                parsed = await new Promise(resolve => {
+                    const ws = new WebSocket(appPage.webSocketDebuggerUrl);
+                    const wsTimer = setTimeout(() => {
+                        try { ws.close(); } catch {}
+                        resolve(null);
+                    }, 1500);
 
-                ws.onopen = () => {
-                    ws.send(JSON.stringify({
-                        id: 1,
-                        method: "Runtime.evaluate",
-                        params: {
-                            expression: "({ hasToken: !!localStorage.getItem('token'), userId: localStorage.getItem('user_id_cache'), pathname: window.location.pathname, appMountChildren: document.getElementById('app-mount')?.childElementCount || 0 })",
-                            returnByValue: true
-                        }
-                    }));
-                };
+                    ws.onopen = () => {
+                        ws.send(JSON.stringify({
+                            id: 1,
+                            method: "Runtime.evaluate",
+                            params: {
+                                expression: "({ hasToken: !!localStorage.getItem('token'), userId: localStorage.getItem('user_id_cache'), pathname: window.location.pathname, appMountChildren: document.getElementById('app-mount')?.childElementCount || 0 })",
+                                returnByValue: true
+                            }
+                        }));
+                    };
 
-                ws.onmessage = (ev) => {
-                    clearTimeout(wsTimer);
-                    try { ws.close(); } catch {}
-                    try {
-                        const parsed = JSON.parse(ev.data);
-                        const val = parsed?.result?.result?.value;
-                        if (val && val.pathname === "/login") {
-                            resolve({ authenticated: false, url: val.pathname, reason: "login_url" });
-                        } else if (val && val.hasToken && val.userId) {
-                            resolve({
-                                authenticated: true,
-                                url: val.pathname || url,
-                                userId: val.userId,
-                                hasToken: true,
-                                appMountChildren: val.appMountChildren,
-                                reason: val.appMountChildren === 0 ? "app_mount_empty" : null
-                            });
-                        } else {
-                            resolve({ authenticated: false, url: val?.pathname || url, reason: "no_token_or_login" });
+                    ws.onmessage = (ev) => {
+                        clearTimeout(wsTimer);
+                        try { ws.close(); } catch {}
+                        try {
+                            resolve(JSON.parse(ev.data));
+                        } catch {
+                            resolve(null);
                         }
-                    } catch {
-                        resolve({ authenticated: false, url, reason: "eval_error" });
+                    };
+
+                    ws.onerror = () => {
+                        clearTimeout(wsTimer);
+                        resolve(null);
+                    };
+                });
+            } else {
+                parsed = await sendCdpCommand(appPage.webSocketDebuggerUrl, {
+                    id: 1,
+                    method: "Runtime.evaluate",
+                    params: {
+                        expression: "({ hasToken: !!localStorage.getItem('token'), userId: localStorage.getItem('user_id_cache'), pathname: window.location.pathname, appMountChildren: document.getElementById('app-mount')?.childElementCount || 0 })",
+                        returnByValue: true
                     }
-                };
+                }, 1500);
+            }
 
-                ws.onerror = () => {
-                    clearTimeout(wsTimer);
-                    resolve({ authenticated: false, url, reason: "ws_error" });
+            const val = parsed?.result?.result?.value;
+            if (val && val.pathname === "/login") {
+                return { authenticated: false, url: val.pathname, reason: "login_url" };
+            } else if (val && val.hasToken && val.userId) {
+                return {
+                    authenticated: true,
+                    url: val.pathname || url,
+                    userId: val.userId,
+                    hasToken: true,
+                    appMountChildren: val.appMountChildren,
+                    reason: val.appMountChildren === 0 ? "app_mount_empty" : null
                 };
-            });
+            } else if (val) {
+                return { authenticated: false, url: val?.pathname || url, reason: "no_token_or_login" };
+            }
         }
 
         return { authenticated: false, url, reason: "unrecognized_route" };
@@ -403,6 +490,17 @@ export class CollectorSupervisor {
         this.sawUnauthenticated = false;
         this.hasAttemptedColdStartReload = false;
         this.discordProcessStartTime = 0;
+        this.isStoppingDiscord = false;
+        this.restartTimer = null;
+
+        this.role = options.role || process.env.CORDBRIEF_ROLE || "standalone";
+        this.runtimeDir = options.runtimeDir || process.env.CORDBRIEF_RUNTIME_DIR || "/var/cordbrief/runtime";
+        this.runtimeLockFile = options.runtimeLockFile || path.join(this.runtimeDir, "runtime.lock");
+        this.runtimeManifestFile = options.runtimeManifestFile || path.join(this.runtimeDir, "current", "runtime-manifest.json");
+        this.legacyRuntimeManifestFile = path.join(this.runtimeDir, "runtime-manifest.json");
+        this.enableLock = options.enableLock ?? (Boolean(process.env.CORDBRIEF_ROLE) && options.role !== "test" && options.spawnDiscord !== false && !options.disableLock);
+        this.exitOnSetupComplete = options.exitOnSetupComplete ?? (this.role === "setup");
+        this.lockHandle = null;
     }
 
     loadLastAckedRequestId() {
@@ -415,6 +513,24 @@ export class CollectorSupervisor {
             }
         } catch {}
         return null;
+    }
+
+    getVencordDistDir() {
+        if (this.role === "collector") {
+            const val = validateRuntimeManifest(this.runtimeManifestFile);
+            if (val.valid && val.manifest.paths?.vencord_dist) {
+                return val.manifest.paths.vencord_dist;
+            }
+            if (fs.existsSync(this.legacyRuntimeManifestFile)) {
+                const legVal = validateRuntimeManifest(this.legacyRuntimeManifestFile);
+                if (legVal.valid && legVal.manifest.paths?.vencord_dist) {
+                    return legVal.manifest.paths.vencord_dist;
+                }
+            }
+        }
+        const candidate = path.join(this.vencordDir, "dist");
+        if (fs.existsSync(candidate)) return candidate;
+        return this.vencordDir;
     }
 
     hasProfileSessionFiles() {
@@ -476,6 +592,19 @@ export class CollectorSupervisor {
                 if (runtime.recovery_last_at) recoveryLastAt = runtime.recovery_last_at;
                 if (typeof runtime.recovery_pending_channels === "number") recoveryPendingChannels = runtime.recovery_pending_channels;
                 if (runtime.recovery_last_error) recoveryLastError = runtime.recovery_last_error;
+            }
+
+            if (catalogState === "unavailable") {
+                const catalogPath = path.join(this.exchangeDir, "catalog.json");
+                if (fs.existsSync(catalogPath)) {
+                    try {
+                        const cat = JSON.parse(fs.readFileSync(catalogPath, "utf8"));
+                        if (cat && cat.version === 1 && Array.isArray(cat.guilds)) {
+                            catalogState = "ready";
+                            catalogUpdatedAt = cat.updated_at || null;
+                        }
+                    } catch {}
+                }
             }
         } else {
             // In SETUP, REAUTH, or unauthenticated: catalog and continuity are unavailable
@@ -638,24 +767,95 @@ export class CollectorSupervisor {
 
         await this.stopDiscordProcess();
         const appDir = getLatestAppDir(this.discordConfigDir);
-        if (appDir) {
-            patchVencord(appDir, path.join(this.vencordDir, "dist"));
+
+        if (this.role === "setup") {
+            console.log("[Supervisor] Setup role detected: staging runtime distribution release...");
+            let releaseId = "unknown";
+            try {
+                const staged = stageRuntime({
+                    runtimeDir: this.runtimeDir,
+                    vencordSourceDir: this.vencordDir,
+                    discordConfigDir: this.discordConfigDir,
+                    force: true
+                });
+                releaseId = staged.releaseId;
+                console.log(`[Supervisor] Successfully staged and activated runtime release: ${releaseId}`);
+            } catch (stErr) {
+                console.error("[Supervisor] Runtime staging error:", stErr.message);
+                this.lastError = `runtime_staging_failed: ${stErr.message}`;
+            }
+
+            // Write final setup completion status
+            this.mode = MODES.NORMAL;
+            this.collectorState = "ready";
+            this.discordAuthenticated = true;
+            this.publishStatus();
+
+            console.log("==================================================");
+            console.log("[Setup] CORDBRIEF SETUP COMPLETE!");
+            console.log("[Setup] Official Discord authenticated successfully.");
+            console.log(`[Setup] Runtime release staged and activated: ${releaseId}`);
+            console.log("[Setup] Terminating setup environment and releasing runtime lock.");
+            console.log("[Setup] You may now start the minimal collector daemon:");
+            console.log("  docker compose start cordbrief-collector");
+            console.log("==================================================");
+
+            if (this.lockHandle) {
+                this.lockHandle.release();
+                this.lockHandle = null;
+            }
+
+            try {
+                const ownerFile = path.join(this.runtimeDir, "runtime-owner.json");
+                if (fs.existsSync(ownerFile)) {
+                    fs.unlinkSync(ownerFile);
+                }
+            } catch {}
+
+            if (this.exitOnSetupComplete !== false) {
+                const display = process.env.DISPLAY || ":100";
+                try {
+                    execSync(`xpra stop ${display}`, { stdio: "ignore" });
+                } catch (err) {
+                    console.warn("[Setup] Notice during xpra stop:", err.message);
+                }
+                process.exit(0);
+            }
+            return;
         }
+
+        if (appDir) {
+            let distDir = this.getVencordDistDir();
+            patchVencord(appDir, distDir);
+        }
+        this.collectorState = "running";
+        this.publishStatus();
         await this.startDiscordProcess();
     }
 
     async startDiscordProcess() {
+        if (this.restartTimer) {
+            clearTimeout(this.restartTimer);
+            this.restartTimer = null;
+        }
         this.hasAttemptedColdStartReload = false;
         this.sawUnauthenticated = false;
         this.discordProcessStartTime = Date.now();
 
-        if (!this.spawnDiscord || this.discordProcess) return;
+        let bin = "discord";
+        const runtimeBin = path.join(this.runtimeDir, "current", "discord", "Discord");
+        const profileBin = path.join(this.discordConfigDir, "Discord");
 
-        const discordBin = path.join(this.discordConfigDir, "Discord");
-        const bin = fs.existsSync(discordBin) ? discordBin : "discord";
+        if (this.role === "collector" && fs.existsSync(runtimeBin)) {
+            bin = runtimeBin;
+        } else if (fs.existsSync(profileBin)) {
+            bin = profileBin;
+        } else if (fs.existsSync(runtimeBin)) {
+            bin = runtimeBin;
+        }
 
         console.log(`[Supervisor] Launching Discord (${this.mode} mode): ${bin}`);
-        const child = spawn(bin, ["--no-sandbox", `--remote-debugging-port=${this.cdpPort}`, "--enable-logging"], {
+        const child = spawn(bin, ["--no-sandbox", `--user-data-dir=${this.discordConfigDir}`, `--remote-debugging-port=${this.cdpPort}`, "--enable-logging"], {
             stdio: "inherit",
             env: {
                 ...process.env,
@@ -666,14 +866,28 @@ export class CollectorSupervisor {
 
         this.discordProcess = child;
 
+        child.on("error", (err) => {
+            console.warn(`[Supervisor] Failed to spawn Discord binary (${bin}): ${err.message}`);
+            if (this.discordProcess === child) {
+                this.discordProcess = null;
+            }
+        });
+
         child.on("exit", (code, signal) => {
             console.log(`[Supervisor] Discord process exited (code=${code}, signal=${signal})`);
-            this.discordProcess = null;
+            if (this.discordProcess === child) {
+                this.discordProcess = null;
+            }
+            if (this.isStoppingDiscord) {
+                return;
+            }
             if (this.isRunning) {
                 this.consecutiveCrashes++;
                 this.backoffDelayMs = Math.min(1000 * Math.pow(2, this.consecutiveCrashes - 1), 30000);
                 console.log(`[Supervisor] Scheduling Discord restart in ${this.backoffDelayMs}ms (crashes=${this.consecutiveCrashes})`);
-                setTimeout(() => {
+                if (this.restartTimer) clearTimeout(this.restartTimer);
+                this.restartTimer = setTimeout(() => {
+                    this.restartTimer = null;
                     if (this.isRunning && !this.discordProcess) {
                         this.startDiscordProcess();
                     }
@@ -683,7 +897,12 @@ export class CollectorSupervisor {
     }
 
     async stopDiscordProcess(timeoutMs = 5000) {
+        if (this.restartTimer) {
+            clearTimeout(this.restartTimer);
+            this.restartTimer = null;
+        }
         if (!this.discordProcess) return;
+        this.isStoppingDiscord = true;
         const child = this.discordProcess;
         this.discordProcess = null;
 
@@ -710,6 +929,7 @@ export class CollectorSupervisor {
             // Already dead
         }
 
+        this.isStoppingDiscord = false;
         // Brief delay to allow TCP socket (CDP port) to be released by kernel
         await new Promise(r => setTimeout(r, 1000));
     }
@@ -815,6 +1035,48 @@ export class CollectorSupervisor {
         this.isRunning = true;
         this.lastProcessedRequestId = this.loadLastAckedRequestId();
 
+        // 1. Single ownership lock acquisition
+        if (this.enableLock) {
+            const lock = acquireRuntimeLock(this.runtimeLockFile, this.role);
+            if (!lock.acquired) {
+                console.warn(`[Supervisor] Runtime lock currently held by '${lock.existing.holder}' (pid: ${lock.existing.pid}).`);
+                this.collectorState = lock.existing.holder === "setup" ? "setup_active" : "error";
+                this.lastError = `Runtime lock held by ${lock.existing.holder}`;
+                this.publishStatus();
+                this.isRunning = false;
+                return false;
+            }
+            this.lockHandle = lock;
+            console.log(`[Supervisor] Acquired single-ownership runtime lease for role '${this.role}'.`);
+        }
+
+        // 2. Runtime validation for minimal collector daemon
+        if (this.role === "collector") {
+            let manifestPath = this.runtimeManifestFile;
+            if (!fs.existsSync(manifestPath) && fs.existsSync(this.legacyRuntimeManifestFile)) {
+                manifestPath = this.legacyRuntimeManifestFile;
+            }
+            const val = validateRuntimeManifest(manifestPath);
+            if (!val.valid) {
+                console.warn(`[Supervisor] Runtime manifest missing or invalid (${val.reason}). Run setup first:`);
+                console.warn("  docker compose --profile setup run --rm cordbrief-setup");
+                this.mode = MODES.SETUP;
+                this.collectorState = "setup_required";
+                this.discordAuthenticated = false;
+                this.lastError = `runtime_manifest_${val.reason}`;
+                this.publishStatus();
+                if (this.lockHandle) {
+                    this.lockHandle.release();
+                    this.lockHandle = null;
+                }
+                this.isRunning = false;
+                return false;
+            }
+            if (val.manifest.paths?.vencord_dist) {
+                this.vencordDir = val.manifest.paths.vencord_dist;
+            }
+        }
+
         const appDir = getLatestAppDir(this.discordConfigDir);
         const hasSession = this.hasProfileSessionFiles();
 
@@ -867,13 +1129,8 @@ export class CollectorSupervisor {
 
                 if (probe.authenticated) {
                     console.log("[Supervisor] Authentication proven! Transitioning to NORMAL mode...");
-                    await this.stopDiscordProcess();
-                    patchVencord(appDir, path.join(this.vencordDir, "dist"));
-                    this.mode = MODES.NORMAL;
-                    this.collectorState = "running";
                     this.discordAuthenticated = true;
-                    this.publishStatus();
-                    await this.startDiscordProcess();
+                    await this.transitionToNormal();
                 } else {
                     console.log(`[Supervisor] Profile unauthenticated or expired (${probe.url || "timeout"}). Keeping Discord clean in REAUTH mode.`);
                     this.mode = MODES.REAUTH;
@@ -885,17 +1142,15 @@ export class CollectorSupervisor {
                 // In non-spawning mode (unit tests), inspect route via mock CDP
                 const auth = await inspectDiscordAuth(this.cdpPort);
                 if (auth.authenticated) {
-                    this.mode = MODES.NORMAL;
-                    this.collectorState = "running";
                     this.discordAuthenticated = true;
-                    patchVencord(appDir, path.join(this.vencordDir, "dist"));
+                    await this.transitionToNormal();
                 } else {
                     this.mode = MODES.REAUTH;
                     this.collectorState = "reauth_required";
                     this.discordAuthenticated = false;
                     unpatchVencord(appDir);
+                    this.publishStatus();
                 }
-                this.publishStatus();
             }
         }
 
@@ -908,11 +1163,19 @@ export class CollectorSupervisor {
     async stop() {
         console.log("[Supervisor] Stopping supervisor...");
         this.isRunning = false;
+        if (this.restartTimer) {
+            clearTimeout(this.restartTimer);
+            this.restartTimer = null;
+        }
         if (this.cdpInterval) clearInterval(this.cdpInterval);
         if (this.commandInterval) clearInterval(this.commandInterval);
         if (this.statusInterval) clearInterval(this.statusInterval);
 
         await this.stopDiscordProcess();
+        if (this.lockHandle) {
+            this.lockHandle.release();
+            this.lockHandle = null;
+        }
         console.log("[Supervisor] Teardown complete.");
     }
 }
