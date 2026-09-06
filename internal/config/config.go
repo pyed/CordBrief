@@ -32,11 +32,28 @@ const (
 	DefaultMaxInputChars = DefaultGeminiMaxInput
 	DefaultMaxOutputToks = DefaultGeminiMaxOutput
 
+	DefaultCorePort  = 28741
+	DefaultSetupPort = 28742
+
+	EnvTelegramBotToken = "TELEGRAM_BOT_TOKEN"
+
 	DefaultLanguage              = "en"
 	DefaultLookback              = "24h"
 	DefaultCatchup               = "48h"
 	DefaultMaxMessagesPerChannel = 20000
 )
+
+// TelegramConfig defines Telegram digest delivery destination.
+type TelegramConfig struct {
+	Enabled   bool   `json:"enabled"`
+	ChatID    string `json:"chat_id"`
+	ChatLabel string `json:"chat_label,omitempty"`
+}
+
+// DeliveryConfig defines destination endpoints for digest delivery.
+type DeliveryConfig struct {
+	Telegram TelegramConfig `json:"telegram"`
+}
 
 // ScheduleConfig defines scheduling and timezone properties.
 type ScheduleConfig struct {
@@ -108,6 +125,7 @@ type Config struct {
 	Schedule         ScheduleConfig `json:"schedule"`
 	LLM              LLMConfig      `json:"llm"`
 	Digest           DigestConfig   `json:"digest"`
+	Delivery         DeliveryConfig `json:"delivery"`
 }
 
 // Load reads and validates a JSON configuration file from disk.
@@ -254,6 +272,11 @@ func (c *Config) Validate() error {
 		c.Digest.MaxMessagesPerChannel = DefaultMaxMessagesPerChannel
 	}
 
+	// Delivery validation
+	if c.Delivery.Telegram.Enabled && strings.TrimSpace(c.Delivery.Telegram.ChatID) == "" {
+		errs = append(errs, "delivery.telegram.chat_id is required when delivery.telegram.enabled is true")
+	}
+
 	if len(errs) > 0 {
 		return errors.New(strings.Join(errs, "; "))
 	}
@@ -287,4 +310,10 @@ func (c *Config) LLMAPIKey() string {
 		return ""
 	}
 	return strings.TrimSpace(os.Getenv(c.LLM.APIKeyEnv))
+}
+
+// TelegramBotToken retrieves the Telegram bot token from the environment variable TELEGRAM_BOT_TOKEN.
+// Per SPEC.md, secrets must never come from non-secret config.json.
+func (c *Config) TelegramBotToken() string {
+	return strings.TrimSpace(os.Getenv(EnvTelegramBotToken))
 }

@@ -12,16 +12,19 @@ import (
 )
 
 // Secrets holds private credentials, strictly isolated from public application configuration.
+// Secrets holds private credentials, strictly isolated from public application configuration.
 // Persisted exclusively to /var/cordbrief/data/secrets.json (mode 0600).
 type Secrets struct {
-	GeminiAPIKey string `json:"gemini_api_key,omitempty"`
+	GeminiAPIKey     string `json:"gemini_api_key,omitempty"`
+	TelegramBotToken string `json:"telegram_bot_token,omitempty"`
 }
 
-// AppConfig represents non-secret runtime configuration for Schedule, LLM, and Digest parameters.
+// AppConfig represents non-secret runtime configuration for Schedule, LLM, Digest, and Delivery parameters.
 type AppConfig struct {
 	Schedule ScheduleConfig `json:"schedule"`
 	LLM      LLMConfig      `json:"llm"`
 	Digest   DigestConfig   `json:"digest"`
+	Delivery DeliveryConfig `json:"delivery"`
 }
 
 // DefaultAppConfig returns a safe, production-ready default application configuration.
@@ -48,6 +51,13 @@ func DefaultAppConfig() AppConfig {
 			FirstRunLookbackRaw:   DefaultLookback,
 			MaxCatchupRaw:         DefaultCatchup,
 			MaxMessagesPerChannel: DefaultMaxMessagesPerChannel,
+		},
+		Delivery: DeliveryConfig{
+			Telegram: TelegramConfig{
+				Enabled:   false,
+				ChatID:    "",
+				ChatLabel: "",
+			},
 		},
 	}
 }
@@ -90,6 +100,7 @@ func NewStore(dataDir, initialConfigPath string) (*Store, error) {
 				Schedule: cfg.Schedule,
 				LLM:      cfg.LLM,
 				Digest:   cfg.Digest,
+				Delivery: cfg.Delivery,
 			}
 			loaded = true
 		}
@@ -320,6 +331,80 @@ func (s *Store) SaveGeminiKey(key string) error {
 	s.secrets.GeminiAPIKey = strings.TrimSpace(key)
 	secretsPath := filepath.Join(s.dataDir, "secrets.json")
 	return safeWriteJSON(secretsPath, s.secrets, 0600)
+}
+
+// IsTelegramConfigured reports whether a Telegram bot token is available via environment or private storage.
+func (s *Store) IsTelegramConfigured() bool {
+	return s.GetTelegramBotToken() != ""
+}
+
+// GetTelegramTokenSource returns the provenance of the active Telegram bot token:
+// - SecretSourceEnvironment if TELEGRAM_BOT_TOKEN or CORDBRIEF_TELEGRAM_BOT_TOKEN is set.
+// - SecretSourceStored if saved in private secrets.json.
+// - SecretSourceNone if not configured.
+// Precedence rule: Environment variables take precedence over stored secrets.
+func (s *Store) GetTelegramTokenSource() SecretSource {
+	if os.Getenv(EnvTelegramBotToken) != "" || os.Getenv("CORDBRIEF_TELEGRAM_BOT_TOKEN") != "" {
+		return SecretSourceEnvironment
+	}
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if strings.TrimSpace(s.secrets.TelegramBotToken) != "" {
+		return SecretSourceStored
+	}
+	return SecretSourceNone
+}
+
+// GetTelegramBotToken returns the active Telegram bot token.
+// Priority 1: TELEGRAM_BOT_TOKEN environment variable.
+// Priority 2: Private persisted secrets.json in data directory.
+// Never logged or returned in public API payloads.
+func (s *Store) GetTelegramBotToken() string {
+	if env := os.Getenv(EnvTelegramBotToken); env != "" {
+		return env
+	}
+	if env := os.Getenv("CORDBRIEF_TELEGRAM_BOT_TOKEN"); env != "" {
+		return env
+	}
+
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.secrets.TelegramBotToken
+}
+
+// SaveTelegramBotToken saves the Telegram bot token into private dataDir/secrets.json with mode 0600.
+func (s *Store) SaveTelegramBotToken(token string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	s.secrets.TelegramBotToken = strings.TrimSpace(token)
+	secretsPath := filepath.Join(s.dataDir, "secrets.json")
+	return safeWriteJSON(secretsPath, s.secrets, 0600)
+}
+
+// GetDeliveryConfig returns a safe copy of the delivery configuration.
+func (s *Store) GetDeliveryConfig() DeliveryConfig {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.config.Delivery
+}
+
+// SaveDeliveryConfig updates delivery configuration and persists it.
+func (s *Store) SaveDeliveryConfig(del DeliveryConfig) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cfg := s.config
+	cfg.Delivery = del
+	s.applyDefaultsAndValidate(&cfg)
+
+	persistedConfigPath := filepath.Join(s.dataDir, "config.json")
+	if err := safeWriteJSON(persistedConfigPath, cfg, 0644); err != nil {
+		return fmt.Errorf("saving delivery config: %w", err)
+	}
+
+	s.config = cfg
+	return nil
 }
 
 func safeWriteJSON(dest string, data any, mode os.FileMode) error {

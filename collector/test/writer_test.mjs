@@ -253,6 +253,8 @@ function publishCatalog(guilds) {
         const validChannels = [];
         for (const ch of (g.channels || [])) {
             if (!ch || typeof ch.id !== "string" || !ch.id || typeof ch.name !== "string") continue;
+            const trimmedName = ch.name.trim();
+            if (trimmedName === "___hidden___" || trimmedName === "__hidden__") continue;
             validChannels.push({
                 id: ch.id,
                 name: ch.name,
@@ -290,7 +292,10 @@ const sampleGuilds = [
         name: "Beta Guild",
         channels: [
             { id: "c2", name: "general", type: 0 },
-            { id: "c1", name: "announcements", type: 5 }
+            { id: "c1", name: "announcements", type: 5 },
+            { id: "c_hid1", name: "___hidden___", type: 0 },
+            { id: "c_hid2", name: "__hidden__", type: 0 },
+            { id: "c_legit", name: "📡  Hidden Signal  📡", type: 0 }
         ]
     },
     {
@@ -312,9 +317,11 @@ assert.strictEqual(parsedCat.guilds.length, 2);
 // Verified deterministic sorting: Alpha Guild before Beta Guild
 assert.strictEqual(parsedCat.guilds[0].name, "Alpha Guild");
 assert.strictEqual(parsedCat.guilds[1].name, "Beta Guild");
-// Verified channel sorting: announcements before general
-assert.strictEqual(parsedCat.guilds[1].channels[0].name, "announcements");
-assert.strictEqual(parsedCat.guilds[1].channels[1].name, "general");
+// Verified channel sorting: 📡  Hidden Signal  📡, announcements, general (and ___hidden___ / __hidden__ are filtered out!)
+assert.strictEqual(parsedCat.guilds[1].channels.length, 3, "Sentinels filtered, legitimate channels kept");
+assert.strictEqual(parsedCat.guilds[1].channels[0].name, "📡  Hidden Signal  📡");
+assert.strictEqual(parsedCat.guilds[1].channels[1].name, "announcements");
+assert.strictEqual(parsedCat.guilds[1].channels[2].name, "general");
 
 // B. Deduplication: second publish of identical content does NOT rewrite
 const statBefore = fs.statSync(catalogFile);

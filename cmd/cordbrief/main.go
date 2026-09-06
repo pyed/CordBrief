@@ -11,12 +11,14 @@ import (
 	"net/http"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	"cordbrief/internal/config"
+	"cordbrief/internal/delivery"
 	"cordbrief/internal/digest"
 	"cordbrief/internal/discord"
 	"cordbrief/internal/journal"
@@ -453,6 +455,7 @@ func runDigest(args []string, stdout, stderr io.Writer) int {
 	exchangeDir := fs.String("exchange-dir", "", "path to exchange directory")
 	dataDir := fs.String("data-dir", "", "path to data directory")
 	limit := fs.Int("limit", 1000, "maximum events to read in batch")
+	deliverFlag := fs.Bool("deliver", false, "deliver digest via configured channels (e.g. Telegram)")
 
 	if err := fs.Parse(subArgs); err != nil {
 		return 2
@@ -614,6 +617,30 @@ func runDigest(args []string, stdout, stderr io.Writer) int {
 
 	fmt.Fprintln(stdout, "\n--- Rendered Digest ---")
 	fmt.Fprint(stdout, digest.RenderMarkdown(res.Digest, res.Batch))
+
+	if commit && *deliverFlag && res != nil && res.Artifact != nil {
+		actualDataDir := getDataDir(*dataDir)
+		actualExchangeDir := getExchangeDir(*exchangeDir)
+		store, storeErr := config.NewStore(actualDataDir, *cfgPath)
+		if storeErr == nil {
+			delSvc, svcErr := delivery.NewService(delivery.ServiceOptions{
+				DataDir:     actualDataDir,
+				ExchangeDir: actualExchangeDir,
+				Store:       store,
+			})
+			if svcErr == nil {
+				delRec, delErr := delSvc.DeliverBatch(context.Background(), res.Artifact.BatchID, false)
+				if delErr != nil {
+					fmt.Fprintf(stderr, "\n[WARN] Telegram delivery failed: %v\n", delErr)
+				} else if delRec != nil {
+					fmt.Fprintf(stdout, "\n[PASS] Delivered to Telegram (batch: %s, parts: %d)\n", res.Artifact.BatchID, delRec.TotalParts)
+				}
+			} else {
+				fmt.Fprintf(stderr, "\n[WARN] Failed initializing delivery service: %v\n", svcErr)
+			}
+		}
+	}
+
 	return 0
 }
 
@@ -635,17 +662,30 @@ func printUsage(w io.Writer) {
 
 func runServe(args []string, stdout, stderr io.Writer) int {
 	defaultAddr := "127.0.0.1"
-	if env := os.Getenv("CORDBRIEF_HTTP_ADDR"); env != "" {
+	if env := os.Getenv("CORDBRIEF_WEB_ADDR"); env != "" {
+		defaultAddr = env
+	} else if env := os.Getenv("CORDBRIEF_HTTP_ADDR"); env != "" {
 		defaultAddr = env
 	} else if os.Getenv("CORDBRIEF_DATA_DIR") != "" || os.Getenv("CORDBRIEF_EXCHANGE_DIR") != "" {
-		// Inside Docker container, bind to 0.0.0.0 so host port mapping (127.0.0.1:8080:8080) can forward traffic
+		// Inside Docker container, bind to 0.0.0.0 so host port mapping (127.0.0.1:28741:28741) can forward traffic
 		defaultAddr = "0.0.0.0"
+	}
+
+	defaultPort := config.DefaultCorePort
+	if env := os.Getenv("CORDBRIEF_WEB_PORT"); env != "" {
+		if p, err := strconv.Atoi(env); err == nil && p > 0 {
+			defaultPort = p
+		}
+	} else if env := os.Getenv("CORDBRIEF_HTTP_PORT"); env != "" {
+		if p, err := strconv.Atoi(env); err == nil && p > 0 {
+			defaultPort = p
+		}
 	}
 
 	fs := flag.NewFlagSet("serve", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 	addrFlag := fs.String("addr", defaultAddr, "HTTP listen address")
-	portFlag := fs.Int("port", 8080, "HTTP listen port")
+	portFlag := fs.Int("port", defaultPort, "HTTP listen port")
 	cfgPath := fs.String("config", "config.json", "path to configuration file")
 	exchangeDir := fs.String("exchange-dir", "", "path to exchange directory")
 	dataDir := fs.String("data-dir", "", "path to data directory")
@@ -670,13 +710,25 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		Store:       store,
 	}
 
+	deliveryService, err := delivery.NewService(delivery.ServiceOptions{
+		DataDir:     actualDataDir,
+		ExchangeDir: actualExchangeDir,
+		Store:       store,
+	})
+	if err != nil {
+		fmt.Fprintf(stderr, "error initializing delivery service: %v\n", err)
+		return 1
+	}
+	defer deliveryService.Close()
+
 	sched, err := scheduler.NewService(scheduler.ServiceOptions{
-		Store:         store,
-		DataDir:       actualDataDir,
-		Runner:        runner,
-		Clock:         time.Now,
-		CheckInterval: 15 * time.Second,
-		Lock:          digestLock,
+		Store:            store,
+		DataDir:          actualDataDir,
+		Runner:           runner,
+		DeliveryEnqueuer: deliveryService,
+		Clock:            time.Now,
+		CheckInterval:    15 * time.Second,
+		Lock:             digestLock,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "error initializing scheduler service: %v\n", err)
@@ -686,13 +738,15 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go sched.Start(ctx)
+	go deliveryService.StartWorker(ctx)
 
 	server, err := web.NewServer(web.ServerOptions{
-		ExchangeDir: actualExchangeDir,
-		DataDir:     actualDataDir,
-		Store:       store,
-		Scheduler:   sched,
-		Lock:        digestLock,
+		ExchangeDir:     actualExchangeDir,
+		DataDir:         actualDataDir,
+		Store:           store,
+		Scheduler:       sched,
+		DeliveryService: deliveryService,
+		Lock:            digestLock,
 	})
 	if err != nil {
 		fmt.Fprintf(stderr, "error initializing web server: %v\n", err)

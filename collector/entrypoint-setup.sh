@@ -75,11 +75,11 @@ fi
 # Stage runtime release if Discord app is already installed
 if [ -n "$LATEST_APP" ] && [ -d "$LATEST_APP" ]; then
     echo "[Setup] Staging runtime distribution release into volume ($RUNTIME_DIR)..."
-    node /home/cordbrief/stage-runtime.mjs || true
+    node /home/cordbrief/stage-runtime.mjs --force || true
 fi
 
 DISPLAY_NUM="${DISPLAY:-:100}"
-PORT="${XPRA_PORT:-14500}"
+PORT="${XPRA_PORT:-28742}"
 
 # 6. Clean up stale X11 / Xpra socket and lock files
 NUM="${DISPLAY_NUM#:}"

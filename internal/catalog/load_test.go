@@ -153,3 +153,27 @@ func TestResolveGuildForChannel(t *testing.T) {
 		t.Error("expected error for nil catalog, got nil")
 	}
 }
+
+func TestIsHiddenChannelSentinel(t *testing.T) {
+	cases := []struct {
+		name     string
+		expected bool
+	}{
+		{"___hidden___", true},
+		{"__hidden__", true},
+		{"  ___hidden___  ", true},
+		{"  __hidden__  ", true},
+		{"📡  Hidden Signal  📡", false},
+		{"hidden", false},
+		{"hidden-channel", false},
+		{"_hidden_", false},
+		{"general", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := IsHiddenChannelSentinel(tc.name); got != tc.expected {
+			t.Errorf("IsHiddenChannelSentinel(%q) = %v, expected %v", tc.name, got, tc.expected)
+		}
+	}
+}
+

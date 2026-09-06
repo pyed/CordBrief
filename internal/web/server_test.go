@@ -1,7 +1,10 @@
 package web
 
 import (
+	"bytes"
 	"encoding/json"
+	"fmt"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -12,6 +15,8 @@ import (
 	"time"
 
 	"cordbrief/internal/config"
+	"cordbrief/internal/delivery"
+	"cordbrief/internal/digest"
 	"cordbrief/internal/journal"
 	"cordbrief/internal/llm"
 )
@@ -560,10 +565,16 @@ func TestServer_DigestDetail_ValidAndNotFound(t *testing.T) {
 	if !strings.Contains(body, "#general") {
 		t.Errorf("missing channel context tag in detail view")
 	}
-	// Verify jump link reconstructed from journal
+	// Verify jump link reconstructed from journal with user-facing label 1 and internal ID in tooltip
 	expectedJumpLink := "https://discord.com/channels/111222/333444/999888"
 	if !strings.Contains(body, expectedJumpLink) {
 		t.Errorf("expected jump link %s in detail view, got: %s", expectedJumpLink, body)
+	}
+	if !strings.Contains(body, ">1 ↗</a>") {
+		t.Errorf("expected user-facing source label '1 ↗' in detail view, got: %s", body)
+	}
+	if !strings.Contains(body, "Internal ID: S000001") {
+		t.Errorf("expected internal ID S000001 in tooltip, got: %s", body)
 	}
 
 	// 2. Non-existent 64-hex ID returns 404
@@ -962,3 +973,500 @@ func TestServer_CollectorCommand(t *testing.T) {
 		t.Errorf("expected 'Command already pending' in body, got: %s", rec.Body.String())
 	}
 }
+
+func TestWebDeliveryHandlers(t *testing.T) {
+	tmpDir := t.TempDir()
+	exchangeDir := filepath.Join(tmpDir, "exchange")
+	eventsDir := filepath.Join(exchangeDir, "events")
+	dataDir := filepath.Join(tmpDir, "data")
+	digestsDir := filepath.Join(dataDir, "digests")
+	_ = os.MkdirAll(eventsDir, 0755)
+	_ = os.MkdirAll(digestsDir, 0755)
+
+	// Mock Telegram Bot API Server
+	var sendCount int
+	mockTG := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "getMe") {
+			if strings.Contains(r.URL.Path, "invalid-token") {
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"ok": false, "error_code": 401, "description": "Unauthorized"}`))
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok": true, "result": {"id": 12345678, "is_bot": true, "first_name": "CordBriefBot", "username": "cordbrief_bot"}}`))
+			return
+		}
+		if strings.Contains(r.URL.Path, "getUpdates") {
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"ok": true, "result": [
+				{"update_id": 101, "message": {"message_id": 1, "chat": {"id": -100987654321, "type": "supergroup", "title": "Dev Team"}, "text": "sensitive message text"}},
+				{"update_id": 102, "message": {"message_id": 2, "chat": {"id": 11223344, "type": "private", "first_name": "Alice", "username": "alice_dev"}, "text": "secret user chat"}}
+			]}`))
+			return
+		}
+		if strings.Contains(r.URL.Path, "sendMessage") {
+			sendCount++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"ok": true, "result": {"message_id": %d}}`, 500+sendCount)))
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer mockTG.Close()
+
+	store, err := config.NewStore(dataDir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	delSvc, err := delivery.NewService(delivery.ServiceOptions{
+		DataDir:     dataDir,
+		ExchangeDir: exchangeDir,
+		Store:       store,
+		ClientGetter: func(token string) *delivery.TelegramClient {
+			return delivery.NewTelegramClient(token, delivery.WithBaseURL(mockTG.URL))
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	srv, err := NewServer(ServerOptions{
+		ExchangeDir:     exchangeDir,
+		DataDir:         dataDir,
+		Store:           store,
+		DeliveryService: delSvc,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. CSRF rejection on state-changing Telegram endpoints
+	t.Run("CSRF rejection", func(t *testing.T) {
+		endpoints := []string{
+			"/api/telegram/settings",
+			"/api/telegram/test",
+			"/api/telegram/chats",
+			"/api/telegram/send-test",
+			"/api/digests/" + strings.Repeat("f", 64) + "/deliver",
+		}
+		for _, ep := range endpoints {
+			req := httptest.NewRequest(http.MethodPost, ep, strings.NewReader("token=123"))
+			req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+			req.Header.Set("Origin", "http://evil-origin.com")
+			req.Host = "127.0.0.1:28741"
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, req)
+			if rec.Code != http.StatusForbidden {
+				t.Errorf("expected 403 Forbidden for endpoint %s with bad CSRF, got %d", ep, rec.Code)
+			}
+		}
+	})
+
+	// 2. POST /api/telegram/test: when unconfigured and empty token submitted -> returns 400
+	t.Run("POST telegram test unconfigured error", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/telegram/test", strings.NewReader(""))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Origin", "http://127.0.0.1:28741")
+		req.Host = "127.0.0.1:28741"
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request, got %d", rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "telegram bot token is not configured") {
+			t.Errorf("expected error message to say token is not configured, got: %s", rec.Body.String())
+		}
+	})
+
+	// 3. POST /api/telegram/test: with invalid token -> rejected and NOT saved to secrets
+	t.Run("POST telegram test invalid token not saved", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/telegram/test", strings.NewReader("token=invalid-token"))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Origin", "http://127.0.0.1:28741")
+		req.Host = "127.0.0.1:28741"
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request, got %d", rec.Code)
+		}
+		if token := store.GetTelegramBotToken(); token != "" {
+			t.Errorf("expected secrets token to remain empty on test failure, got %q", token)
+		}
+	})
+
+	// 4. POST /api/telegram/test: multipart form parsing and token auto-saved to secrets.json
+	t.Run("POST telegram test multipart and auto-persist", func(t *testing.T) {
+		body := &bytes.Buffer{}
+		writer := multipart.NewWriter(body)
+		_ = writer.WriteField("token", "multipart-secret-token")
+		_ = writer.Close()
+
+		req := httptest.NewRequest(http.MethodPost, "/api/telegram/test", body)
+		req.Header.Set("Content-Type", writer.FormDataContentType())
+		req.Header.Set("Origin", "http://127.0.0.1:28741")
+		req.Host = "127.0.0.1:28741"
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d (body: %s)", rec.Code, rec.Body.String())
+		}
+
+		var resp map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed decoding json: %v", err)
+		}
+		if resp["ok"] != true || resp["configured"] != true {
+			t.Errorf("expected ok=true and configured=true, got %v", resp)
+		}
+		if resp["username"] != "cordbrief_bot" {
+			t.Errorf("expected username cordbrief_bot, got %v", resp["username"])
+		}
+
+		// Verify token was persisted to secrets.json!
+		if token := store.GetTelegramBotToken(); token != "multipart-secret-token" {
+			t.Errorf("expected token to be auto-persisted to secrets.json, got %q", token)
+		}
+	})
+
+	// 5. POST /api/telegram/test: testing invalid token keeps previously saved token intact
+	t.Run("POST telegram test preserves existing token on failure", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/telegram/test", strings.NewReader("token=invalid-token"))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Origin", "http://127.0.0.1:28741")
+		req.Host = "127.0.0.1:28741"
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request, got %d", rec.Code)
+		}
+		if token := store.GetTelegramBotToken(); token != "multipart-secret-token" {
+			t.Errorf("expected secrets token to remain 'multipart-secret-token', got %q", token)
+		}
+	})
+
+	// 6. POST /api/telegram/chats: calls getUpdates using stored token immediately without re-entering
+	t.Run("POST telegram chats safe discovery using stored token", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, "/api/telegram/chats", nil)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Origin", "http://127.0.0.1:28741")
+		req.Host = "127.0.0.1:28741"
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+
+		body := rec.Body.String()
+		if strings.Contains(body, "sensitive message text") || strings.Contains(body, "secret user chat") {
+			t.Fatalf("CRITICAL: Discovered chats leaked message text bodies: %s", body)
+		}
+		if !strings.Contains(body, "-100987654321") || !strings.Contains(body, "Dev Team") {
+			t.Errorf("missing safe chat metadata in response: %s", body)
+		}
+	})
+
+	// 7. Environment variable precedence: env token is authoritative and never overwritten
+	t.Run("Environment variable token precedence", func(t *testing.T) {
+		envStore, err := config.NewStore(dataDir, "env-authoritative-token")
+		if err != nil {
+			t.Fatal(err)
+		}
+		envDelSvc, err := delivery.NewService(delivery.ServiceOptions{
+			DataDir:     dataDir,
+			ExchangeDir: exchangeDir,
+			Store:       envStore,
+			ClientGetter: func(token string) *delivery.TelegramClient {
+				return delivery.NewTelegramClient(token, delivery.WithBaseURL(mockTG.URL))
+			},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		envSrv, err := NewServer(ServerOptions{
+			ExchangeDir:     exchangeDir,
+			DataDir:         dataDir,
+			Store:           envStore,
+			DeliveryService: envDelSvc,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		req := httptest.NewRequest(http.MethodPost, "/api/telegram/test", strings.NewReader("token=attempted-override-token"))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Origin", "http://127.0.0.1:28741")
+		req.Host = "127.0.0.1:28741"
+		rec := httptest.NewRecorder()
+		envSrv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", rec.Code)
+		}
+		// Confirm secrets.json was NOT overwritten with attempted-override-token
+		if store.GetTelegramBotToken() == "attempted-override-token" {
+			t.Errorf("CRITICAL: secrets.json was overwritten despite environment variable precedence!")
+		}
+	})
+
+	// 8. POST /api/telegram/settings: validation rejects enabled=true when destination chat_id is empty
+	t.Run("POST telegram settings validation empty destination", func(t *testing.T) {
+		form := url.Values{}
+		form.Set("enabled", "true")
+		form.Set("chat_id", "") // empty destination
+
+		req := httptest.NewRequest(http.MethodPost, "/api/telegram/settings", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Origin", "http://127.0.0.1:28741")
+		req.Host = "127.0.0.1:28741"
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusSeeOther {
+			t.Fatalf("expected 303 redirect on validation failure, got %d", rec.Code)
+		}
+		loc := rec.Header().Get("Location")
+		if !strings.Contains(loc, "Select+a+Telegram+destination+before+enabling+daily+delivery") {
+			t.Errorf("expected destination required error in redirect, got %q", loc)
+		}
+
+		// Verify existing token was NOT destroyed by validation failure
+		if token := store.GetTelegramBotToken(); token != "multipart-secret-token" {
+			t.Errorf("expected existing token 'multipart-secret-token' preserved, got %q", token)
+		}
+
+		// Verify Telegram was NOT enabled
+		cfg := store.GetDeliveryConfig()
+		if cfg.Telegram.Enabled {
+			t.Errorf("Telegram delivery must NOT be enabled with empty destination")
+		}
+	})
+
+	// 9. Requirement 6A: Send Test Ping uses submitted form chat_id when none persisted
+	t.Run("POST telegram send-test uses submitted chat_id without prior save", func(t *testing.T) {
+		// Verify no chat_id is currently persisted in store
+		cfg := store.GetDeliveryConfig()
+		if cfg.Telegram.ChatID != "" {
+			t.Fatalf("precondition failed: expected empty persisted chat_id, got %q", cfg.Telegram.ChatID)
+		}
+
+		form := url.Values{}
+		form.Set("chat_id", "-100987654321") // newly discovered chat submitted by user
+
+		req := httptest.NewRequest(http.MethodPost, "/api/telegram/send-test", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Origin", "http://127.0.0.1:28741")
+		req.Host = "127.0.0.1:28741"
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d (body: %s)", rec.Code, rec.Body.String())
+		}
+
+		var resp map[string]any
+		if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("failed decoding json: %v", err)
+		}
+		if resp["ok"] != true {
+			t.Errorf("expected ok=true, got %v", resp["ok"])
+		}
+		if resp["message"] != "Test message sent successfully." {
+			t.Errorf("expected clean success message, got %v", resp["message"])
+		}
+	})
+
+	// 10. Requirement 6B & 6E: Save valid destination then Send Test Ping with blank form falls back to persisted
+	t.Run("POST telegram save valid destination and fallback test ping", func(t *testing.T) {
+		// Save valid destination
+		form := url.Values{}
+		form.Set("enabled", "true")
+		form.Set("token", "my-secret-tg-token")
+		form.Set("chat_id", "-100987654321")
+		form.Set("chat_label", "Engineering Digest")
+
+		saveReq := httptest.NewRequest(http.MethodPost, "/api/telegram/settings", strings.NewReader(form.Encode()))
+		saveReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		saveReq.Header.Set("Origin", "http://127.0.0.1:28741")
+		saveReq.Host = "127.0.0.1:28741"
+		saveRec := httptest.NewRecorder()
+		srv.ServeHTTP(saveRec, saveReq)
+
+		if saveRec.Code != http.StatusSeeOther {
+			t.Fatalf("expected 303 redirect, got %d", saveRec.Code)
+		}
+
+		cfg := store.GetDeliveryConfig()
+		if !cfg.Telegram.Enabled || cfg.Telegram.ChatID != "-100987654321" {
+			t.Fatalf("expected saved enabled and chat_id, got %+v", cfg.Telegram)
+		}
+
+		// Send Test Ping with blank form chat_id -> falls back to persisted
+		pingReq := httptest.NewRequest(http.MethodPost, "/api/telegram/send-test", strings.NewReader("chat_id="))
+		pingReq.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		pingReq.Header.Set("Origin", "http://127.0.0.1:28741")
+		pingReq.Host = "127.0.0.1:28741"
+		pingRec := httptest.NewRecorder()
+		srv.ServeHTTP(pingRec, pingReq)
+
+		if pingRec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK using persisted chat_id, got %d (body: %s)", pingRec.Code, pingRec.Body.String())
+		}
+	})
+
+	// 11. Requirement 6C: Form chat_id overrides persisted chat_id for test
+	t.Run("POST telegram send-test form chat_id overrides persisted", func(t *testing.T) {
+		form := url.Values{}
+		form.Set("chat_id", "-100888888888") // temporary override for test
+
+		req := httptest.NewRequest(http.MethodPost, "/api/telegram/send-test", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Origin", "http://127.0.0.1:28741")
+		req.Host = "127.0.0.1:28741"
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d (body: %s)", rec.Code, rec.Body.String())
+		}
+
+		// Persisted config remains untouched
+		cfg := store.GetDeliveryConfig()
+		if cfg.Telegram.ChatID != "-100987654321" {
+			t.Errorf("persisted chat_id should not change when test overrides it, got %q", cfg.Telegram.ChatID)
+		}
+	})
+
+	// 12. POST /api/digests/{batch-id}/deliver: delivers existing artifact and verifies UI views
+	t.Run("POST digest delivery and UI views", func(t *testing.T) {
+		batchID := strings.Repeat("f", 64)
+		art := &digest.Artifact{
+			Version: journal.CurrentSchemaVersion,
+			BatchID: batchID,
+			Digest: &digest.Digest{
+				Title:    "Sprint Alpha Summary",
+				Overview: "Everything shipped successfully.",
+				Items: []digest.Item{
+					{Kind: "important", Text: "System online"},
+				},
+			},
+			CreatedAt: time.Now().UTC(),
+		}
+		if err := digest.SaveArtifact(digestsDir, art); err != nil {
+			t.Fatalf("failed saving test artifact: %v", err)
+		}
+
+		// Initial deliver POST
+		req := httptest.NewRequest(http.MethodPost, "/api/digests/"+batchID+"/deliver", nil)
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Origin", "http://127.0.0.1:28741")
+		req.Host = "127.0.0.1:28741"
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusSeeOther {
+			t.Fatalf("expected 303 redirect, got %d", rec.Code)
+		}
+
+		// Verify delivery record persisted as StateSent
+		recState, err := delSvc.GetDelivery(batchID)
+		if err != nil || recState == nil {
+			t.Fatalf("expected delivery record for batch, got: %v", err)
+		}
+		if recState.State != delivery.StateSent {
+			t.Errorf("expected StateSent, got %s", recState.State)
+		}
+
+		// Verify Index UI has Telegram settings card
+		idxReq := httptest.NewRequest(http.MethodGet, "/", nil)
+		idxRec := httptest.NewRecorder()
+		srv.ServeHTTP(idxRec, idxReq)
+		idxHTML := idxRec.Body.String()
+		if !strings.Contains(idxHTML, "Telegram Delivery Configuration") {
+			t.Errorf("Index UI missing Telegram Delivery Configuration card")
+		}
+		if !strings.Contains(idxHTML, "Discover Chats") {
+			t.Errorf("Index UI missing Discover Chats button")
+		}
+
+		// Verify Inbox UI has Telegram delivery badge
+		inboxReq := httptest.NewRequest(http.MethodGet, "/inbox", nil)
+		inboxRec := httptest.NewRecorder()
+		srv.ServeHTTP(inboxRec, inboxReq)
+		inboxHTML := inboxRec.Body.String()
+		if !strings.Contains(inboxHTML, "✈ Telegram: Sent") {
+			t.Errorf("Inbox UI missing Telegram Sent badge: %s", inboxHTML)
+		}
+
+		// Verify Detail UI has Telegram Delivery card and Sent status
+		detailReq := httptest.NewRequest(http.MethodGet, "/digests/"+batchID, nil)
+		detailRec := httptest.NewRecorder()
+		srv.ServeHTTP(detailRec, detailReq)
+		detailHTML := detailRec.Body.String()
+		if !strings.Contains(detailHTML, "Telegram Delivery") || !strings.Contains(detailHTML, "All parts delivered to Telegram") {
+			t.Errorf("Detail UI missing Telegram delivery status: %s", detailHTML)
+		}
+
+		// 13. Verify secret hygiene: raw secret tokens are NEVER rendered into HTML
+		if strings.Contains(idxHTML, "my-secret-tg-token") || strings.Contains(idxHTML, "multipart-secret-token") {
+			t.Fatalf("CRITICAL: Secret Telegram token leaked into Index HTML!")
+		}
+		if strings.Contains(inboxHTML, "my-secret-tg-token") || strings.Contains(detailHTML, "my-secret-tg-token") {
+			t.Fatalf("CRITICAL: Secret Telegram token leaked into Inbox/Detail HTML!")
+		}
+	})
+
+	// 14. Requirements 7 & 8: Index UI defense-in-depth filters hidden Discord channel sentinels
+	t.Run("Index UI filters hidden channel sentinels from catalog", func(t *testing.T) {
+		catData := `{
+  "version": 1,
+  "updated_at": "2026-09-06T00:00:00Z",
+  "guilds": [
+    {
+      "id": "g_test",
+      "name": "Test Server",
+      "channels": [
+        {"id": "ch_legit_1", "name": "general", "type": 0},
+        {"id": "ch_legit_2", "name": "📡  Hidden Signal  📡", "type": 0},
+        {"id": "ch_invis_1", "name": "___hidden___", "type": 0},
+        {"id": "ch_invis_2", "name": "__hidden__", "type": 0}
+      ]
+    }
+  ]
+}`
+		if err := os.WriteFile(filepath.Join(exchangeDir, "catalog.json"), []byte(catData), 0644); err != nil {
+			t.Fatal(err)
+		}
+
+		idxReq := httptest.NewRequest(http.MethodGet, "/", nil)
+		idxRec := httptest.NewRecorder()
+		srv.ServeHTTP(idxRec, idxReq)
+
+		if idxRec.Code != http.StatusOK {
+			t.Fatalf("expected 200 OK, got %d", idxRec.Code)
+		}
+
+		body := idxRec.Body.String()
+		// Legitimate channels must be rendered
+		if !strings.Contains(body, "#general") {
+			t.Errorf("expected #general rendered in channel picker")
+		}
+		if !strings.Contains(body, "#📡  Hidden Signal  📡") {
+			t.Errorf("expected legitimate channel '#📡  Hidden Signal  📡' rendered in channel picker")
+		}
+		// Inaccessible sentinels must NOT be rendered
+		if strings.Contains(body, "___hidden___") {
+			t.Errorf("CRITICAL: Sentinel '___hidden___' was rendered in channel picker: %s", body)
+		}
+		if strings.Contains(body, "__hidden__") {
+			t.Errorf("CRITICAL: Sentinel '__hidden__' was rendered in channel picker: %s", body)
+		}
+	})
+}
+

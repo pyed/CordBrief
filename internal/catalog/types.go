@@ -111,3 +111,11 @@ func (c *Catalog) ResolveGuildForChannel(channelID string) (string, error) {
 	}
 	return matchedGuildID, nil
 }
+
+// IsHiddenChannelSentinel reports whether a channel name matches Discord's internal inaccessible channel placeholder sentinel.
+// It matches exact sentinels ("___hidden___" or "__hidden__") and does not filter legitimate channel names containing "hidden".
+func IsHiddenChannelSentinel(name string) bool {
+	trimmed := strings.TrimSpace(name)
+	return trimmed == "___hidden___" || trimmed == "__hidden__"
+}
+

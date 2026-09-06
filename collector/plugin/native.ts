@@ -631,6 +631,8 @@ export async function publishCatalog(_: IpcMainInvokeEvent, guilds: CatalogGuild
             const validChannels: CatalogChannel[] = [];
             for (const ch of (g.channels || [])) {
                 if (!ch || typeof ch.id !== "string" || !ch.id || typeof ch.name !== "string") continue;
+                const trimmedName = ch.name.trim();
+                if (trimmedName === "___hidden___" || trimmedName === "__hidden__") continue;
                 validChannels.push({
                     id: ch.id,
                     name: ch.name,

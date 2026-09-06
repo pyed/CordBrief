@@ -53,13 +53,19 @@ type TransactionRunner interface {
 // StateSaver defines the signature for persisting scheduler state.
 type StateSaver func(dataDir string, s *State) error
 
+// DeliveryEnqueuer abstracts enqueuing a completed digest batch for external delivery.
+type DeliveryEnqueuer interface {
+	Enqueue(batchID string) error
+}
+
 // ServiceOptions configures the scheduler service.
 type ServiceOptions struct {
-	Store         *config.Store
-	DataDir       string
-	Runner        TransactionRunner
-	Clock         Clock
-	CheckInterval time.Duration
+	Store            *config.Store
+	DataDir          string
+	Runner           TransactionRunner
+	DeliveryEnqueuer DeliveryEnqueuer
+	Clock            Clock
+	CheckInterval    time.Duration
 	// Lock coordinates single-flight mutual exclusion within the running Core process
 	// (e.g. between the scheduler loop and web control plane actions).
 	//
@@ -75,14 +81,15 @@ type ServiceOptions struct {
 
 // Service manages the background daily scheduler loop.
 type Service struct {
-	mu            sync.RWMutex
-	store         *config.Store
-	dataDir       string
-	runner        TransactionRunner
-	clock         Clock
-	checkInterval time.Duration
-	lock          *sync.Mutex
-	saveStateFn   StateSaver
+	mu               sync.RWMutex
+	store            *config.Store
+	dataDir          string
+	runner           TransactionRunner
+	deliveryEnqueuer DeliveryEnqueuer
+	clock            Clock
+	checkInterval    time.Duration
+	lock             *sync.Mutex
+	saveStateFn      StateSaver
 
 	state *State
 }
@@ -115,14 +122,15 @@ func NewService(opts ServiceOptions) (*Service, error) {
 	}
 
 	return &Service{
-		store:         opts.Store,
-		dataDir:       opts.DataDir,
-		runner:        opts.Runner,
-		clock:         opts.Clock,
-		checkInterval: opts.CheckInterval,
-		lock:          opts.Lock,
-		saveStateFn:   saveFn,
-		state:         st,
+		store:            opts.Store,
+		dataDir:          opts.DataDir,
+		runner:           opts.Runner,
+		deliveryEnqueuer: opts.DeliveryEnqueuer,
+		clock:            opts.Clock,
+		checkInterval:    opts.CheckInterval,
+		lock:             opts.Lock,
+		saveStateFn:      saveFn,
+		state:            st,
 	}, nil
 }
 
@@ -229,6 +237,14 @@ func (s *Service) CheckAndRunSlot(ctx context.Context) (bool, error) {
 			batchDesc = "empty"
 		}
 		return true, fmt.Errorf("transaction completed (%s) but saving scheduler state failed: %w", batchDesc, saveErr)
+	}
+
+	// Post-transaction delivery: enqueue ONLY after transaction and scheduler state succeed
+	if s.deliveryEnqueuer != nil && res != nil && res.Artifact != nil {
+		delCfg := s.store.GetDeliveryConfig()
+		if delCfg.Telegram.Enabled && s.store.IsTelegramConfigured() && delCfg.Telegram.ChatID != "" {
+			_ = s.deliveryEnqueuer.Enqueue(res.Artifact.BatchID)
+		}
 	}
 
 	return true, nil

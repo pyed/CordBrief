@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -394,4 +395,122 @@ func TestCLI_ServeUsage(t *testing.T) {
 		t.Errorf("usage missing serve command: %s", stdout.String())
 	}
 }
+
+func TestPortHardeningDefaults(t *testing.T) {
+	t.Setenv("CORDBRIEF_WEB_PORT", "")
+	t.Setenv("CORDBRIEF_HTTP_PORT", "")
+	t.Setenv("CORDBRIEF_WEB_ADDR", "")
+	t.Setenv("CORDBRIEF_HTTP_ADDR", "")
+	t.Setenv("CORDBRIEF_DATA_DIR", "")
+	t.Setenv("CORDBRIEF_EXCHANGE_DIR", "")
+
+	if config.DefaultCorePort != 28741 {
+		t.Fatalf("expected DefaultCorePort 28741, got %d", config.DefaultCorePort)
+	}
+	if config.DefaultSetupPort != 28742 {
+		t.Fatalf("expected DefaultSetupPort 28742, got %d", config.DefaultSetupPort)
+	}
+}
+
+func TestDigestDeliveryTriggerPolicy(t *testing.T) {
+	// Mock Telegram API Server
+	var sendCount int
+	mockTG := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(r.URL.Path, "sendMessage") {
+			sendCount++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(fmt.Sprintf(`{"ok": true, "result": {"message_id": %d}}`, 700+sendCount)))
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{"ok": true}`))
+	}))
+	defer mockTG.Close()
+
+	t.Setenv("CORDBRIEF_TELEGRAM_API_BASE", mockTG.URL)
+	t.Setenv("TELEGRAM_BOT_TOKEN", "cli-test-token")
+
+	fakeServer := llm.NewFakeLLMServer()
+	defer fakeServer.Close()
+	fakeServer.ResponseContent = `{"title":"CLI Delivery Test","overview":"CLI delivery overview","items":[{"kind":"finding","text":"Tested delivery CLI","source_ids":["S000001"]}]}`
+
+	t.Setenv("CORDBRIEF_LLM_BASE_URL", fakeServer.URL)
+	t.Setenv("CORDBRIEF_LLM_MODEL", "mock-model")
+	t.Setenv("GEMINI_API_KEY", "test-api-key")
+
+	tmpDir := t.TempDir()
+	exchangeDir := filepath.Join(tmpDir, "exchange")
+	eventsDir := filepath.Join(exchangeDir, "events")
+	dataDir := filepath.Join(tmpDir, "data")
+	_ = os.MkdirAll(eventsDir, 0755)
+	_ = os.MkdirAll(dataDir, 0755)
+
+	store, err := config.NewStore(dataDir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	delCfg := store.GetDeliveryConfig()
+	delCfg.Telegram.Enabled = true
+	delCfg.Telegram.ChatID = "-100123456789"
+	_ = store.SaveDeliveryConfig(delCfg)
+
+	// Write 1 message to segment
+	seg1 := filepath.Join(eventsDir, "0000000000000001.ndjson")
+	eventLine := []byte(`{"version":1,"event":"message_create","message_id":"15451001","guild_id":"g1","channel_id":"ch-a","timestamp":"2026-09-03T12:00:00Z","captured_at":"2026-09-03T12:00:00Z","author":{"id":"u1","name":"alice","display_name":"Alice","bot":false},"content":"Testing CLI delivery policy"}` + "\n")
+	if err := os.WriteFile(seg1, eventLine, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Preview: must NOT deliver even if Telegram configured
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"digest", "preview", "-config=", "-exchange-dir=" + exchangeDir, "-data-dir=" + dataDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("preview failed: %s", stderr.String())
+	}
+	if sendCount != 0 {
+		t.Fatalf("SECURITY VIOLATION: digest preview triggered delivery (sendCount=%d)", sendCount)
+	}
+
+	// 2. Run WITHOUT --deliver flag: must NOT deliver
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"digest", "run", "-config=", "-exchange-dir=" + exchangeDir, "-data-dir=" + dataDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run failed: %s", stderr.String())
+	}
+	if sendCount != 0 {
+		t.Fatalf("POLICY VIOLATION: digest run without --deliver triggered delivery (sendCount=%d)", sendCount)
+	}
+
+	// Verify cursor was committed
+	ackFile := filepath.Join(exchangeDir, "core-ack.json")
+	if _, err := os.Stat(ackFile); err != nil {
+		t.Fatalf("expected core-ack.json to exist after run: %v", err)
+	}
+
+	// Write second event for deliver run
+	eventLine2 := []byte(`{"version":1,"event":"message_create","message_id":"15451002","guild_id":"g1","channel_id":"ch-a","timestamp":"2026-09-03T12:01:00Z","captured_at":"2026-09-03T12:01:00Z","author":{"id":"u2","name":"bob","display_name":"Bob","bot":false},"content":"Testing CLI with deliver flag"}` + "\n")
+	f, err := os.OpenFile(seg1, os.O_APPEND|os.O_WRONLY, 0644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _ = f.Write(eventLine2)
+	_ = f.Close()
+
+	// 3. Run WITH --deliver flag: MUST deliver post-commit
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"digest", "run", "--deliver", "-config=", "-exchange-dir=" + exchangeDir, "-data-dir=" + dataDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("run with --deliver failed: %s", stderr.String())
+	}
+	if sendCount != 1 {
+		t.Fatalf("expected exactly 1 Telegram delivery when --deliver passed, got %d", sendCount)
+	}
+	if !strings.Contains(stdout.String(), "[PASS] Delivered to Telegram") {
+		t.Errorf("expected '[PASS] Delivered to Telegram' in stdout, got: %s", stdout.String())
+	}
+}
+
 

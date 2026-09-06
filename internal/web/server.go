@@ -9,6 +9,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +18,7 @@ import (
 
 	"cordbrief/internal/catalog"
 	"cordbrief/internal/config"
+	"cordbrief/internal/delivery"
 	"cordbrief/internal/digest"
 	"cordbrief/internal/inbox"
 	"cordbrief/internal/journal"
@@ -25,21 +28,23 @@ import (
 
 // ServerOptions configures the Core Web Control Plane.
 type ServerOptions struct {
-	ExchangeDir string
-	DataDir     string
-	Store       *config.Store
-	Scheduler   *scheduler.Service
-	Lock        *sync.Mutex
+	ExchangeDir     string
+	DataDir         string
+	Store           *config.Store
+	Scheduler       *scheduler.Service
+	DeliveryService *delivery.Service
+	Lock            *sync.Mutex
 }
 
 // Server serves the Core Web Control Plane.
 type Server struct {
-	exchangeDir string
-	dataDir     string
-	store       *config.Store
-	scheduler   *scheduler.Service
-	lock        *sync.Mutex
-	mux         *http.ServeMux
+	exchangeDir     string
+	dataDir         string
+	store           *config.Store
+	scheduler       *scheduler.Service
+	deliveryService *delivery.Service
+	lock            *sync.Mutex
+	mux             *http.ServeMux
 }
 
 // NewServer initializes the Core web control plane handler.
@@ -58,12 +63,13 @@ func NewServer(opts ServerOptions) (*Server, error) {
 	}
 
 	s := &Server{
-		exchangeDir: opts.ExchangeDir,
-		dataDir:     opts.DataDir,
-		store:       opts.Store,
-		scheduler:   opts.Scheduler,
-		lock:        opts.Lock,
-		mux:         http.NewServeMux(),
+		exchangeDir:     opts.ExchangeDir,
+		dataDir:         opts.DataDir,
+		store:           opts.Store,
+		scheduler:       opts.Scheduler,
+		deliveryService: opts.DeliveryService,
+		lock:            opts.Lock,
+		mux:             http.NewServeMux(),
 	}
 
 	s.routes()
@@ -89,6 +95,11 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/digest/settings", s.handleDigestSettings)
 	s.mux.HandleFunc("/api/digest/preview", s.handleDigestPreview)
 	s.mux.HandleFunc("/api/collector/command", s.handleCollectorCommand)
+	s.mux.HandleFunc("/api/telegram/settings", s.handleTelegramSettings)
+	s.mux.HandleFunc("/api/telegram/test", s.handleTelegramTest)
+	s.mux.HandleFunc("/api/telegram/chats", s.handleTelegramChats)
+	s.mux.HandleFunc("/api/telegram/send-test", s.handleTelegramSendTest)
+	s.mux.HandleFunc("/api/digests/", s.handleDigestDeliveryAction)
 }
 
 // validateCSRF enforces Origin / Host check on state-changing requests.
@@ -145,6 +156,11 @@ type indexViewModel struct {
 	ScheduleState             scheduler.State
 	ScheduleNextDue           time.Time
 	ScheduleNextDueFormatted string
+	TelegramEnabled          bool
+	TelegramTokenSource      config.SecretSource
+	TelegramConfigured       bool
+	TelegramChatID           string
+	TelegramChatLabel        string
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
@@ -202,9 +218,28 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 	// 2. Read catalog.json
 	if cat, err := catalog.Load(s.exchangeDir); err == nil {
-		vm.Catalog = cat
-		vm.CatalogGuildCount = len(cat.Guilds)
+		sanitizedCat := &catalog.Catalog{
+			Version:   cat.Version,
+			UpdatedAt: cat.UpdatedAt,
+		}
 		for _, g := range cat.Guilds {
+			var safeChannels []catalog.Channel
+			for _, ch := range g.Channels {
+				if !catalog.IsHiddenChannelSentinel(ch.Name) {
+					safeChannels = append(safeChannels, ch)
+				}
+			}
+			if len(safeChannels) > 0 {
+				sanitizedCat.Guilds = append(sanitizedCat.Guilds, catalog.Guild{
+					ID:       g.ID,
+					Name:     g.Name,
+					Channels: safeChannels,
+				})
+			}
+		}
+		vm.Catalog = sanitizedCat
+		vm.CatalogGuildCount = len(sanitizedCat.Guilds)
+		for _, g := range sanitizedCat.Guilds {
 			vm.CatalogChannelCount += len(g.Channels)
 		}
 		if vm.CatalogState == "" {
@@ -274,6 +309,13 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		vm.ScheduleNextDueFormatted = vm.ScheduleNextDue.Format("2006-01-02 15:04 MST")
 	}
 
+	delCfg := s.store.GetDeliveryConfig()
+	vm.TelegramEnabled = delCfg.Telegram.Enabled
+	vm.TelegramTokenSource = s.store.GetTelegramTokenSource()
+	vm.TelegramConfigured = s.store.IsTelegramConfigured()
+	vm.TelegramChatID = delCfg.Telegram.ChatID
+	vm.TelegramChatLabel = delCfg.Telegram.ChatLabel
+
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	_ = IndexTemplate.Execute(w, vm)
 }
@@ -325,6 +367,7 @@ type inboxItemViewModel struct {
 	inbox.DigestSummary
 	CreatedAtFormatted string
 	ShortBatchID       string
+	Delivery           *delivery.DeliveryRecord
 }
 
 type inboxViewModel struct {
@@ -352,10 +395,15 @@ func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 		if len(shortID) > 12 {
 			shortID = shortID[:12]
 		}
+		var delRec *delivery.DeliveryRecord
+		if s.deliveryService != nil {
+			delRec, _ = s.deliveryService.GetDelivery(sum.BatchID)
+		}
 		items = append(items, inboxItemViewModel{
 			DigestSummary:      sum,
 			CreatedAtFormatted: FormatDisplayTime(sum.CreatedAt, tzName),
 			ShortBatchID:       shortID,
+			Delivery:           delRec,
 		})
 	}
 
@@ -394,8 +442,9 @@ func (s *Server) getDisplayTimezone() string {
 }
 
 type SourceLinkView struct {
-	ID  string
-	URL string
+	Label string
+	ID    string
+	URL   string
 }
 
 type DetailItemView struct {
@@ -409,6 +458,9 @@ type detailViewModel struct {
 	Artifact           *digest.Artifact
 	CreatedAtFormatted string
 	Items              []DetailItemView
+	Delivery           *delivery.DeliveryRecord
+	FlashMessage       string
+	FlashError         string
 }
 
 func (s *Server) handleDigestDetail(w http.ResponseWriter, r *http.Request) {
@@ -459,19 +511,47 @@ func (s *Server) handleDigestDetail(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	displayMap := delivery.BuildSourceDisplayMap(art.Digest)
 	var items []DetailItemView
 	if art.Digest != nil {
 		for _, item := range art.Digest.Items {
-			var sources []SourceLinkView
+			type sourceItem struct {
+				num  int
+				view SourceLinkView
+			}
+			var itemSources []sourceItem
 			for _, sID := range item.SourceIDs {
+				sIDTrim := strings.TrimSpace(sID)
+				if sIDTrim == "" {
+					continue
+				}
 				var jumpURL string
-				if sm, ok := sourceMap[sID]; ok {
+				if sm, ok := sourceMap[sIDTrim]; ok {
 					jumpURL = digest.JumpLink(sm)
 				}
-				sources = append(sources, SourceLinkView{
-					ID:  sID,
-					URL: jumpURL,
+				label := sIDTrim
+				num := 0
+				if mapped, ok := displayMap[sIDTrim]; ok {
+					label = mapped
+					if n, err := strconv.Atoi(mapped); err == nil {
+						num = n
+					}
+				}
+				itemSources = append(itemSources, sourceItem{
+					num: num,
+					view: SourceLinkView{
+						Label: label,
+						ID:    sIDTrim,
+						URL:   jumpURL,
+					},
 				})
+			}
+			sort.SliceStable(itemSources, func(i, j int) bool {
+				return itemSources[i].num < itemSources[j].num
+			})
+			var sources []SourceLinkView
+			for _, s := range itemSources {
+				sources = append(sources, s.view)
 			}
 			items = append(items, DetailItemView{
 				Kind:           item.Kind,
@@ -482,11 +562,19 @@ func (s *Server) handleDigestDetail(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var delRec *delivery.DeliveryRecord
+	if s.deliveryService != nil {
+		delRec, _ = s.deliveryService.GetDelivery(batchID)
+	}
+
 	tzName := s.getDisplayTimezone()
 	vm := detailViewModel{
 		Artifact:           art,
 		CreatedAtFormatted: FormatDisplayTime(art.CreatedAt, tzName),
 		Items:              items,
+		Delivery:           delRec,
+		FlashMessage:       r.URL.Query().Get("flash"),
+		FlashError:         r.URL.Query().Get("error"),
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -831,15 +919,300 @@ func (s *Server) handleCollectorCommand(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	msg := "Reauthentication mode requested. Open Setup Viewer (:14500) to sign in."
+	msg := "Reauthentication mode requested. Open Setup Viewer (:28742) to sign in."
 	if command == "return_normal" {
 		msg = "Normal collection mode requested."
 	}
 	http.Redirect(w, r, "/?flash="+url.QueryEscape(msg), http.StatusSeeOther)
 }
 
+func parseForm(r *http.Request) {
+	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
+		_ = r.ParseMultipartForm(10 << 20)
+	} else {
+		_ = r.ParseForm()
+	}
+}
+
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(data)
+}
+
+func (s *Server) handleTelegramSettings(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.validateCSRF(r) {
+		http.Error(w, "CSRF verification failed", http.StatusForbidden)
+		return
+	}
+
+	parseForm(r)
+
+	enabled := (r.FormValue("enabled") == "true" || r.FormValue("enabled") == "on")
+	token := strings.TrimSpace(r.FormValue("token"))
+	chatID := strings.TrimSpace(r.FormValue("chat_id"))
+	chatLabel := strings.TrimSpace(r.FormValue("chat_label"))
+
+	// Save token to secrets.json if provided and not managed by environment
+	if token != "" {
+		if s.store.GetTelegramTokenSource() != config.SecretSourceEnvironment {
+			if err := s.store.SaveTelegramBotToken(token); err != nil {
+				http.Redirect(w, r, fmt.Sprintf("/?error=Failed+saving+token:+%s", url.QueryEscape(err.Error())), http.StatusSeeOther)
+				return
+			}
+		}
+	}
+
+	delCfg := s.store.GetDeliveryConfig()
+	delCfg.Telegram.Enabled = enabled
+	delCfg.Telegram.ChatID = chatID
+	delCfg.Telegram.ChatLabel = chatLabel
+
+	// Validation: a persisted configuration with telegram.enabled = true must have configured token and destination
+	if enabled {
+		tokenSource := s.store.GetTelegramTokenSource()
+		if tokenSource == config.SecretSourceNone && token == "" {
+			errMsg := "Configure and verify a Telegram bot token before enabling delivery."
+			if strings.Contains(r.Header.Get("Accept"), "application/json") {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": errMsg})
+				return
+			}
+			http.Redirect(w, r, "/?error="+url.QueryEscape(errMsg), http.StatusSeeOther)
+			return
+		}
+		if chatID == "" {
+			errMsg := "Select a Telegram destination before enabling daily delivery."
+			if strings.Contains(r.Header.Get("Accept"), "application/json") {
+				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": errMsg})
+				return
+			}
+			http.Redirect(w, r, "/?error="+url.QueryEscape(errMsg), http.StatusSeeOther)
+			return
+		}
+	}
+
+	if err := s.store.SaveDeliveryConfig(delCfg); err != nil {
+		http.Redirect(w, r, fmt.Sprintf("/?error=Failed+saving+delivery+settings:+%s", url.QueryEscape(err.Error())), http.StatusSeeOther)
+		return
+	}
+
+	if strings.Contains(r.Header.Get("Accept"), "application/json") {
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		return
+	}
+
+	http.Redirect(w, r, "/?flash=Telegram+delivery+settings+saved", http.StatusSeeOther)
+}
+
+func (s *Server) handleTelegramTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.validateCSRF(r) {
+		http.Error(w, "CSRF verification failed", http.StatusForbidden)
+		return
+	}
+
+	parseForm(r)
+	token := strings.TrimSpace(r.FormValue("token"))
+
+	if s.deliveryService == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"ok":    false,
+			"error": "Delivery service not initialized",
+		})
+		return
+	}
+
+	if token == "" && s.store.GetTelegramTokenSource() == config.SecretSourceNone {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":    false,
+			"error": "telegram bot token is not configured",
+		})
+		return
+	}
+
+	user, err := s.deliveryService.TestBot(r.Context(), token)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":    false,
+			"error": err.Error(),
+		})
+		return
+	}
+
+	// Persist verified token into data/secrets.json (0600) so Discover Chats and delivery work immediately
+	if token != "" && s.store.GetTelegramTokenSource() != config.SecretSourceEnvironment {
+		if err := s.store.SaveTelegramBotToken(token); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]any{
+				"ok":    false,
+				"error": fmt.Sprintf("saving bot token: %v", err),
+			})
+			return
+		}
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"id":         user.ID,
+		"username":   user.Username,
+		"first_name": user.FirstName,
+		"configured": true,
+		"source":     s.store.GetTelegramTokenSource(),
+	})
+}
+
+func (s *Server) handleTelegramChats(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.validateCSRF(r) {
+		http.Error(w, "CSRF verification failed", http.StatusForbidden)
+		return
+	}
+
+	parseForm(r)
+	token := strings.TrimSpace(r.FormValue("token"))
+
+	if s.deliveryService == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"ok":    false,
+			"error": "Delivery service not initialized",
+		})
+		return
+	}
+
+	chats, err := s.deliveryService.DiscoverChats(r.Context(), token)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":    false,
+			"error": err.Error(),
+		})
+		return
+	}
+
+	type safeChatView struct {
+		ID    string `json:"id"`
+		Label string `json:"label"`
+		Type  string `json:"type"`
+	}
+
+	var results []safeChatView
+	for _, c := range chats {
+		results = append(results, safeChatView{
+			ID:    c.ID,
+			Label: c.Label(),
+			Type:  c.Type,
+		})
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":    true,
+		"chats": results,
+	})
+}
+
+func (s *Server) handleTelegramSendTest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.validateCSRF(r) {
+		http.Error(w, "CSRF verification failed", http.StatusForbidden)
+		return
+	}
+
+	parseForm(r)
+	chatID := strings.TrimSpace(r.FormValue("chat_id"))
+	if chatID == "" {
+		chatID = s.store.GetDeliveryConfig().Telegram.ChatID
+	}
+	if chatID == "" {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":    false,
+			"error": "chat_id is required",
+		})
+		return
+	}
+
+	if s.deliveryService == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+			"ok":    false,
+			"error": "Delivery service not initialized",
+		})
+		return
+	}
+
+	msgID, err := s.deliveryService.SendTestMessage(r.Context(), chatID)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]any{
+			"ok":    false,
+			"error": err.Error(),
+		})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ok":         true,
+		"message_id": msgID,
+		"message":    "Test message sent successfully.",
+	})
+}
+
+func (s *Server) handleDigestDeliveryAction(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	if !s.validateCSRF(r) {
+		http.Error(w, "CSRF verification failed", http.StatusForbidden)
+		return
+	}
+
+	parts := strings.Split(r.URL.Path, "/")
+	if len(parts) < 4 || parts[1] != "api" || parts[2] != "digests" {
+		http.Error(w, "Not found", http.StatusNotFound)
+		return
+	}
+	batchID := parts[3]
+
+	parseForm(r)
+	force := (r.FormValue("force") == "true" || r.FormValue("force") == "1")
+
+	if s.deliveryService == nil {
+		http.Error(w, "Delivery service not initialized", http.StatusServiceUnavailable)
+		return
+	}
+
+	rec, err := s.deliveryService.DeliverBatch(r.Context(), batchID, force)
+
+	isJSON := strings.Contains(r.Header.Get("Accept"), "application/json")
+	if isJSON {
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{
+				"ok":     false,
+				"error":  err.Error(),
+				"record": rec,
+			})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok":     true,
+			"record": rec,
+		})
+		return
+	}
+
+	if err != nil {
+		http.Redirect(w, r, fmt.Sprintf("/digests/%s?error=%s", batchID, url.QueryEscape(err.Error())), http.StatusSeeOther)
+		return
+	}
+
+	http.Redirect(w, r, fmt.Sprintf("/digests/%s?flash=Delivered+to+Telegram+successfully", batchID), http.StatusSeeOther)
 }

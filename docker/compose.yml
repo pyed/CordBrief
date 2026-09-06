@@ -3,7 +3,7 @@
 # Security & Process Boundary:
 # - cordbrief-collector: Lightweight headless daemon running official Discord + Vencord dist under Xvfb.
 #   Stripped of Xpra, Python, compilers, git, and build tools. No published ports.
-# - cordbrief-setup: Ephemeral setup and reauthentication tool with Xpra HTML5 viewer on 127.0.0.1:14500.
+# - cordbrief-setup: Ephemeral setup and reauthentication tool with Xpra HTML5 viewer on 127.0.0.1:28742.
 #   Builds Vencord with CordBrief userplugin, stages runtime volume releases, and yields.
 #   Runs on-demand via: docker compose --profile setup up cordbrief-setup
 # - cordbrief-core: Runs Go core application. Reads journal events and manages watchlist.
@@ -59,12 +59,12 @@ services:
     user: "1000:1000"
     ports:
       # Expose Xpra HTML5 client exclusively to localhost for first-time login / reauth
-      - "127.0.0.1:14500:14500"
+      - "127.0.0.1:28742:28742"
     environment:
       - CORDBRIEF_EXCHANGE_DIR=/var/cordbrief/exchange
       - CORDBRIEF_COLLECTOR_DATA_DIR=/var/lib/cordbrief
       - CORDBRIEF_RUNTIME_DIR=/var/cordbrief/runtime
-      - XPRA_PORT=14500
+      - XPRA_PORT=28742
       - DISPLAY=:100
     volumes:
       - cordbrief_discord_runtime:/var/cordbrief/runtime
@@ -85,11 +85,16 @@ services:
     user: "1000:1000"
     command: ["serve"]
     ports:
-      - "127.0.0.1:8080:8080"
+      - "127.0.0.1:28741:28741"
+    env_file:
+      - path: ../.env
+        required: false
     environment:
       - CORDBRIEF_EXCHANGE_DIR=/var/cordbrief/exchange
       - CORDBRIEF_DATA_DIR=/var/cordbrief/data
+      - CORDBRIEF_WEB_PORT=28741
       - GEMINI_API_KEY
+      - TELEGRAM_BOT_TOKEN
       - CORDBRIEF_LLM_PROVIDER
       - CORDBRIEF_LLM_BASE_URL
       - CORDBRIEF_LLM_MODEL
@@ -100,7 +105,7 @@ services:
       # Core internal data and state
       - cordbrief_core_data:/var/cordbrief/data
     healthcheck:
-      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:8080/ > /dev/null || exit 1"]
+      test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:28741/ > /dev/null || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 3

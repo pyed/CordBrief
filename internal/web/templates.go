@@ -316,13 +316,13 @@ const indexTemplateHTML = `<!DOCTYPE html>
           # 1. Stop collector and launch setup viewer:<br>
           <strong>docker compose stop cordbrief-collector && docker compose --profile setup up cordbrief-setup</strong><br><br>
           # 2. Open viewer in browser and sign in:<br>
-          <a href="http://127.0.0.1:14500/" target="_blank" style="color: var(--primary); font-weight: bold;">http://127.0.0.1:14500/</a><br><br>
+          <a href="http://127.0.0.1:28742/" target="_blank" style="color: var(--primary); font-weight: bold;">http://127.0.0.1:28742/</a><br><br>
           # 3. Once signed in, restart collector:<br>
           <strong>docker compose start cordbrief-collector</strong>
         </div>
         <div class="btn-group">
-          <a href="http://127.0.0.1:14500/" target="_blank" class="btn btn-primary">
-            🖥 Open Setup Viewer (:14500)
+          <a href="http://127.0.0.1:28742/" target="_blank" class="btn btn-primary">
+            🖥 Open Setup Viewer (:28742)
           </a>
           <form method="POST" action="/api/collector/command" style="display: inline;">
             <input type="hidden" name="command" value="return_normal">
@@ -330,9 +330,9 @@ const indexTemplateHTML = `<!DOCTYPE html>
           </form>
         </div>
         <div class="help-text" style="margin-top: 10px; line-height: 1.5;">
-          <strong>Security Note:</strong> Port <code>14500</code> is bound to <code>127.0.0.1</code> (localhost) only to protect your Discord desktop session.<br>
+          <strong>Security Note:</strong> Port <code>28742</code> is bound to <code>127.0.0.1</code> (localhost) only to protect your Discord desktop session.<br>
           If managing CordBrief remotely on a NAS, forward ports over SSH:<br>
-          <code style="background: var(--code-bg); padding: 2px 6px; border-radius: 4px;">ssh -L 8080:127.0.0.1:8080 -L 14500:127.0.0.1:14500 user@nas</code>
+          <code style="background: var(--code-bg); padding: 2px 6px; border-radius: 4px;">ssh -L 28741:127.0.0.1:28741 -L 28742:127.0.0.1:28742 user@nas</code>
         </div>
       </div>
     {{else if .DiscordAuthenticated}}
@@ -564,7 +564,76 @@ const indexTemplateHTML = `<!DOCTYPE html>
       </form>
     </div>
 
-    <!-- 6. MANUAL DIGEST PREVIEW -->
+    <!-- 6. TELEGRAM DELIVERY SETTINGS -->
+    <div class="card">
+      <div class="card-title">
+        <span>Telegram Delivery Configuration</span>
+        <span class="help-text">Direct delivery of completed digests over outbound HTTPS</span>
+      </div>
+      <form method="POST" action="/api/telegram/settings" id="telegram-form">
+        <div class="form-group">
+          <label class="channel-cb">
+            <input type="checkbox" name="enabled" value="true" {{if .TelegramEnabled}}checked{{end}}>
+            <span><strong>Enable Telegram Delivery</strong></span>
+          </label>
+        </div>
+
+        <div class="form-group">
+          <label>Bot Token Status</label>
+          <div id="tg-token-status" style="margin-bottom: 8px;">
+            {{if eq .TelegramTokenSource "environment"}}
+              <span class="badge badge-ok">Configured (via environment: TELEGRAM_BOT_TOKEN)</span>
+            {{else if eq .TelegramTokenSource "stored"}}
+              <span class="badge badge-ok">Configured (stored in secrets.json)</span>
+            {{else}}
+              <span class="badge badge-warn">Not Configured</span>
+            {{end}}
+          </div>
+          <label>Enter / Update Bot Token</label>
+          {{if eq .TelegramTokenSource "environment"}}
+            <input type="password" name="token" id="tg-token" placeholder="Managed by environment variable (TELEGRAM_BOT_TOKEN)" disabled>
+            <div class="help-text"><strong>Precedence Note:</strong> Environment variable (<code>TELEGRAM_BOT_TOKEN</code>) takes precedence over stored secrets.</div>
+          {{else if eq .TelegramTokenSource "stored"}}
+            <input type="password" name="token" id="tg-token" placeholder="Configured — leave blank to keep unchanged">
+            <div class="help-text">Stored privately in <code>data/secrets.json</code> (0600). Enter a new token to replace it.</div>
+          {{else}}
+            <input type="password" name="token" id="tg-token" placeholder="Enter bot token from @BotFather (e.g. 123456789:ABCDef...)">
+            <div class="help-text">Obtained from Telegram @BotFather. Stored privately in <code>data/secrets.json</code> (0600); never displayed.</div>
+          {{end}}
+          <div style="margin-top: 8px;">
+            <button type="button" class="btn btn-secondary" onclick="testTelegramBot()">Test Bot Token</button>
+            <span id="tg-bot-test-result" style="margin-left: 8px; font-size: 0.9rem; font-weight: 600;"></span>
+          </div>
+        </div>
+
+        <div class="form-group">
+          <label>Destination Chat ID</label>
+          <div style="display: flex; gap: 8px; margin-bottom: 6px;">
+            <input type="text" name="chat_id" id="tg-chat-id" value="{{.TelegramChatID}}" placeholder="e.g. -100123456789 or 987654321" style="flex: 1;">
+            <button type="button" class="btn btn-secondary" onclick="discoverTelegramChats()">Discover Chats</button>
+          </div>
+          <div id="tg-discovered-chats" style="display: none; margin-bottom: 8px;">
+            <label style="font-size: 0.85rem; color: var(--text-muted);">Discovered Recent Chats (click to select):</label>
+            <div id="tg-chats-list" style="display: flex; flex-direction: column; gap: 6px; max-height: 180px; overflow-y: auto; background: var(--code-bg); padding: 8px; border-radius: 4px; border: 1px solid var(--border);"></div>
+            <div id="tg-selected-chat-note" style="display: none; margin-top: 6px; font-size: 0.85rem; color: var(--accent); font-weight: 600;"></div>
+          </div>
+          <div class="help-text">Send a message to your bot first (e.g. <code>/start</code>), then click 'Discover Chats' to auto-populate.</div>
+        </div>
+
+        <div class="form-group">
+          <label>Destination Chat Label (optional)</label>
+          <input type="text" name="chat_label" id="tg-chat-label" value="{{.TelegramChatLabel}}" placeholder="e.g. CordBrief Daily Updates">
+        </div>
+
+        <div class="btn-group">
+          <button type="submit" class="btn btn-primary">Save Telegram Settings</button>
+          <button type="button" class="btn btn-secondary" onclick="sendTestTelegramMessage()">Send Test Ping</button>
+          <span id="tg-ping-result" style="font-size: 0.9rem; font-weight: 600;"></span>
+        </div>
+      </form>
+    </div>
+
+    <!-- 7. MANUAL DIGEST PREVIEW -->
     <div class="card">
       <div class="card-title">
         <span>Manual Digest Preview</span>
@@ -608,6 +677,182 @@ const indexTemplateHTML = `<!DOCTYPE html>
         }
       } catch (err) {
         resEl.textContent = '✗ Network error testing connection';
+        resEl.style.color = 'var(--danger)';
+      }
+    }
+
+    async function testTelegramBot() {
+      const resEl = document.getElementById('tg-bot-test-result');
+      resEl.textContent = 'Testing bot...';
+      resEl.style.color = 'var(--text-muted)';
+      try {
+        const tokenInput = document.getElementById('tg-token');
+        const params = new URLSearchParams();
+        if (tokenInput && tokenInput.value.trim()) {
+          params.append('token', tokenInput.value.trim());
+        }
+        const resp = await fetch('/api/telegram/test', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: params.toString()
+        });
+        const data = await resp.json();
+        if (data.ok) {
+          resEl.textContent = '✓ Bot verified: @' + (data.username || data.first_name) + ' (ID: ' + data.id + ') — Saved to secrets.json';
+          resEl.style.color = 'var(--success)';
+
+          const statusEl = document.getElementById('tg-token-status');
+          if (statusEl) {
+            const badgeText = (data.source === 'environment')
+              ? 'Configured (via environment: TELEGRAM_BOT_TOKEN)'
+              : 'Configured (stored in secrets.json)';
+            statusEl.innerHTML = '<span class="badge badge-ok">' + badgeText + '</span>';
+          }
+          if (tokenInput && data.source !== 'environment') {
+            tokenInput.placeholder = 'Configured — leave blank to keep unchanged';
+            tokenInput.value = '';
+          }
+        } else {
+          resEl.textContent = '✗ ' + (data.error || 'Test failed');
+          resEl.style.color = 'var(--danger)';
+        }
+      } catch (err) {
+        resEl.textContent = '✗ Network error testing bot';
+        resEl.style.color = 'var(--danger)';
+      }
+    }
+
+    function selectDiscoveredChat(id, label, rowEl) {
+      const chatIdInput = document.getElementById('tg-chat-id');
+      const chatLabelInput = document.getElementById('tg-chat-label');
+      if (chatIdInput) chatIdInput.value = id;
+      if (chatLabelInput && label) chatLabelInput.value = label;
+
+      const allRows = document.querySelectorAll('.tg-discovered-item');
+      allRows.forEach(r => {
+        r.style.borderColor = 'var(--border)';
+        r.style.background = 'var(--bg-card)';
+        const badge = r.querySelector('.tg-item-badge');
+        if (badge) badge.style.display = 'none';
+      });
+
+      if (rowEl) {
+        rowEl.style.borderColor = 'var(--accent)';
+        rowEl.style.background = 'rgba(88, 101, 242, 0.12)';
+        const badge = rowEl.querySelector('.tg-item-badge');
+        if (badge) badge.style.display = 'inline-block';
+      }
+
+      const selNote = document.getElementById('tg-selected-chat-note');
+      if (selNote) {
+        selNote.textContent = 'Selected: ' + (label || id) + ' (' + id + ')';
+        selNote.style.display = 'block';
+      }
+    }
+
+    async function discoverTelegramChats() {
+      const container = document.getElementById('tg-discovered-chats');
+      const listEl = document.getElementById('tg-chats-list');
+      const selNote = document.getElementById('tg-selected-chat-note');
+      if (selNote) selNote.style.display = 'none';
+      listEl.innerHTML = '<span style="color: var(--text-muted); font-size: 0.85rem;">Querying updates...</span>';
+      container.style.display = 'block';
+      try {
+        const tokenInput = document.getElementById('tg-token');
+        const params = new URLSearchParams();
+        if (tokenInput && tokenInput.value.trim()) {
+          params.append('token', tokenInput.value.trim());
+        }
+        const resp = await fetch('/api/telegram/chats', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: params.toString()
+        });
+        const data = await resp.json();
+        if (data.ok && data.chats && data.chats.length > 0) {
+          listEl.innerHTML = '';
+          const currentChatId = (document.getElementById('tg-chat-id').value || '').trim();
+          let autoSelectTarget = null;
+          let autoSelectRow = null;
+
+          // Auto-select ONLY if exactly 1 eligible private chat exists and no destination is already configured
+          const privateChats = data.chats.filter(c => c.type === 'private');
+          const shouldAutoSelect = (data.chats.length === 1 && privateChats.length === 1 && currentChatId === '');
+
+          data.chats.forEach(c => {
+            const isSelected = (currentChatId === c.id);
+            const isGroup = (c.type === 'group' || c.type === 'supergroup');
+            const icon = isGroup ? '👥' : '👤';
+            const typeLabel = (c.type || 'chat').toUpperCase();
+
+            const row = document.createElement('div');
+            row.className = 'tg-discovered-item';
+            row.style.display = 'flex';
+            row.style.justifyContent = 'space-between';
+            row.style.alignItems = 'center';
+            row.style.padding = '8px 12px';
+            row.style.borderRadius = '6px';
+            row.style.border = '1px solid ' + (isSelected ? 'var(--accent)' : 'var(--border)');
+            row.style.background = isSelected ? 'rgba(88, 101, 242, 0.12)' : 'var(--bg-card)';
+            row.style.cursor = 'pointer';
+            row.style.transition = 'all 0.15s ease';
+
+            row.innerHTML =
+              '<div style="display: flex; align-items: center; gap: 8px;">' +
+                '<span style="font-size: 1.1rem;">' + icon + '</span>' +
+                '<span style="font-weight: 600; font-size: 0.9rem;">' + c.label + '</span>' +
+                '<span style="font-size: 0.8rem; color: var(--text-muted);">(' + c.id + ')</span>' +
+              '</div>' +
+              '<div style="display: flex; align-items: center; gap: 8px;">' +
+                '<span class="badge" style="font-size: 0.75rem; letter-spacing: 0.5px;">' + typeLabel + '</span>' +
+                '<span class="badge badge-ok tg-item-badge" style="font-size: 0.75rem; display: ' + (isSelected ? 'inline-block' : 'none') + ';">✓ SELECTED</span>' +
+              '</div>';
+
+            row.onclick = () => selectDiscoveredChat(c.id, c.label, row);
+            listEl.appendChild(row);
+
+            if (shouldAutoSelect) {
+              autoSelectTarget = c;
+              autoSelectRow = row;
+            }
+          });
+
+          if (shouldAutoSelect && autoSelectTarget && autoSelectRow) {
+            selectDiscoveredChat(autoSelectTarget.id, autoSelectTarget.label, autoSelectRow);
+          }
+        } else if (data.ok) {
+          listEl.innerHTML = '<span style="color: var(--text-muted); font-size: 0.85rem;">No recent chat interactions found. Send a message (e.g. <code>/start</code>) to the bot on Telegram first, then try again.</span>';
+        } else {
+          listEl.innerHTML = '<span style="color: var(--danger); font-size: 0.85rem;">Error: ' + (data.error || 'Failed discovering chats') + '</span>';
+        }
+      } catch (err) {
+        listEl.innerHTML = '<span style="color: var(--danger); font-size: 0.85rem;">Network error discovering chats</span>';
+      }
+    }
+
+    async function sendTestTelegramMessage() {
+      const resEl = document.getElementById('tg-ping-result');
+      resEl.textContent = 'Sending test ping...';
+      resEl.style.color = 'var(--text-muted)';
+      try {
+        const chatId = document.getElementById('tg-chat-id').value.trim();
+        const params = new URLSearchParams();
+        if (chatId) params.append('chat_id', chatId);
+        const resp = await fetch('/api/telegram/send-test', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: params.toString()
+        });
+        const data = await resp.json();
+        if (data.ok) {
+          resEl.textContent = '✓ Test message sent successfully (ID: ' + data.message_id + ')';
+          resEl.style.color = 'var(--success)';
+        } else {
+          resEl.textContent = '✗ ' + (data.error || 'Send failed');
+          resEl.style.color = 'var(--danger)';
+        }
+      } catch (err) {
+        resEl.textContent = '✗ Network error sending ping';
         resEl.style.color = 'var(--danger)';
       }
     }
@@ -760,6 +1005,21 @@ const inboxTemplateHTML = `<!DOCTYPE html>
                   {{end}}
                 {{else}}
                   <span class="badge badge-manual">👤 Manual</span>
+                {{end}}
+                {{if .Delivery}}
+                  {{if eq .Delivery.State "sent"}}
+                    <span class="badge badge-ok">✈ Telegram: Sent</span>
+                  {{else if eq .Delivery.State "sending"}}
+                    <span class="badge badge-warn">✈ Telegram: Sending ({{.Delivery.NextPart}}/{{.Delivery.TotalParts}})</span>
+                  {{else if eq .Delivery.State "pending"}}
+                    <span class="badge badge-info">✈ Telegram: Pending</span>
+                  {{else if eq .Delivery.State "uncertain"}}
+                    <span class="badge badge-err">✈ Telegram: Uncertain</span>
+                  {{else if eq .Delivery.State "failed"}}
+                    <span class="badge badge-err">✈ Telegram: Failed</span>
+                  {{end}}
+                {{else}}
+                  <span class="badge" style="background: #374151; color: #9ca3af;">✈ Telegram: Not Delivered</span>
                 {{end}}
               </div>
             </div>
@@ -944,6 +1204,13 @@ const digestDetailTemplateHTML = `<!DOCTYPE html>
   <div class="container">
     <a href="/inbox" class="back-btn">← Back to Inbox</a>
 
+    {{if .FlashMessage}}
+      <div class="alert alert-success">{{.FlashMessage}}</div>
+    {{end}}
+    {{if .FlashError}}
+      <div class="alert alert-error">{{.FlashError}}</div>
+    {{end}}
+
     <div class="detail-header">
       <div class="detail-meta-bar">
         {{if .Artifact.Trigger}}
@@ -956,9 +1223,68 @@ const digestDetailTemplateHTML = `<!DOCTYPE html>
           <span class="badge badge-manual">👤 Manual Run</span>
         {{end}}
         <span class="badge badge-info">{{.Artifact.Provider}} ({{.Artifact.Model}})</span>
+        {{if .Delivery}}
+          {{if eq .Delivery.State "sent"}}
+            <span class="badge badge-ok">✈ Telegram: Sent</span>
+          {{else if eq .Delivery.State "sending"}}
+            <span class="badge badge-warn">✈ Telegram: Sending ({{.Delivery.NextPart}}/{{.Delivery.TotalParts}})</span>
+          {{else if eq .Delivery.State "pending"}}
+            <span class="badge badge-info">✈ Telegram: Pending</span>
+          {{else if eq .Delivery.State "uncertain"}}
+            <span class="badge badge-err">✈ Telegram: Uncertain</span>
+          {{else if eq .Delivery.State "failed"}}
+            <span class="badge badge-err">✈ Telegram: Failed</span>
+          {{end}}
+        {{else}}
+          <span class="badge" style="background: #374151; color: #9ca3af;">✈ Telegram: Not Delivered</span>
+        {{end}}
         <span class="help-text">Generated on {{.CreatedAtFormatted}}</span>
       </div>
       <h1 class="detail-title">{{.Artifact.Digest.Title}}</h1>
+    </div>
+
+    <!-- TELEGRAM DELIVERY CARD -->
+    <div class="card" style="margin-bottom: 24px;">
+      <div class="card-title">
+        <span>Telegram Delivery</span>
+        {{if .Delivery}}
+          <span class="help-text">Destination: {{if .Delivery.DestinationLabel}}{{.Delivery.DestinationLabel}}{{else}}{{.Delivery.DestinationID}}{{end}}</span>
+        {{end}}
+      </div>
+      {{if .Delivery}}
+        {{if .Delivery.LastSafeError}}
+          <div style="background: rgba(237, 66, 69, 0.15); border: 1px solid var(--danger); border-radius: 6px; padding: 12px; margin-bottom: 12px; color: #ffa6a8; font-size: 0.9rem;">
+            <strong>Delivery Issue:</strong> {{.Delivery.LastSafeError}}
+          </div>
+        {{end}}
+        {{if eq .Delivery.State "uncertain"}}
+          <div style="background: rgba(250, 168, 26, 0.15); border: 1px solid var(--warning); border-radius: 6px; padding: 12px; margin-bottom: 12px; color: #fde68a; font-size: 0.9rem;">
+            <strong>Ambiguous Outcome:</strong> Transport failed ambiguously after submission (timeout or server error). Messages may have reached Telegram. Confirmation required before retrying to avoid duplicate messages.
+          </div>
+          <form method="POST" action="/api/digests/{{$.Artifact.BatchID}}/deliver" style="display: inline;">
+            <input type="hidden" name="force" value="true">
+            <button type="submit" class="btn btn-primary" onclick="return confirm('Delivery outcome was uncertain. Send again anyway?')">Confirm &amp; Resend</button>
+          </form>
+        {{else if eq .Delivery.State "sent"}}
+          <div style="color: var(--success); font-weight: 600; margin-bottom: 12px;">✓ All parts delivered to Telegram ({{len .Delivery.TelegramMessageIDs}} message(s)).</div>
+          <form method="POST" action="/api/digests/{{$.Artifact.BatchID}}/deliver" style="display: inline;">
+            <input type="hidden" name="force" value="true">
+            <button type="submit" class="btn btn-secondary" onclick="return confirm('This digest has already been sent. Send again anyway?')">Send Again Anyway</button>
+          </form>
+        {{else if eq .Delivery.State "failed"}}
+          <form method="POST" action="/api/digests/{{$.Artifact.BatchID}}/deliver" style="display: inline;">
+            <input type="hidden" name="force" value="true">
+            <button type="submit" class="btn btn-primary">Retry Delivery</button>
+          </form>
+        {{else}}
+          <span class="help-text">Delivery is in progress...</span>
+        {{end}}
+      {{else}}
+        <p class="help-text" style="margin-bottom: 12px;">This digest has not been delivered to Telegram yet.</p>
+        <form method="POST" action="/api/digests/{{$.Artifact.BatchID}}/deliver" style="display: inline;">
+          <button type="submit" class="btn btn-primary">Send to Telegram</button>
+        </form>
+      {{end}}
     </div>
 
     <div class="detail-overview-box">
@@ -983,9 +1309,9 @@ const digestDetailTemplateHTML = `<!DOCTYPE html>
                 <span>Sources:</span>
                 {{range .Sources}}
                   {{if .URL}}
-                    <a href="{{.URL}}" target="_blank" rel="noopener noreferrer" class="source-link" title="Jump to Discord message">{{.ID}} ↗</a>
+                    <a href="{{.URL}}" target="_blank" rel="noopener noreferrer" class="source-link" title="Jump to Discord message (Internal ID: {{.ID}})">{{.Label}} ↗</a>
                   {{else}}
-                    <span class="source-tag">{{.ID}}</span>
+                    <span class="source-tag" title="Internal ID: {{.ID}}">{{.Label}}</span>
                   {{end}}
                 {{end}}
               </div>

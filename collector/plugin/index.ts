@@ -383,7 +383,11 @@ export default definePlugin({
                         const map = ChannelStore.getMutableGuildChannelsForGuild(g.id);
                         if (map) {
                             channels = (Object.values(map) as any[])
-                                .filter(c => c && (c.type === 0 || c.type === 5)) // text or announcement only
+                                .filter(c => {
+                                    if (!c || (c.type !== 0 && c.type !== 5)) return false;
+                                    const n = String(c.name || "").trim();
+                                    return n !== "___hidden___" && n !== "__hidden__";
+                                })
                                 .map(c => ({
                                     id: String(c.id),
                                     name: String(c.name || "unnamed"),

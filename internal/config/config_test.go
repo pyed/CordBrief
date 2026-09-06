@@ -392,3 +392,81 @@ func TestValidateForChannels(t *testing.T) {
 		t.Fatal("expected error when guild_id is empty, got nil")
 	}
 }
+
+func TestPortHardeningDefaults(t *testing.T) {
+	if DefaultCorePort != 28741 {
+		t.Fatalf("expected DefaultCorePort 28741, got %d", DefaultCorePort)
+	}
+	if DefaultSetupPort != 28742 {
+		t.Fatalf("expected DefaultSetupPort 28742, got %d", DefaultSetupPort)
+	}
+}
+
+func TestDeliveryConfigValidation(t *testing.T) {
+	cfg := &Config{
+		GuildID:          "1234567890",
+		SourceChannelIDs: []string{"111"},
+		DigestChannelID:  "999",
+		Schedule: ScheduleConfig{
+			Time:     "08:00",
+			Timezone: "UTC",
+		},
+		Delivery: DeliveryConfig{
+			Telegram: TelegramConfig{
+				Enabled: true,
+				ChatID:  "",
+			},
+		},
+	}
+	if err := cfg.Validate(); err == nil {
+		t.Fatal("expected error when delivery.telegram.enabled is true but chat_id is empty, got nil")
+	}
+
+	cfg.Delivery.Telegram.ChatID = "-1001234567890"
+	if err := cfg.Validate(); err != nil {
+		t.Fatalf("expected valid config when chat_id is populated, got: %v", err)
+	}
+}
+
+func TestComposeConfigurationInvariants(t *testing.T) {
+	composeBytes, err := os.ReadFile("../../docker/compose.yml")
+	if err != nil {
+		t.Fatalf("failed to read docker/compose.yml: %v", err)
+	}
+	content := string(composeBytes)
+
+	// 1. Secret forwarding: env_file must point to ../.env (required: false)
+	if !strings.Contains(content, "path: ../.env") || !strings.Contains(content, "required: false") {
+		t.Errorf("docker/compose.yml missing env_file forwarding for ../.env")
+	}
+
+	// 2. Secret forwarding: GEMINI_API_KEY and TELEGRAM_BOT_TOKEN forwarded by name
+	if !strings.Contains(content, "- GEMINI_API_KEY") {
+		t.Errorf("docker/compose.yml missing GEMINI_API_KEY environment variable forwarding")
+	}
+	if !strings.Contains(content, "- TELEGRAM_BOT_TOKEN") {
+		t.Errorf("docker/compose.yml missing TELEGRAM_BOT_TOKEN environment variable forwarding")
+	}
+
+	// 3. Port hardening: Core web port
+	if !strings.Contains(content, `"127.0.0.1:28741:28741"`) {
+		t.Errorf("docker/compose.yml missing hardened Core port binding 127.0.0.1:28741:28741")
+	}
+
+	// 4. Port hardening: Setup port
+	if !strings.Contains(content, `"127.0.0.1:28742:28742"`) {
+		t.Errorf("docker/compose.yml missing hardened Setup port binding 127.0.0.1:28742:28742")
+	}
+
+	// 5. Port hardening: Collector has zero published host ports
+	collectorBlockIdx := strings.Index(content, "cordbrief-collector:")
+	setupBlockIdx := strings.Index(content, "cordbrief-setup:")
+	if collectorBlockIdx == -1 || setupBlockIdx == -1 || setupBlockIdx <= collectorBlockIdx {
+		t.Fatalf("unexpected compose structure: cordbrief-collector / cordbrief-setup blocks")
+	}
+	collectorBlock := content[collectorBlockIdx:setupBlockIdx]
+	if strings.Contains(collectorBlock, "ports:") {
+		t.Errorf("POLICY VIOLATION: cordbrief-collector must have zero published host ports, found 'ports:' in block")
+	}
+}
+

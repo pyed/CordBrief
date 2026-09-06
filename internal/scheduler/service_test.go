@@ -784,3 +784,98 @@ func TestScheduler_SafeLastErrorSanitization(t *testing.T) {
 		t.Fatalf("expected redacted token in LastError, got: %s", lastErr)
 	}
 }
+
+type mockDeliveryEnqueuer struct {
+	mu           sync.Mutex
+	enqueuedList []string
+	errToEmit    error
+}
+
+func (m *mockDeliveryEnqueuer) Enqueue(batchID string) error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.enqueuedList = append(m.enqueuedList, batchID)
+	return m.errToEmit
+}
+
+func TestDigestDeliveryTriggerPolicy(t *testing.T) {
+	loc, _ := time.LoadLocation("Asia/Riyadh")
+	now := time.Date(2026, 9, 4, 10, 0, 0, 0, loc)
+	sch := config.ScheduleConfig{
+		Enabled:  true,
+		Time:     "08:00",
+		Timezone: "Asia/Riyadh",
+	}
+
+	tmpDir := t.TempDir()
+	store, err := config.NewStore(tmpDir, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = store.SaveScheduleConfig(sch)
+
+	// Case 1: Telegram NOT enabled in config -> Enqueue is NOT called
+	runner := &mockRunner{
+		resultToEmit: &digest.TransactionResult{
+			Batch:    &digest.Batch{BatchID: strings.Repeat("1", 64)},
+			Artifact: &digest.Artifact{BatchID: strings.Repeat("1", 64)},
+		},
+	}
+	enq := &mockDeliveryEnqueuer{}
+
+	svc, err := NewService(ServiceOptions{
+		Store:            store,
+		DataDir:          tmpDir,
+		Runner:           runner,
+		DeliveryEnqueuer: enq,
+		Clock:            func() time.Time { return now },
+		CheckInterval:    1 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ran, err := svc.CheckAndRunSlot(context.Background())
+	if err != nil || !ran {
+		t.Fatalf("expected slot to run, ran=%v err=%v", ran, err)
+	}
+	if len(enq.enqueuedList) != 0 {
+		t.Errorf("expected 0 enqueued batches when telegram disabled, got %d", len(enq.enqueuedList))
+	}
+
+	// Case 2: Telegram configured and enabled -> Enqueue is called post-commit
+	now2 := now.Add(24 * time.Hour)
+	delCfg := store.GetDeliveryConfig()
+	delCfg.Telegram.Enabled = true
+	delCfg.Telegram.ChatID = "-100123456789"
+	_ = store.SaveDeliveryConfig(delCfg)
+	_ = store.SaveTelegramBotToken("fake-token")
+
+	runner.resultToEmit = &digest.TransactionResult{
+		Batch:    &digest.Batch{BatchID: strings.Repeat("2", 64)},
+		Artifact: &digest.Artifact{BatchID: strings.Repeat("2", 64)},
+	}
+
+	svc.clock = func() time.Time { return now2 }
+	ran, err = svc.CheckAndRunSlot(context.Background())
+	if err != nil || !ran {
+		t.Fatalf("expected slot to run, ran=%v err=%v", ran, err)
+	}
+	if len(enq.enqueuedList) != 1 || enq.enqueuedList[0] != strings.Repeat("2", 64) {
+		t.Errorf("expected batch %s to be enqueued, got %v", strings.Repeat("2", 64), enq.enqueuedList)
+	}
+
+	// Case 3: Enqueue error does NOT cause CheckAndRunSlot to fail or rollback cursor
+	now3 := now2.Add(24 * time.Hour)
+	runner.resultToEmit = &digest.TransactionResult{
+		Batch:    &digest.Batch{BatchID: strings.Repeat("3", 64)},
+		Artifact: &digest.Artifact{BatchID: strings.Repeat("3", 64)},
+	}
+	enq.errToEmit = errors.New("queue storage full")
+
+	svc.clock = func() time.Time { return now3 }
+	ran, err = svc.CheckAndRunSlot(context.Background())
+	if err != nil || !ran {
+		t.Fatalf("expected slot to succeed even if delivery enqueue errors, got ran=%v err=%v", ran, err)
+	}
+}
