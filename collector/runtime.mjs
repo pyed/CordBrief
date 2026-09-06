@@ -324,6 +324,52 @@ export function shouldStageRuntime({
 }
 
 /**
+ * Atomically activates a symlink to relativeTarget at currentLink within runtimeDir.
+ *
+ * PRODUCTION POLICY (Linux):
+ * Production runs exclusively on Linux containers, where rename(2) atomically replaces
+ * an existing symlink or directory in a single kernel syscall. current is NEVER missing.
+ *
+ * PLATFORM INVARIANT (Windows / Fail-Closed):
+ * Windows NTFS does NOT support atomic replacement of an existing junction or symlink via rename.
+ * Multi-step rename pivots (current -> old, tmp -> current, rm old) are NOT atomic because a crash
+ * between steps leaves current missing.
+ * Therefore, on Windows this function FAILS CLOSED: if direct renameSync fails over an existing current,
+ * tmpLink is cleaned up and an error is thrown immediately, leaving previous current completely untouched.
+ * Production runtime code contains no supported switch or environment variable that converts atomic
+ * activation into unlink or multi-step replacement.
+ */
+export function atomicActivateSymlink(
+    relativeTarget,
+    currentLink,
+    runtimeDir,
+    prefix = "current",
+    _renameSync = fs.renameSync,
+    options = {}
+) {
+    const tmpLink = path.join(runtimeDir, `${prefix}.${process.pid}.${Date.now()}.tmp`);
+    fs.symlinkSync(relativeTarget, tmpLink, "junction");
+
+    try {
+        _renameSync(tmpLink, currentLink);
+    } catch (err) {
+        try { fs.unlinkSync(tmpLink); } catch {}
+
+        // Test-only hook: if a test explicitly injects a custom replacement function, invoke it
+        if (typeof options._testReplaceFn === "function") {
+            options._testReplaceFn(relativeTarget, currentLink);
+            return;
+        }
+
+        if (process.platform === "win32") {
+            throw new Error(`Atomic symlink replacement is unsupported on Windows; previous current preserved untouched: ${err.message}`);
+        }
+
+        throw new Error(`Failed to atomically switch current symlink: ${err.message}`);
+    }
+}
+
+/**
  * Creates an immutable versioned runtime release under runtimeDir/releases/<releaseId>,
  * and atomically points runtimeDir/current to it.
  */
@@ -418,15 +464,8 @@ export function createRuntimeRelease({
 
     // 9. Atomically activate current symlink
     const currentSymlink = path.join(runtimeDir, "current");
-    const tmpSymlink = path.join(runtimeDir, `current.${id}.tmp`);
     const relativeTarget = path.join("releases", id);
-    try {
-        fs.symlinkSync(relativeTarget, tmpSymlink, "junction");
-        fs.renameSync(tmpSymlink, currentSymlink);
-    } catch {
-        try { fs.unlinkSync(currentSymlink); } catch {}
-        fs.symlinkSync(relativeTarget, currentSymlink, "junction");
-    }
+    atomicActivateSymlink(relativeTarget, currentSymlink, runtimeDir, `current.${id}`);
 
     return { releaseId: id, releaseDir, manifest };
 }
@@ -950,7 +989,13 @@ export function pruneRuntimeReleases({ runtimeDir = "/var/cordbrief/runtime", lo
  * Safely activates previous or specified validated release under runtime/releases.
  * Requires setup lock ownership.
  */
-export function rollbackRuntimeRelease({ runtimeDir = "/var/cordbrief/runtime", targetReleaseId = null, lockContext = null } = {}) {
+export function rollbackRuntimeRelease({
+    runtimeDir = "/var/cordbrief/runtime",
+    targetReleaseId = null,
+    lockContext = null,
+    _renameSync = fs.renameSync,
+    _testReplaceFn = null
+} = {}) {
     verifyLockOwnership({ runtimeDir, lockContext });
 
     const plan = evaluateRetentionPlan({ runtimeDir });
@@ -990,16 +1035,8 @@ export function rollbackRuntimeRelease({ runtimeDir = "/var/cordbrief/runtime", 
 
     // Atomic symlink switch
     const currentLink = path.join(runtimeDir, "current");
-    const tmpLink = path.join(runtimeDir, `current.rollback.${process.pid}.${Date.now()}.tmp`);
     const relativeTarget = path.join("releases", targetId);
-
-    try {
-        fs.symlinkSync(relativeTarget, tmpLink, "junction");
-        fs.renameSync(tmpLink, currentLink);
-    } catch {
-        try { fs.unlinkSync(currentLink); } catch {}
-        fs.symlinkSync(relativeTarget, currentLink, "junction");
-    }
+    atomicActivateSymlink(relativeTarget, currentLink, runtimeDir, "current.rollback", _renameSync, { _testReplaceFn });
 
     // Validate new active current
     const postVal = validateReleaseDirectory(path.join(runtimeDir, "current"));

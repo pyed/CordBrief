@@ -194,3 +194,84 @@ func TestCollectorCommand_WriteAndReadAck(t *testing.T) {
 		t.Fatalf("unexpected ack contents: %+v", ack)
 	}
 }
+
+func TestCollectorCommandDurability(t *testing.T) {
+	tmpDir := t.TempDir()
+
+	// 1. Concurrent race: multiple goroutines attempt to write commands simultaneously
+	const numWriters = 10
+	startGate := make(chan struct{})
+	type writeResult struct {
+		id  string
+		err error
+	}
+	results := make(chan writeResult, numWriters)
+
+	for i := 0; i < numWriters; i++ {
+		reqID := strings.Repeat("x", 8) + string(rune('a'+i))
+		go func(id string) {
+			<-startGate
+			cmd := CollectorCommand{
+				Version:     1,
+				Command:     "enter_reauth",
+				RequestID:   id,
+				RequestedAt: time.Now().UTC(),
+			}
+			err := WriteCollectorCommand(tmpDir, cmd)
+			results <- writeResult{id: id, err: err}
+		}(reqID)
+	}
+
+	close(startGate)
+
+	successCount := 0
+	pendingCount := 0
+	for i := 0; i < numWriters; i++ {
+		res := <-results
+		if res.err == nil {
+			successCount++
+		} else if errors.Is(res.err, ErrCommandPending) {
+			pendingCount++
+		} else {
+			t.Errorf("unexpected write error: %v", res.err)
+		}
+	}
+
+	if successCount != 1 {
+		t.Fatalf("expected exactly 1 successful command writer, got %d", successCount)
+	}
+	if pendingCount != numWriters-1 {
+		t.Fatalf("expected %d ErrCommandPending, got %d", numWriters-1, pendingCount)
+	}
+
+	// 2. Verify surviving command file is valid and readable
+	cmdPath := filepath.Join(tmpDir, DefaultCommandFilename)
+	data, err := os.ReadFile(cmdPath)
+	if err != nil {
+		t.Fatalf("failed reading target command file: %v", err)
+	}
+	if len(data) == 0 || data[0] != '{' {
+		t.Fatalf("corrupted or empty command file: %s", string(data))
+	}
+
+	// 3. Subsequent write while command file exists still returns ErrCommandPending
+	err = WriteCollectorCommand(tmpDir, CollectorCommand{
+		Version:     1,
+		Command:     "return_normal",
+		RequestID:   "req-later",
+		RequestedAt: time.Now().UTC(),
+	})
+	if !errors.Is(err, ErrCommandPending) {
+		t.Fatalf("expected ErrCommandPending, got: %v", err)
+	}
+}
+
+func TestSmallCleanups(t *testing.T) {
+	// Verify ReadCollectorCommandAck safely joins filepath and handles nonexistent directory cleanly
+	tmpDir := t.TempDir()
+	ack, err := ReadCollectorCommandAck(filepath.Join(tmpDir, "nonexistent_sub"))
+	if err == nil || ack != nil {
+		t.Fatalf("expected error on missing ack file, got ack=%v, err=%v", ack, err)
+	}
+}
+

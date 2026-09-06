@@ -443,7 +443,14 @@ async function runTests() {
         setSymlink(tmp, "releases/20260906020000");
         const lockContext = setupMockLock(tmp, "setup");
 
-        const rollbackRes = rollbackRuntimeRelease({ runtimeDir: tmp, lockContext });
+        const rollbackRes = rollbackRuntimeRelease({
+            runtimeDir: tmp,
+            lockContext,
+            _testReplaceFn: process.platform === "win32" ? (rel, cur) => {
+                try { fs.unlinkSync(cur); } catch {}
+                fs.symlinkSync(rel, cur, "junction");
+            } : null
+        });
         assert.strictEqual(rollbackRes.success, true);
         assert.strictEqual(rollbackRes.activeReleaseId, "20260906010000");
         assert.strictEqual(rollbackRes.previousReleaseId, "20260906020000");
@@ -484,6 +491,63 @@ async function runTests() {
         }, /does not exist in releases/);
 
         console.log("  ✔ Test Q passed.");
+    }
+
+    // Test R: Failure during atomic symlink switch leaves previous current intact
+    {
+        console.log("[Test R] Failure during atomic symlink switch leaves previous current intact...");
+        const tmp = makeTempDir();
+        const releasesDir = path.join(tmp, "releases");
+        fs.mkdirSync(releasesDir, { recursive: true });
+        createMockRelease(releasesDir, "20260906010000");
+        createMockRelease(releasesDir, "20260906020000");
+        setSymlink(tmp, "releases/20260906020000");
+        const lockContext = setupMockLock(tmp, "setup");
+
+        assert.throws(() => {
+            rollbackRuntimeRelease({
+                runtimeDir: tmp,
+                targetReleaseId: "20260906010000",
+                lockContext,
+                _renameSync: () => {
+                    throw new Error("EPERM: simulated permission denied");
+                }
+            });
+        }, /Failed to atomically switch current symlink|Atomic symlink replacement is unsupported on Windows/);
+
+        const currentLink = path.join(tmp, "current");
+        assert(fs.existsSync(currentLink), "current symlink must remain existing");
+        const target = fs.readlinkSync(currentLink);
+        assert(target.includes("20260906020000"), "current symlink must still point to original release");
+
+        console.log("  ✔ Test R passed.");
+    }
+
+    // Test S: On Windows, replacing without explicit test hook fails closed leaving previous current untouched
+    if (process.platform === "win32") {
+        console.log("[Test S] Windows fails closed when atomic replace unsupported, leaving current untouched...");
+        const tmp = makeTempDir();
+        const releasesDir = path.join(tmp, "releases");
+        fs.mkdirSync(releasesDir, { recursive: true });
+        createMockRelease(releasesDir, "20260906010000");
+        createMockRelease(releasesDir, "20260906020000");
+        setSymlink(tmp, "releases/20260906020000");
+        const lockContext = setupMockLock(tmp, "setup");
+
+        assert.throws(() => {
+            rollbackRuntimeRelease({
+                runtimeDir: tmp,
+                targetReleaseId: "20260906010000",
+                lockContext
+            });
+        }, /Atomic symlink replacement is unsupported on Windows/);
+
+        const currentLink = path.join(tmp, "current");
+        assert(fs.existsSync(currentLink), "current symlink must remain existing");
+        const target = fs.readlinkSync(currentLink);
+        assert(target.includes("20260906020000"), "current symlink must still point to original release");
+
+        console.log("  ✔ Test S passed.");
     }
 
     // Test Lock Context: Collector or unauthorized caller cannot prune

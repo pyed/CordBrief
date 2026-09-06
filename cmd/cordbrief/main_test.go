@@ -12,7 +12,9 @@ import (
 
 	"cordbrief/internal/config"
 	"cordbrief/internal/discord"
+	"cordbrief/internal/journal"
 	"cordbrief/internal/llm"
+	"time"
 )
 
 func TestCLI_Version(t *testing.T) {
@@ -511,6 +513,87 @@ func TestDigestDeliveryTriggerPolicy(t *testing.T) {
 	if !strings.Contains(stdout.String(), "[PASS] Delivered to Telegram") {
 		t.Errorf("expected '[PASS] Delivered to Telegram' in stdout, got: %s", stdout.String())
 	}
+}
+
+func TestWebRequestLimitsAndTimeouts(t *testing.T) {
+	srv := NewHTTPServer("127.0.0.1:28741", http.NotFoundHandler())
+	if srv.ReadHeaderTimeout != 10*time.Second {
+		t.Errorf("expected ReadHeaderTimeout 10s, got %v", srv.ReadHeaderTimeout)
+	}
+	if srv.ReadTimeout != 30*time.Second {
+		t.Errorf("expected ReadTimeout 30s, got %v", srv.ReadTimeout)
+	}
+	if srv.WriteTimeout < 240*time.Second {
+		t.Errorf("expected WriteTimeout >= 240s, got %v", srv.WriteTimeout)
+	}
+	if srv.WriteTimeout <= MaxProviderTimeout {
+		t.Errorf("expected WriteTimeout (%v) to exceed MaxProviderTimeout (%v)", srv.WriteTimeout, MaxProviderTimeout)
+	}
+	if srv.WriteTimeout != DefaultHTTPServerWriteTimeout {
+		t.Errorf("expected WriteTimeout %v, got %v", DefaultHTTPServerWriteTimeout, srv.WriteTimeout)
+	}
+	if srv.IdleTimeout != 120*time.Second {
+		t.Errorf("expected IdleTimeout 120s, got %v", srv.IdleTimeout)
+	}
+	if srv.MaxHeaderBytes != 1<<20 {
+		t.Errorf("expected MaxHeaderBytes 1MB, got %d", srv.MaxHeaderBytes)
+	}
+}
+
+func TestCommitLock(t *testing.T) {
+	tmpDir := t.TempDir()
+	exchangeDir := filepath.Join(tmpDir, "exchange")
+	dataDir := filepath.Join(tmpDir, "data")
+	eventsDir := filepath.Join(exchangeDir, "events")
+	_ = os.MkdirAll(eventsDir, 0755)
+	_ = os.MkdirAll(dataDir, 0755)
+
+	// 1. Basic acquire & conflict on dataDir
+	l1, err := journal.AcquireCommitLock(dataDir)
+	if err != nil {
+		t.Fatalf("failed acquiring commit lock: %v", err)
+	}
+
+	_, err2 := journal.AcquireCommitLock(dataDir)
+	if err2 == nil {
+		t.Fatal("expected ErrCommitLockActive on second acquire, got nil")
+	}
+
+	// 2. While lock is held, digest preview still succeeds (does not require commit lock)
+	fake := llm.NewFakeLLMServer()
+	defer fake.Close()
+	fake.ResponseContent = `{"title":"Test Digest","summary":"Summary","items":[]}`
+
+	t.Setenv(config.EnvGeminiKey, "mock-key")
+	t.Setenv("CORDBRIEF_LLM_PROVIDER", "gemini")
+	t.Setenv("CORDBRIEF_LLM_BASE_URL", fake.URL)
+	t.Setenv("CORDBRIEF_LLM_MODEL", "gemini-3.7-flash")
+
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"digest", "preview", "-config=", "-exchange-dir=" + exchangeDir, "-data-dir=" + dataDir}, &stdout, &stderr)
+	if code != 0 {
+		t.Fatalf("expected preview to succeed while commit lock is held, got code %d: %s", code, stderr.String())
+	}
+
+	// 3. While lock is held, digest run fails with lock error
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"digest", "run", "-config=", "-exchange-dir=" + exchangeDir, "-data-dir=" + dataDir}, &stdout, &stderr)
+	if code != 1 {
+		t.Fatalf("expected run to fail when commit lock held, got %d", code)
+	}
+	if !strings.Contains(stderr.String(), "cannot run digest: cannot acquire commit lock") {
+		t.Errorf("expected commit lock held error, got: %s", stderr.String())
+	}
+
+	// 4. Release lock -> subsequent acquire succeeds
+	l1.Release()
+
+	l3, err3 := journal.AcquireCommitLock(dataDir)
+	if err3 != nil {
+		t.Fatalf("expected acquire after release to succeed, got %v", err3)
+	}
+	l3.Release()
 }
 
 

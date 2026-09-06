@@ -5,8 +5,9 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"time"
+
+	"cordbrief/internal/durable"
 )
 
 // DefaultPath is the predictable v0.1 state file location.
@@ -44,61 +45,13 @@ func Load(path string) (*State, error) {
 	return &s, nil
 }
 
-// Save persists state using crash-resistant / safe replacement semantics:
-// it writes to a temporary file in the same directory, flushes (Sync), closes,
-// and renames over the destination file.
-// Note: While POSIX renames within the same filesystem are atomic, Go's os.Rename
-// does not guarantee universal atomicity on non-Unix platforms (e.g. Windows NTFS).
+// Save persists state using crash-resistant / safe replacement semantics
+// via durable.AtomicWriteJSON (write temp, sync, close, rename, parent dir sync).
 func Save(path string, s *State) error {
 	if s == nil {
 		return errors.New("state cannot be nil")
 	}
 
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0750); err != nil {
-		return fmt.Errorf("create state directory: %w", err)
-	}
-
-	data, err := json.MarshalIndent(s, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal state: %w", err)
-	}
-	data = append(data, '\n')
-
-	// Create temp file in the same directory to guarantee same filesystem/volume
-	tmp, err := os.CreateTemp(dir, "cordbrief-state-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp state file: %w", err)
-	}
-	tmpName := tmp.Name()
-
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("write state to temp file: %w", err)
-	}
-
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("sync state temp file: %w", err)
-	}
-
-	// Must close file before renaming (especially required on Windows)
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close temp state file: %w", err)
-	}
-
-	// ponytail: os.Rename provides crash-resistant replacement; on Windows NTFS rename replaces existing file
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("safe replacement rename state file: %w", err)
-	}
-
-	cleanup = false
-	return nil
+	return durable.AtomicWriteJSON(path, s, 0640)
 }
+

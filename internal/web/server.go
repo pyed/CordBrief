@@ -26,6 +26,9 @@ import (
 	"cordbrief/internal/scheduler"
 )
 
+// DefaultMaxRequestBodyBytes bounds HTTP mutation request bodies (128 KB) to prevent unbounded memory usage.
+const DefaultMaxRequestBodyBytes = 128 << 10
+
 // ServerOptions configures the Core Web Control Plane.
 type ServerOptions struct {
 	ExchangeDir     string
@@ -81,6 +84,12 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("X-Frame-Options", "DENY")
 	w.Header().Set("Referrer-Policy", "same-origin")
 	w.Header().Set("Content-Security-Policy", "default-src 'self'; style-src 'self' 'unsafe-inline'; script-src 'self' 'unsafe-inline';")
+
+	// Limit request body size for mutation methods to prevent unauthenticated/unbounded memory exhaustion
+	if r.Method == http.MethodPost || r.Method == http.MethodPut || r.Method == http.MethodPatch {
+		r.Body = http.MaxBytesReader(w, r.Body, DefaultMaxRequestBodyBytes)
+	}
+
 	s.mux.ServeHTTP(w, r)
 }
 
@@ -110,28 +119,42 @@ func (s *Server) routes() {
 	s.mux.HandleFunc("/api/digests/", s.handleDigestDeliveryAction)
 }
 
-// validateCSRF enforces Origin / Host check on state-changing requests.
+// validateCSRF enforces Origin / Referer / Fetch metadata checks on state-changing requests.
 func (s *Server) validateCSRF(r *http.Request) bool {
 	if r.Method == http.MethodGet || r.Method == http.MethodHead || r.Method == http.MethodOptions {
 		return true
 	}
-	origin := r.Header.Get("Origin")
-	if origin == "" {
-		referer := r.Header.Get("Referer")
-		if referer == "" {
-			return true // Local CLI or script access allowed
-		}
-		u, err := url.Parse(referer)
-		if err != nil {
+
+	// 1. Check Sec-Fetch-Site (modern browsers send this on cross-origin requests)
+	if strings.EqualFold(strings.TrimSpace(r.Header.Get("Sec-Fetch-Site")), "cross-site") {
+		return false
+	}
+
+	origin := strings.TrimSpace(r.Header.Get("Origin"))
+	// Reject explicit null origin (sandboxed iframes, file://, or privacy proxies)
+	if origin == "null" {
+		return false
+	}
+
+	if origin != "" {
+		u, err := url.Parse(origin)
+		if err != nil || u.Host == "" {
 			return false
 		}
 		return strings.EqualFold(u.Host, r.Host)
 	}
-	u, err := url.Parse(origin)
-	if err != nil {
-		return false
+
+	referer := strings.TrimSpace(r.Header.Get("Referer"))
+	if referer != "" {
+		u, err := url.Parse(referer)
+		if err != nil || u.Host == "" {
+			return false
+		}
+		return strings.EqualFold(u.Host, r.Host)
 	}
-	return strings.EqualFold(u.Host, r.Host)
+
+	// Absent Origin and Referer: allowed for local CLI / script access
+	return true
 }
 
 func (s *Server) getCorePort() int {
@@ -366,18 +389,12 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// 4. Cursor and backlog
-	var curOffset int64
 	ackPath := filepath.Join(s.exchangeDir, "core-ack.json")
-	if cur, err := journal.LoadCursor(ackPath); err == nil {
-		curOffset = cur.Offset
-	}
+	cur, _ := journal.LoadCursor(ackPath)
 	eventsDir := filepath.Join(s.exchangeDir, "events")
-	seg1Path := filepath.Join(eventsDir, "0000000000000001.ndjson")
-	if info, err := os.Stat(seg1Path); err == nil {
-		if info.Size() >= curOffset {
-			vm.BacklogCount = info.Size() - curOffset
-		}
-	}
+	wm, _ := journal.CaptureWatermark(eventsDir)
+	unconsumed, _ := journal.CalculateBacklog(cur, wm)
+	vm.BacklogCount = unconsumed
 
 	// 5. Last Digest
 	digestsDir := filepath.Join(s.dataDir, "digests")
@@ -636,15 +653,14 @@ func (s *Server) handleSystemPage(w http.ResponseWriter, r *http.Request) {
 		vm.CommittedCursor = *cur
 	}
 	eventsDir := filepath.Join(s.exchangeDir, "events")
-	seg1Path := filepath.Join(eventsDir, "0000000000000001.ndjson")
-	if info, err := os.Stat(seg1Path); err == nil {
-		vm.JournalSizeBytes = info.Size()
-		if vm.ActiveSegment == 0 {
-			vm.ActiveSegment = 1
-		}
-	}
-	if vm.JournalSizeBytes >= vm.CommittedCursor.Offset {
-		vm.UnconsumedBytes = vm.JournalSizeBytes - vm.CommittedCursor.Offset
+	wm, _ := journal.CaptureWatermark(eventsDir)
+	unconsumed, total := journal.CalculateBacklog(&vm.CommittedCursor, wm)
+	vm.JournalSizeBytes = total
+	vm.UnconsumedBytes = unconsumed
+	if wm != nil && wm.MaxSegment > 0 {
+		vm.ActiveSegment = int(wm.MaxSegment)
+	} else if vm.ActiveSegment == 0 {
+		vm.ActiveSegment = 1
 	}
 
 	// 4. Scheduler state
@@ -679,7 +695,12 @@ func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := r.ParseForm(); err != nil {
+	if err := parseForm(r); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Redirect(w, r, "/schedule?error=Failed+parsing+form", http.StatusSeeOther)
 		return
 	}
@@ -827,7 +848,7 @@ func (s *Server) handleDigestDetail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	batchID := strings.TrimPrefix(r.URL.Path, "/digests/")
-	if batchID == "" || strings.Contains(batchID, "/") {
+	if !digest.IsValidBatchID(batchID) {
 		http.NotFound(w, r)
 		return
 	}
@@ -954,7 +975,12 @@ func (s *Server) handleWatchlist(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := r.ParseForm(); err != nil {
+	if err := parseForm(r); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Redirect(w, r, "/channels?error=Failed+parsing+form", http.StatusSeeOther)
 		return
 	}
@@ -1011,7 +1037,12 @@ func (s *Server) handleLLMSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := r.ParseForm(); err != nil {
+	if err := parseForm(r); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Redirect(w, r, "/provider?error=Failed+parsing+form", http.StatusSeeOther)
 		return
 	}
@@ -1071,8 +1102,13 @@ func (s *Server) handleLLMTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	_ = r.ParseMultipartForm(32 << 20)
-	_ = r.ParseForm()
+	if err := parseForm(r); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+	}
 
 	providerType := strings.ToLower(strings.TrimSpace(r.FormValue("provider")))
 	if providerType == "" {
@@ -1139,7 +1175,12 @@ func (s *Server) handleDigestSettings(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := r.ParseForm(); err != nil {
+	if err := parseForm(r); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
 		http.Redirect(w, r, "/provider?error=Failed+parsing+form", http.StatusSeeOther)
 		return
 	}
@@ -1250,6 +1291,16 @@ func (s *Server) handleCollectorCommand(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
+	if err := parseForm(r); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Error(w, "Failed parsing form", http.StatusBadRequest)
+		return
+	}
+
 	command := strings.TrimSpace(r.FormValue("command"))
 	validCommands := map[string]bool{
 		"enter_reauth":  true,
@@ -1284,12 +1335,11 @@ func (s *Server) handleCollectorCommand(w http.ResponseWriter, r *http.Request) 
 	http.Redirect(w, r, "/system?flash="+url.QueryEscape(msg), http.StatusSeeOther)
 }
 
-func parseForm(r *http.Request) {
+func parseForm(r *http.Request) error {
 	if strings.HasPrefix(r.Header.Get("Content-Type"), "multipart/form-data") {
-		_ = r.ParseMultipartForm(10 << 20)
-	} else {
-		_ = r.ParseForm()
+		return r.ParseMultipartForm(DefaultMaxRequestBodyBytes)
 	}
+	return r.ParseForm()
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
@@ -1308,7 +1358,15 @@ func (s *Server) handleTelegramSettings(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	parseForm(r)
+	if err := parseForm(r); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+		http.Redirect(w, r, "/telegram?error=Failed+parsing+form", http.StatusSeeOther)
+		return
+	}
 
 	enabled := (r.FormValue("enabled") == "true" || r.FormValue("enabled") == "on")
 	token := strings.TrimSpace(r.FormValue("token"))
@@ -1376,7 +1434,13 @@ func (s *Server) handleTelegramTest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	parseForm(r)
+	if err := parseForm(r); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+	}
 	token := strings.TrimSpace(r.FormValue("token"))
 
 	if s.deliveryService == nil {
@@ -1435,7 +1499,13 @@ func (s *Server) handleTelegramChats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	parseForm(r)
+	if err := parseForm(r); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+	}
 	token := strings.TrimSpace(r.FormValue("token"))
 
 	if s.deliveryService == nil {
@@ -1486,7 +1556,13 @@ func (s *Server) handleTelegramSendTest(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	parseForm(r)
+	if err := parseForm(r); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+	}
 	chatID := strings.TrimSpace(r.FormValue("chat_id"))
 	if chatID == "" {
 		chatID = s.store.GetDeliveryConfig().Telegram.ChatID
@@ -1539,8 +1615,18 @@ func (s *Server) handleDigestDeliveryAction(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	batchID := parts[3]
+	if !digest.IsValidBatchID(batchID) {
+		http.Error(w, "Invalid batch ID", http.StatusBadRequest)
+		return
+	}
 
-	parseForm(r)
+	if err := parseForm(r); err != nil {
+		var maxBytesErr *http.MaxBytesError
+		if errors.As(err, &maxBytesErr) {
+			http.Error(w, "Request body too large", http.StatusRequestEntityTooLarge)
+			return
+		}
+	}
 	force := (r.FormValue("force") == "true" || r.FormValue("force") == "1")
 
 	if s.deliveryService == nil {

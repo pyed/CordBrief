@@ -97,6 +97,41 @@ func CaptureWatermark(eventsDir string) (*Watermark, error) {
 	}, nil
 }
 
+// CalculateBacklog computes unconsumed bytes from cursor across all segments up to watermark,
+// and the total byte size of all segments in watermark.
+// If watermark is nil, or if cursor is invalid/nil, it returns safe non-negative values.
+func CalculateBacklog(cur *Cursor, wm *Watermark) (unconsumedBytes int64, totalBytes int64) {
+	if wm == nil {
+		return 0, 0
+	}
+
+	for _, seg := range wm.Segments {
+		size := wm.SegmentSizes[seg]
+		if size <= 0 {
+			continue
+		}
+		totalBytes += size
+
+		if cur == nil {
+			unconsumedBytes += size
+			continue
+		}
+
+		if seg < cur.Segment {
+			// Fully consumed segment
+			continue
+		} else if seg == cur.Segment {
+			if cur.Offset < size {
+				unconsumedBytes += (size - cur.Offset)
+			}
+		} else { // seg > cur.Segment
+			unconsumedBytes += size
+		}
+	}
+
+	return unconsumedBytes, totalBytes
+}
+
 // Record bundles a parsed Event with its exact segment and byte-offset boundaries.
 type Record struct {
 	Event      Event
@@ -225,7 +260,9 @@ func readSegmentUpTo(f *os.File, segment uint64, startOffset, maxBytes int64, li
 
 		var event Event
 		dec := json.NewDecoder(bytes.NewReader(trimmed))
-		dec.DisallowUnknownFields()
+		// ADDITIVE policy: unknown fields within supported schema version (v1) are accepted
+		// to allow forward-compatible additive evolution by collector plugins.
+		// Incompatible schema changes MUST bump event.Version, which is rejected fail-closed below.
 		if err := dec.Decode(&event); err != nil {
 			return records, recordStart, fmt.Errorf("corrupted journal record at segment %d, offset %d: %w", segment, recordStart, err)
 		}

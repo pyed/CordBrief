@@ -114,8 +114,8 @@ func (s *Service) GetDelivery(batchID string) (*DeliveryRecord, error) {
 // Enqueue adds a batch to the delivery queue.
 func (s *Service) Enqueue(batchID string) error {
 	trimmed := strings.TrimSpace(batchID)
-	if trimmed == "" {
-		return errors.New("batch_id cannot be empty")
+	if err := digest.ValidateBatchID(trimmed); err != nil {
+		return fmt.Errorf("invalid batch_id: %w", err)
 	}
 
 	// Create or ensure initial pending delivery record
@@ -182,8 +182,8 @@ func (s *Service) DeliverBatch(ctx context.Context, batchID string, force bool) 
 	defer s.mu.Unlock()
 
 	trimmedID := strings.TrimSpace(batchID)
-	if trimmedID == "" {
-		return nil, errors.New("batch_id is required")
+	if err := digest.ValidateBatchID(trimmedID); err != nil {
+		return nil, fmt.Errorf("invalid batch_id: %w", err)
 	}
 
 	rec, err := LoadDeliveryRecord(s.dataDir, trimmedID)

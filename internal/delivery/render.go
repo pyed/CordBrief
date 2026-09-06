@@ -80,7 +80,7 @@ func RenderTelegramHTML(d *digest.Digest, sourceMap map[string]digest.SourceMess
 	// Blocks 1..N: Individual insight items
 	for _, item := range d.Items {
 		var itemSB strings.Builder
-		kindLabel := strings.Title(strings.ToLower(strings.TrimSpace(item.Kind)))
+		kindLabel := titleCase(item.Kind)
 		escapedText := html.EscapeString(strings.TrimSpace(item.Text))
 		itemSB.WriteString(fmt.Sprintf("• <b>[%s]</b> %s", kindLabel, escapedText))
 
@@ -246,3 +246,17 @@ func splitLargeBlock(block string, maxRunes int) []string {
 
 	return parts
 }
+
+// titleCase capitalizes the first ASCII letter of s while lowercase-ing the rest.
+func titleCase(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	r := []rune(strings.ToLower(s))
+	if len(r) > 0 && r[0] >= 'a' && r[0] <= 'z' {
+		r[0] = r[0] - 'a' + 'A'
+	}
+	return string(r)
+}
+

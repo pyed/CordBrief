@@ -341,7 +341,7 @@ func TestTelegramRenderingAndChunking(t *testing.T) {
 // G6: Durable Delivery State & Multipart Resume
 func TestDurableDeliveryState(t *testing.T) {
 	dir := t.TempDir()
-	batchID := "abc123def456"
+	batchID := strings.Repeat("d", 64)
 
 	rec := &DeliveryRecord{
 		DigestBatchID:      batchID,
@@ -646,5 +646,49 @@ func TestSourceDisplayMapping(t *testing.T) {
 	}
 	if d.Items[1].SourceIDs[0] != "S000002" || d.Items[1].SourceIDs[1] != "S000003" {
 		t.Errorf("item 1 source IDs mutated: %+v", d.Items[1].SourceIDs)
+	}
+}
+
+func TestBatchIDValidation(t *testing.T) {
+	tmpDir := t.TempDir()
+	invalidIDs := []string{
+		"invalid-batch",
+		"../../etc/passwd",
+		"0123456789abcdef",
+		strings.Repeat("A", 64),
+	}
+	for _, id := range invalidIDs {
+		if _, err := DeliveryRecordPath(tmpDir, id); err == nil {
+			t.Errorf("expected DeliveryRecordPath to reject %q, got nil", id)
+		}
+	}
+	validID := strings.Repeat("a", 64)
+	if path, err := DeliveryRecordPath(tmpDir, validID); err != nil || path == "" {
+		t.Errorf("expected DeliveryRecordPath to accept valid id, got err: %v", err)
+	}
+}
+
+func TestSmallCleanups(t *testing.T) {
+	// 1. titleCase replaces deprecated strings.Title
+	if tc := titleCase("finding"); tc != "Finding" {
+		t.Errorf("expected Finding, got %s", tc)
+	}
+	if tc := titleCase("ACTION_ITEM"); tc != "Action_item" {
+		t.Errorf("expected Action_item, got %s", tc)
+	}
+	if tc := titleCase(""); tc != "" {
+		t.Errorf("expected empty string, got %s", tc)
+	}
+
+	// 2. DeliveryRecordPath uses filepath.Join and canonical path structure
+	tmpDir := t.TempDir()
+	validID := strings.Repeat("b", 64)
+	p, err := DeliveryRecordPath(tmpDir, validID)
+	if err != nil {
+		t.Fatalf("DeliveryRecordPath failed: %v", err)
+	}
+	expected := filepath.Join(tmpDir, "deliveries", validID, "telegram.json")
+	if p != expected {
+		t.Errorf("expected path %q, got %q", expected, p)
 	}
 }

@@ -85,6 +85,9 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	case "serve":
 		return runServe(subArgs, stdout, stderr)
 
+	case "lock-probe":
+		return runLockProbe(subArgs, stdout, stderr)
+
 	case "help", "-help", "--help", "-h":
 		printUsage(stdout)
 		return 0
@@ -370,6 +373,7 @@ func runExchange(args []string, stdout, stderr io.Writer) int {
 		fs := flag.NewFlagSet("exchange ingest", flag.ContinueOnError)
 		fs.SetOutput(stderr)
 		dirFlag := fs.String("exchange-dir", "", "path to exchange directory")
+		dataDirFlag := fs.String("data-dir", "", "path to data directory")
 		limitFlag := fs.Int("limit", 100, "maximum events to read in batch")
 		commitFlag := fs.Bool("commit", false, "commit advanced cursor to core-ack.json after reading")
 		if err := fs.Parse(subArgs); err != nil {
@@ -377,6 +381,7 @@ func runExchange(args []string, stdout, stderr io.Writer) int {
 		}
 
 		exchangeDir := getExchangeDir(*dirFlag)
+		actualDataDir := getDataDir(*dataDirFlag)
 		ackPath := filepath.Join(exchangeDir, journal.DefaultAckFilename)
 		eventsDir := filepath.Join(exchangeDir, "events")
 
@@ -409,6 +414,13 @@ func runExchange(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "Cursor After:  segment=%d, offset=%d\n", nextCur.Segment, nextCur.Offset)
 
 		if *commitFlag {
+			commitLock, lockErr := journal.AcquireCommitLock(actualDataDir)
+			if lockErr != nil {
+				fmt.Fprintf(stderr, "cannot commit cursor: %v\n", lockErr)
+				return 1
+			}
+			defer commitLock.Release()
+
 			if err := journal.SaveCursor(ackPath, &nextCur); err != nil {
 				fmt.Fprintf(stderr, "error committing cursor: %v\n", err)
 				return 1
@@ -569,6 +581,15 @@ func runDigest(args []string, stdout, stderr io.Writer) int {
 
 	// 3. Execute transaction
 	commit := (sub == "run")
+	if commit {
+		commitLock, lockErr := journal.AcquireCommitLock(getDataDir(*dataDir))
+		if lockErr != nil {
+			fmt.Fprintf(stderr, "cannot run digest: %v\n", lockErr)
+			return 1
+		}
+		defer commitLock.Release()
+	}
+
 	opts := digest.TransactionOptions{
 		ExchangeDir:  getExchangeDir(*exchangeDir),
 		DataDir:      getDataDir(*dataDir),
@@ -697,6 +718,15 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 	actualDataDir := getDataDir(*dataDir)
 	actualExchangeDir := getExchangeDir(*exchangeDir)
 
+	// Acquire cross-process commit lock so standalone CLI commands cannot race with serve daemon.
+	// Acquired before initializing store, workers, or scheduler to guarantee fail-closed behavior on lock contention.
+	commitLock, lockErr := journal.AcquireCommitLock(actualDataDir)
+	if lockErr != nil {
+		fmt.Fprintf(stderr, "cannot start serve: %v\n", lockErr)
+		return 1
+	}
+	defer commitLock.Release()
+
 	store, err := config.NewStore(actualDataDir, *cfgPath)
 	if err != nil {
 		fmt.Fprintf(stderr, "error initializing config store: %v\n", err)
@@ -758,12 +788,7 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "Exchange directory: %s\n", actualExchangeDir)
 	fmt.Fprintf(stdout, "Data directory:     %s\n", actualDataDir)
 
-	httpServer := &http.Server{
-		Addr:         listenAddr,
-		Handler:      server,
-		ReadTimeout:  30 * time.Second,
-		WriteTimeout: 60 * time.Second,
-	}
+	httpServer := NewHTTPServer(listenAddr, server)
 
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, os.Interrupt, syscall.SIGTERM)
@@ -782,3 +807,65 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 	}
 	return 0
 }
+
+// MaxProviderTimeout is the maximum legitimate provider execution timeout in CordBrief (180s for local LLM).
+const MaxProviderTimeout = time.Duration(config.DefaultLocalTimeout) * time.Second
+
+// HTTPServerWriteMargin is the safety margin added to MaxProviderTimeout to ensure
+// synchronous web requests handling LLM triggers are not severed prematurely.
+const HTTPServerWriteMargin = 60 * time.Second
+
+// DefaultHTTPServerWriteTimeout is the derived WriteTimeout: 180s + 60s = 240s.
+const DefaultHTTPServerWriteTimeout = MaxProviderTimeout + HTTPServerWriteMargin
+
+func init() {
+	if DefaultHTTPServerWriteTimeout < MaxProviderTimeout+HTTPServerWriteMargin || DefaultHTTPServerWriteTimeout < 240*time.Second {
+		panic("DefaultHTTPServerWriteTimeout must be at least 240s and exceed MaxProviderTimeout")
+	}
+}
+
+// NewHTTPServer constructs an http.Server configured with bounded timeouts and header limits.
+// WriteTimeout is explicitly derived from MaxProviderTimeout + HTTPServerWriteMargin (240s)
+// to prevent premature HTTP connection drops during legitimate synchronous LLM operations.
+func NewHTTPServer(addr string, handler http.Handler) *http.Server {
+	return &http.Server{
+		Addr:              addr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      DefaultHTTPServerWriteTimeout,
+		IdleTimeout:       120 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1MB
+	}
+}
+
+func runLockProbe(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("lock-probe", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dataDir := fs.String("data-dir", "", "path to data directory")
+	holdSeconds := fs.Int("hold", 0, "seconds to hold lock before releasing (0 = probe and release)")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	actualDataDir := getDataDir(*dataDir)
+	lock, err := journal.AcquireCommitLock(actualDataDir)
+	if err != nil {
+		fmt.Fprintf(stderr, "lock-probe: acquisition refused: %v\n", err)
+		return 1
+	}
+	defer lock.Release()
+
+	if *holdSeconds > 0 {
+		fmt.Fprintf(stdout, "lock-probe: acquired, holding for %ds\n", *holdSeconds)
+		time.Sleep(time.Duration(*holdSeconds) * time.Second)
+		fmt.Fprintln(stdout, "lock-probe: released")
+	} else {
+		fmt.Fprintln(stdout, "lock-probe: acquired successfully")
+	}
+	return 0
+}
+
+
+

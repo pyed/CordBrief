@@ -179,6 +179,12 @@ Each line in a segment file contains exactly one newline-terminated JSON object:
 - **No URL Generation**: Raw jump URLs are omitted. Core constructs jump links deterministically from `guild_id`, `channel_id`, and `message_id`.
 - **No Payload Downloads**: Attachments record metadata only (`id`, `filename`, `content_type`, `size`). Payloads are not downloaded.
 
+### Schema Evolution Policy (v1)
+
+- **Additive Forward Compatibility**: Schema v1 explicitly permits unknown additive fields. Readers (`internal/journal/reader.go`) ignore unmapped JSON properties without failing or corrupting batch ingestion.
+- **Fail-Closed Version Gate**: The `version` field specifies the wire protocol. Any record with an unknown or unsupported schema version (`version != 1`) fails closed immediately, halting ingestion to prevent silent data corruption or invalid state advancement.
+- **Breaking Changes**: Any breaking field alteration, field deletion, or semantic change requires incrementing the schema version (`version: 2`) and updating all consumers simultaneously.
+
 ---
 
 ## 6. Core Checkpoint & Watermark Semantics

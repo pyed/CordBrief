@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -329,3 +330,119 @@ func TestReader_WatermarkPartialLineRace(t *testing.T) {
 		t.Fatalf("cursor after batch 2 mismatch: got %d, want %d", curAfterBatch2.Offset, totalExpectedLen)
 	}
 }
+
+func TestCalculateBacklog(t *testing.T) {
+	// Case A: cursor in segment 1, active segment 1
+	wmA := &Watermark{
+		Segments:     []uint64{1},
+		SegmentSizes: map[uint64]int64{1: 500},
+		MaxSegment:   1,
+	}
+	curA := &Cursor{Version: 1, Segment: 1, Offset: 100}
+	unconsumedA, totalA := CalculateBacklog(curA, wmA)
+	if unconsumedA != 400 || totalA != 500 {
+		t.Errorf("Case A mismatch: got unconsumed=%d, total=%d (want 400, 500)", unconsumedA, totalA)
+	}
+
+	// Case B: cursor in segment 1, active segment 2
+	wmB := &Watermark{
+		Segments:     []uint64{1, 2},
+		SegmentSizes: map[uint64]int64{1: 500, 2: 300},
+		MaxSegment:   2,
+	}
+	curB := &Cursor{Version: 1, Segment: 1, Offset: 100}
+	unconsumedB, totalB := CalculateBacklog(curB, wmB)
+	if unconsumedB != 700 || totalB != 800 {
+		t.Errorf("Case B mismatch: got unconsumed=%d, total=%d (want 700, 800)", unconsumedB, totalB)
+	}
+
+	// Case C: cursor in middle of segment 2, active segment 3
+	hmC := &Watermark{
+		Segments:     []uint64{1, 2, 3},
+		SegmentSizes: map[uint64]int64{1: 500, 2: 400, 3: 150},
+		MaxSegment:   3,
+	}
+	curC := &Cursor{Version: 1, Segment: 2, Offset: 200}
+	unconsumedC, totalC := CalculateBacklog(curC, hmC)
+	if unconsumedC != 350 || totalC != 1050 {
+		t.Errorf("Case C mismatch: got unconsumed=%d, total=%d (want 350, 1050)", unconsumedC, totalC)
+	}
+
+	// Case D: zero backlog
+	wmD := &Watermark{
+		Segments:     []uint64{1},
+		SegmentSizes: map[uint64]int64{1: 500},
+		MaxSegment:   1,
+	}
+	curD := &Cursor{Version: 1, Segment: 1, Offset: 500}
+	unconsumedD, totalD := CalculateBacklog(curD, wmD)
+	if unconsumedD != 0 || totalD != 500 {
+		t.Errorf("Case D mismatch: got unconsumed=%d, total=%d (want 0, 500)", unconsumedD, totalD)
+	}
+
+	// Case E: empty closed segment where legal (size 0)
+	wmE := &Watermark{
+		Segments:     []uint64{1},
+		SegmentSizes: map[uint64]int64{1: 0},
+		MaxSegment:   1,
+	}
+	curE := &Cursor{Version: 1, Segment: 1, Offset: 0}
+	unconsumedE, totalE := CalculateBacklog(curE, wmE)
+	if unconsumedE != 0 || totalE != 0 {
+		t.Errorf("Case E mismatch: got unconsumed=%d, total=%d (want 0, 0)", unconsumedE, totalE)
+	}
+
+	// Case F: missing/corrupt journal state fails safely and does not display negative
+	unconsumedF1, totalF1 := CalculateBacklog(nil, nil)
+	if unconsumedF1 < 0 || totalF1 < 0 {
+		t.Errorf("Case F1 mismatch: got negative unconsumed=%d, total=%d", unconsumedF1, totalF1)
+	}
+	curF2 := &Cursor{Version: 1, Segment: 99, Offset: 99999}
+	unconsumedF2, totalF2 := CalculateBacklog(curF2, wmA)
+	if unconsumedF2 < 0 || totalF2 < 0 {
+		t.Errorf("Case F2 mismatch: got negative unconsumed=%d, total=%d", unconsumedF2, totalF2)
+	}
+}
+
+func TestJournalSchemaEvolution(t *testing.T) {
+	tmpDir := t.TempDir()
+	eventsDir := filepath.Join(tmpDir, "events")
+	if err := os.MkdirAll(eventsDir, 0755); err != nil {
+		t.Fatal(err)
+	}
+
+	segPath := filepath.Join(eventsDir, "0000000000000001.ndjson")
+
+	// 1. Event with unknown additive fields (e.g. emitted by newer collector version)
+	additiveEvent := `{"version":1,"event":"message_create","message_id":"msg-additive-1","guild_id":"g1","channel_id":"c1","timestamp":"2026-09-06T12:00:00Z","captured_at":"2026-09-06T12:00:01Z","author":{"id":"a1","username":"user1","bot":false},"content":"hello additive","thread_id":"th-99","custom_meta":{"flag":true}}` + "\n"
+	if err := os.WriteFile(segPath, []byte(additiveEvent), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	wm, err := CaptureWatermark(eventsDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	reader := NewReader(eventsDir, wm)
+	records, _, err := reader.ReadBatch(Cursor{Version: 1, Segment: 1, Offset: 0}, 10)
+	if err != nil {
+		t.Fatalf("expected additive unknown fields to be accepted under ADDITIVE policy, got error: %v", err)
+	}
+	if len(records) != 1 || records[0].Event.MessageID != "msg-additive-1" {
+		t.Fatalf("expected record to parse successfully, got %+v", records)
+	}
+
+	// 2. Event with unsupported schema version (e.g. version 2 breaking change) -> MUST fail fail-closed
+	unsupportedVerEvent := `{"version":2,"event":"message_create","message_id":"msg-ver-2","guild_id":"g1","channel_id":"c1","timestamp":"2026-09-06T12:00:00Z","captured_at":"2026-09-06T12:00:01Z","author":{"id":"a1","username":"user1","bot":false},"content":"breaking"}` + "\n"
+	if err := os.WriteFile(segPath, []byte(unsupportedVerEvent), 0644); err != nil {
+		t.Fatal(err)
+	}
+	wm2, _ := CaptureWatermark(eventsDir)
+	reader2 := NewReader(eventsDir, wm2)
+	_, _, err = reader2.ReadBatch(Cursor{Version: 1, Segment: 1, Offset: 0}, 10)
+	if err == nil || !strings.Contains(err.Error(), "unsupported event version 2") {
+		t.Fatalf("expected error rejecting unsupported schema version 2, got: %v", err)
+	}
+}
+

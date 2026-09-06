@@ -5,9 +5,10 @@ import (
 	"errors"
 	"fmt"
 	"os"
-	"path/filepath"
 	"sort"
 	"strings"
+
+	"cordbrief/internal/durable"
 )
 
 // DefaultWatchlistFilename is the default filename for the channel allowlist.
@@ -33,7 +34,7 @@ func NormalizeChannelIDs(raw []string) []string {
 	return out
 }
 
-// Validate checks that the watchlist meets strict schema v1 constraints.
+// Validate strictly enforces fail-closed invariant: Watchlist must never be empty.
 func (w *Watchlist) Validate() error {
 	if w == nil {
 		return errors.New("watchlist cannot be nil")
@@ -57,61 +58,22 @@ func (w *Watchlist) Validate() error {
 
 // WriteWatchlist writes and validates watchlist.json using safe replacement semantics.
 func WriteWatchlist(path string, w *Watchlist) error {
-	if w == nil {
-		return errors.New("watchlist cannot be nil")
-	}
+	return SaveWatchlist(path, w)
+}
 
-	// Normalize IDs before validation and persistence
+// SaveWatchlist writes watchlist.json using crash-resistant safe replacement
+// via durable.AtomicWriteJSON (write temp, fsync, close, rename, parent dir fsync).
+func SaveWatchlist(path string, w *Watchlist) error {
+	if w == nil {
+		return errors.New("cannot write nil watchlist")
+	}
 	w.ChannelIDs = NormalizeChannelIDs(w.ChannelIDs)
 
 	if err := w.Validate(); err != nil {
 		return fmt.Errorf("cannot write invalid watchlist: %w", err)
 	}
 
-	dir := filepath.Dir(path)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("create watchlist directory: %w", err)
-	}
-
-	data, err := json.MarshalIndent(w, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal watchlist: %w", err)
-	}
-	data = append(data, '\n')
-
-	tmp, err := os.CreateTemp(dir, ".watchlist-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create temp watchlist file: %w", err)
-	}
-	tmpName := tmp.Name()
-
-	cleanup := true
-	defer func() {
-		if cleanup {
-			_ = os.Remove(tmpName)
-		}
-	}()
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("write watchlist temp file: %w", err)
-	}
-
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		return fmt.Errorf("sync watchlist temp file: %w", err)
-	}
-
-	if err := tmp.Close(); err != nil {
-		return fmt.Errorf("close watchlist temp file: %w", err)
-	}
-
-	if err := os.Rename(tmpName, path); err != nil {
-		return fmt.Errorf("safe replacement rename watchlist file: %w", err)
-	}
-
-	cleanup = false
-	return nil
+	return durable.AtomicWriteJSON(path, w, 0644)
 }
 
 // ReadWatchlist reads and strictly validates watchlist.json.

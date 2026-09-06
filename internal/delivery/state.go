@@ -8,6 +8,9 @@ import (
 	"path/filepath"
 	"strings"
 	"time"
+
+	"cordbrief/internal/digest"
+	"cordbrief/internal/durable"
 )
 
 // DeliveryState represents the lifecycle status of a Telegram digest dispatch.
@@ -23,8 +26,7 @@ const (
 	CurrentDeliveryRecordVersion = 1
 )
 
-// DeliveryRecord captures durable state for a Telegram delivery attempt.
-// It stores only safe metadata and never contains bot tokens or raw digest content.
+// DeliveryRecord captures durable state for a Telegram digest delivery.
 type DeliveryRecord struct {
 	Version            int           `json:"version"`
 	DigestBatchID      string        `json:"digest_batch_id"`
@@ -41,17 +43,22 @@ type DeliveryRecord struct {
 }
 
 // DeliveryRecordPath returns the canonical path to a delivery state file.
-func DeliveryRecordPath(dataDir, batchID string) string {
-	return filepath.Join(dataDir, "deliveries", batchID, "telegram.json")
+// Validates that batchID strictly matches 64 lowercase hexadecimal characters.
+func DeliveryRecordPath(dataDir, batchID string) (string, error) {
+	trimmed := strings.TrimSpace(batchID)
+	if err := digest.ValidateBatchID(trimmed); err != nil {
+		return "", fmt.Errorf("invalid delivery record batch_id: %w", err)
+	}
+	return filepath.Join(dataDir, "deliveries", trimmed, "telegram.json"), nil
 }
 
 // LoadDeliveryRecord reads the durable delivery state for a batch ID from disk.
 func LoadDeliveryRecord(dataDir, batchID string) (*DeliveryRecord, error) {
-	if strings.TrimSpace(batchID) == "" {
-		return nil, errors.New("batch_id cannot be empty")
+	p, err := DeliveryRecordPath(dataDir, batchID)
+	if err != nil {
+		return nil, err
 	}
 
-	p := DeliveryRecordPath(dataDir, batchID)
 	data, err := os.ReadFile(p)
 	if err != nil {
 		return nil, err
@@ -64,19 +71,16 @@ func LoadDeliveryRecord(dataDir, batchID string) (*DeliveryRecord, error) {
 	return &rec, nil
 }
 
-// SaveDeliveryRecord writes the delivery record atomically with file sync and rename.
+// SaveDeliveryRecord writes the delivery record atomically with file sync and rename
+// via durable.AtomicWriteJSON.
 func SaveDeliveryRecord(dataDir string, rec *DeliveryRecord) error {
 	if rec == nil {
 		return errors.New("delivery record cannot be nil")
 	}
-	if strings.TrimSpace(rec.DigestBatchID) == "" {
-		return errors.New("delivery record digest_batch_id cannot be empty")
-	}
 
-	targetPath := DeliveryRecordPath(dataDir, rec.DigestBatchID)
-	dir := filepath.Dir(targetPath)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("create delivery directory: %w", err)
+	targetPath, err := DeliveryRecordPath(dataDir, rec.DigestBatchID)
+	if err != nil {
+		return err
 	}
 
 	rec.UpdatedAt = time.Now().UTC()
@@ -87,34 +91,5 @@ func SaveDeliveryRecord(dataDir string, rec *DeliveryRecord) error {
 		rec.Version = CurrentDeliveryRecordVersion
 	}
 
-	data, err := json.MarshalIndent(rec, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal delivery record: %w", err)
-	}
-	data = append(data, '\n')
-
-	tmpPath := fmt.Sprintf("%s.%d.tmp", targetPath, time.Now().UnixNano())
-	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		return fmt.Errorf("create tmp delivery record: %w", err)
-	}
-
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("write tmp delivery record: %w", err)
-	}
-
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("sync tmp delivery record: %w", err)
-	}
-
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("close tmp delivery record: %w", err)
-	}
-
-	return os.Rename(tmpPath, targetPath)
+	return durable.AtomicWriteJSON(targetPath, rec, 0644)
 }

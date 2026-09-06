@@ -118,11 +118,12 @@ func RunTransaction(ctx context.Context, s Summarizer, opts TransactionOptions) 
 			}
 		}
 
+		artPath, _ := ArtifactPath(digestsDir, batch.BatchID)
 		return &TransactionResult{
 			Batch:            batch,
 			Digest:           existingArt.Digest,
 			Artifact:         existingArt,
-			ArtifactPath:     ArtifactPath(digestsDir, batch.BatchID),
+			ArtifactPath:     artPath,
 			CommittedCursor:  &nextCur,
 			WasIdempotentHit: true,
 		}, nil
@@ -175,7 +176,10 @@ func RunTransaction(ctx context.Context, s Summarizer, opts TransactionOptions) 
 	}
 
 	// 9. Verify artifact exists on disk
-	artPath := ArtifactPath(digestsDir, art.BatchID)
+	artPath, err := ArtifactPath(digestsDir, art.BatchID)
+	if err != nil {
+		return nil, fmt.Errorf("resolve artifact path: %w", err)
+	}
 	if _, err := os.Stat(artPath); err != nil {
 		return nil, fmt.Errorf("verify saved artifact on disk: %w", err)
 	}

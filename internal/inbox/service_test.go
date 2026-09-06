@@ -326,3 +326,18 @@ func writeArtifact(t *testing.T, dir string, art *digest.Artifact) {
 		t.Fatal(err)
 	}
 }
+
+func TestBatchIDValidation(t *testing.T) {
+	tmpDir := t.TempDir()
+	invalidIDs := []string{
+		"invalid-id",
+		"../../etc/passwd",
+		"0123456789abcdef",
+		strings.Repeat("A", 64),
+	}
+	for _, id := range invalidIDs {
+		if _, err := GetDigest(tmpDir, id); !errors.Is(err, ErrInvalidBatchID) {
+			t.Errorf("expected ErrInvalidBatchID for %q, got: %v", id, err)
+		}
+	}
+}

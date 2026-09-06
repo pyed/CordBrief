@@ -1746,5 +1746,233 @@ func TestServer_DedicatedSecretStatusAndResolution(t *testing.T) {
 	})
 }
 
+func TestBatchIDValidation(t *testing.T) {
+	srv, _, _ := setupTestEnv(t)
+
+	invalidIDs := []string{
+		"invalid-id",
+		"0123456789abcdef",
+		"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdefg", // non-hex
+		strings.Repeat("A", 64), // uppercase not allowed
+		"etc_passwd",
+	}
+
+	for _, id := range invalidIDs {
+		// GET /digests/<id> -> 404
+		req := httptest.NewRequest(http.MethodGet, "/digests/"+id, nil)
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusNotFound {
+			t.Errorf("GET /digests/%s: expected 404, got %d", id, rec.Code)
+		}
+
+		// POST /api/digests/<id> -> 400 Bad Request
+		postReq := httptest.NewRequest(http.MethodPost, "/api/digests/"+id, nil)
+		postReq.Host = "127.0.0.1:8080"
+		postReq.Header.Set("Origin", "http://127.0.0.1:8080")
+		postRec := httptest.NewRecorder()
+		srv.ServeHTTP(postRec, postReq)
+		if postRec.Code != http.StatusBadRequest {
+			t.Errorf("POST /api/digests/%s: expected 400, got %d", id, postRec.Code)
+		}
+	}
+
+	// Traversal attempt -> blocked (cannot return 200 OK)
+	traversalReq := httptest.NewRequest(http.MethodGet, "/digests/../../etc/passwd", nil)
+	traversalRec := httptest.NewRecorder()
+	srv.ServeHTTP(traversalRec, traversalReq)
+	if traversalRec.Code == http.StatusOK {
+		t.Errorf("expected traversal attempt to be blocked, got 200 OK")
+	}
+
+	// Valid 64-char hex batch ID
+	validID := strings.Repeat("a", 64)
+	req := httptest.NewRequest(http.MethodGet, "/digests/"+validID, nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	// Not found on disk, but passed validation (404, not 400)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("expected 404 for valid nonexistent batch, got %d", rec.Code)
+	}
+}
+
+func TestCalculateBacklog(t *testing.T) {
+	srv, exchangeDir, _ := setupTestEnv(t)
+	eventsDir := filepath.Join(exchangeDir, "events")
+
+	// Segment 1: 400 bytes
+	seg1 := filepath.Join(eventsDir, "0000000000000001.ndjson")
+	_ = os.WriteFile(seg1, bytes.Repeat([]byte("a"), 400), 0644)
+
+	// Segment 2: 600 bytes
+	seg2 := filepath.Join(eventsDir, "0000000000000002.ndjson")
+	_ = os.WriteFile(seg2, bytes.Repeat([]byte("b"), 600), 0644)
+
+	// Cursor at segment 1, offset 100
+	ackPath := filepath.Join(exchangeDir, "core-ack.json")
+	cur := &journal.Cursor{
+		Version: 1,
+		Segment: 1,
+		Offset:  100,
+	}
+	_ = journal.SaveCursor(ackPath, cur)
+
+	// 1. Overview page: unconsumed should be (400-100) + 600 = 900 bytes
+	req := httptest.NewRequest(http.MethodGet, "/overview", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("overview failed: %d", rec.Code)
+	}
+	body := rec.Body.String()
+	if !strings.Contains(body, "900") {
+		t.Errorf("expected overview to display 900 bytes backlog: %s", body)
+	}
+
+	// 2. System page: unconsumed 900, total 1000
+	sysReq := httptest.NewRequest(http.MethodGet, "/system", nil)
+	sysRec := httptest.NewRecorder()
+	srv.ServeHTTP(sysRec, sysReq)
+	if sysRec.Code != http.StatusOK {
+		t.Fatalf("system failed: %d", sysRec.Code)
+	}
+	sysBody := sysRec.Body.String()
+	if !strings.Contains(sysBody, "900") {
+		t.Errorf("expected system to display 900 unconsumed bytes: %s", sysBody)
+	}
+	if !strings.Contains(sysBody, "1000") && !strings.Contains(sysBody, "1,000") && !strings.Contains(sysBody, "1.0 KB") {
+		t.Errorf("expected system to display 1000 bytes total size: %s", sysBody)
+	}
+}
+
+func TestWebRequestLimitsAndTimeouts(t *testing.T) {
+	srv, _, _ := setupTestEnv(t)
+
+	// 1. Send body > 128KB (e.g. 150KB)
+	largeBody := strings.Repeat("channels=c1&", 15000)
+	req := httptest.NewRequest(http.MethodPost, "/api/watchlist", strings.NewReader(largeBody))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Host = "127.0.0.1:8080"
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusRequestEntityTooLarge {
+		t.Fatalf("expected 413 RequestEntityTooLarge for oversized body, got %d", rec.Code)
+	}
+
+	// 2. Normal-sized body succeeds
+	normalBody := "channels=c1"
+	reqNormal := httptest.NewRequest(http.MethodPost, "/api/watchlist", strings.NewReader(normalBody))
+	reqNormal.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	reqNormal.Host = "127.0.0.1:8080"
+	reqNormal.Header.Set("Origin", "http://127.0.0.1:8080")
+
+	recNormal := httptest.NewRecorder()
+	srv.ServeHTTP(recNormal, reqNormal)
+
+	if recNormal.Code != http.StatusSeeOther {
+		t.Fatalf("expected 303 SeeOther for normal body, got %d", recNormal.Code)
+	}
+}
+
+func TestCSRFProtectionAndThreatModel(t *testing.T) {
+	srv, _, _ := setupTestEnv(t)
+
+	body := "channels=c1"
+
+	// Case 1: Sec-Fetch-Site: cross-site -> 403
+	{
+		req := httptest.NewRequest(http.MethodPost, "/api/watchlist", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Sec-Fetch-Site", "cross-site")
+		req.Host = "127.0.0.1:8080"
+		req.Header.Set("Origin", "http://127.0.0.1:8080")
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("expected 403 on Sec-Fetch-Site: cross-site, got %d", rec.Code)
+		}
+	}
+
+	// Case 2: Origin: null -> 403
+	{
+		req := httptest.NewRequest(http.MethodPost, "/api/watchlist", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Origin", "null")
+		req.Host = "127.0.0.1:8080"
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("expected 403 on Origin: null, got %d", rec.Code)
+		}
+	}
+
+	// Case 3: Origin mismatch -> 403
+	{
+		req := httptest.NewRequest(http.MethodPost, "/api/watchlist", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Origin", "http://attacker.com")
+		req.Host = "127.0.0.1:8080"
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("expected 403 on mismatched Origin, got %d", rec.Code)
+		}
+	}
+
+	// Case 4: Origin matches Host -> 303 (Allowed)
+	{
+		req := httptest.NewRequest(http.MethodPost, "/api/watchlist", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Origin", "http://127.0.0.1:8080")
+		req.Host = "127.0.0.1:8080"
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusSeeOther {
+			t.Errorf("expected 303 on matching Origin, got %d", rec.Code)
+		}
+	}
+
+	// Case 5: No Origin, Referer mismatch -> 403
+	{
+		req := httptest.NewRequest(http.MethodPost, "/api/watchlist", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Referer", "http://attacker.com/evil")
+		req.Host = "127.0.0.1:8080"
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusForbidden {
+			t.Errorf("expected 403 on mismatched Referer, got %d", rec.Code)
+		}
+	}
+
+	// Case 6: No Origin, Referer matches Host -> 303 (Allowed)
+	{
+		req := httptest.NewRequest(http.MethodPost, "/api/watchlist", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Referer", "http://127.0.0.1:8080/channels")
+		req.Host = "127.0.0.1:8080"
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusSeeOther {
+			t.Errorf("expected 303 on matching Referer, got %d", rec.Code)
+		}
+	}
+
+	// Case 7: No Origin, No Referer, No browser Sec headers (local CLI / curl) -> 303 (Allowed)
+	{
+		req := httptest.NewRequest(http.MethodPost, "/api/watchlist", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Host = "127.0.0.1:8080"
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if rec.Code != http.StatusSeeOther {
+			t.Errorf("expected 303 for local CLI without Origin/Referer, got %d", rec.Code)
+		}
+	}
+}
+
 
 

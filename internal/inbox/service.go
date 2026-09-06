@@ -105,22 +105,10 @@ func ListDigests(digestsDir string) ([]DigestSummary, int, error) {
 }
 
 // GetDigest retrieves and unmarshals a digest artifact by its batch ID.
-// It verifies that batchID matches ^[a-f0-9]{64}$ to prevent path traversal.
+// It verifies that batchID conforms to the canonical 64 lowercase hex characters.
 func GetDigest(digestsDir string, batchID string) (*digest.Artifact, error) {
-	if !ValidBatchIDRegex.MatchString(batchID) {
+	if err := digest.ValidateBatchID(batchID); err != nil {
 		return nil, ErrInvalidBatchID
 	}
-
-	filePath := filepath.Join(digestsDir, batchID+".json")
-	data, err := os.ReadFile(filePath)
-	if err != nil {
-		return nil, err
-	}
-
-	var art digest.Artifact
-	if err := json.Unmarshal(data, &art); err != nil {
-		return nil, fmt.Errorf("unmarshal digest artifact: %w", err)
-	}
-
-	return &art, nil
+	return digest.LoadArtifact(digestsDir, batchID)
 }

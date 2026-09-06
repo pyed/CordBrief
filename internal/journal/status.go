@@ -7,6 +7,8 @@ import (
 	"os"
 	"path/filepath"
 	"time"
+
+	"cordbrief/internal/durable"
 )
 
 // ErrCommandPending is returned when attempting to write a new collector command while a previous one is still pending.
@@ -59,7 +61,13 @@ func ReadCollectorStatus(path string) (*CollectorStatus, error) {
 	return &s, nil
 }
 
-// WriteCollectorCommand writes an atomic command file in exchange directory using temporary file + rename.
+// WriteCollectorCommand writes an atomic command file in exchange directory.
+// Uses durable.AtomicWriteJSONExclusive to guarantee:
+// - Write to unpublished temp file, fsync, and close
+// - Atomic create-if-absent publication via os.Link (fails if command already pending)
+// - Zero TOCTOU window between concurrent writers
+// - Directory fsync on parent directory
+// - Guaranteed cleanup of temp file
 func WriteCollectorCommand(exchangeDir string, cmd CollectorCommand) error {
 	if cmd.Version == 0 {
 		cmd.Version = CurrentSchemaVersion
@@ -74,25 +82,12 @@ func WriteCollectorCommand(exchangeDir string, cmd CollectorCommand) error {
 		cmd.RequestedAt = time.Now().UTC()
 	}
 
-	data, err := json.MarshalIndent(cmd, "", "  ")
-	if err != nil {
-		return fmt.Errorf("marshal collector command: %w", err)
-	}
-
 	targetPath := filepath.Join(exchangeDir, DefaultCommandFilename)
-	if _, err := os.Stat(targetPath); err == nil {
-		return ErrCommandPending
-	}
-
-	tmpPath := fmt.Sprintf("%s.tmp.%d", targetPath, time.Now().UnixNano())
-
-	if err := os.WriteFile(tmpPath, data, 0o644); err != nil {
-		return fmt.Errorf("write temp collector command: %w", err)
-	}
-
-	if err := os.Rename(tmpPath, targetPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("atomic rename collector command: %w", err)
+	if err := durable.AtomicWriteJSONExclusive(targetPath, cmd, 0644); err != nil {
+		if errors.Is(err, os.ErrExist) || os.IsExist(err) {
+			return ErrCommandPending
+		}
+		return fmt.Errorf("write collector command: %w", err)
 	}
 
 	return nil
@@ -100,7 +95,7 @@ func WriteCollectorCommand(exchangeDir string, cmd CollectorCommand) error {
 
 // ReadCollectorCommandAck strictly parses collector-command-ack.json from exchange directory.
 func ReadCollectorCommandAck(exchangeDir string) (*CollectorCommandAck, error) {
-	path := fmt.Sprintf("%s/%s", exchangeDir, DefaultCommandAckFilename)
+	path := filepath.Join(exchangeDir, DefaultCommandAckFilename)
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, fmt.Errorf("open collector command ack: %w", err)

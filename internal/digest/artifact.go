@@ -5,14 +5,20 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+
+	"cordbrief/internal/durable"
 )
 
 // ArtifactPath returns the canonical filesystem path for a digest artifact.
-func ArtifactPath(dir, batchID string) string {
-	return filepath.Join(dir, batchID+".json")
+// It verifies that batchID strictly matches 64 lowercase hexadecimal characters.
+func ArtifactPath(dir, batchID string) (string, error) {
+	if err := ValidateBatchID(batchID); err != nil {
+		return "", err
+	}
+	return filepath.Join(dir, batchID+".json"), nil
 }
 
-// SaveArtifact writes the digest artifact atomically with sync and rename.
+// SaveArtifact writes the digest artifact atomically with sync and rename using durable.AtomicWriteJSON.
 func SaveArtifact(dir string, art *Artifact) error {
 	if art == nil {
 		return fmt.Errorf("artifact cannot be nil")
@@ -21,52 +27,20 @@ func SaveArtifact(dir string, art *Artifact) error {
 		return fmt.Errorf("artifact batch_id cannot be empty")
 	}
 
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("create digest artifact directory: %w", err)
-	}
-
-	targetPath := ArtifactPath(dir, art.BatchID)
-	tmpPath := fmt.Sprintf("%s.tmp.%d", targetPath, os.Getpid())
-
-	data, err := json.MarshalIndent(art, "", "  ")
+	targetPath, err := ArtifactPath(dir, art.BatchID)
 	if err != nil {
-		return fmt.Errorf("marshal digest artifact: %w", err)
-	}
-	data = append(data, '\n')
-
-	f, err := os.OpenFile(tmpPath, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, 0644)
-	if err != nil {
-		return fmt.Errorf("create tmp digest artifact: %w", err)
+		return fmt.Errorf("invalid artifact batch_id: %w", err)
 	}
 
-	if _, err := f.Write(data); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("write tmp digest artifact: %w", err)
-	}
-
-	if err := f.Sync(); err != nil {
-		_ = f.Close()
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("sync tmp digest artifact: %w", err)
-	}
-
-	if err := f.Close(); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("close tmp digest artifact: %w", err)
-	}
-
-	if err := os.Rename(tmpPath, targetPath); err != nil {
-		_ = os.Remove(tmpPath)
-		return fmt.Errorf("rename digest artifact to destination: %w", err)
-	}
-
-	return nil
+	return durable.AtomicWriteJSON(targetPath, art, 0644)
 }
 
 // LoadArtifact reads a persisted digest artifact from disk.
 func LoadArtifact(dir, batchID string) (*Artifact, error) {
-	path := ArtifactPath(dir, batchID)
+	path, err := ArtifactPath(dir, batchID)
+	if err != nil {
+		return nil, err
+	}
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, err
