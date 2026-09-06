@@ -39,6 +39,19 @@ cat << EOF > "$RUNTIME_DIR/runtime-owner.json"
 }
 EOF
 
+# If a specific maintenance command was supplied to the container, execute it directly
+# under the held kernel flock lease without starting Xpra, Openbox, or Discord.
+if [ $# -gt 0 ]; then
+    echo "[Setup] Executing maintenance command under kernel flock lease (FD 9): $@"
+    trap 'rm -f "$RUNTIME_DIR/runtime-owner.json" 2>/dev/null || true' EXIT INT TERM
+    set +e
+    "$@"
+    CHILD_EXIT=$?
+    rm -f "$RUNTIME_DIR/runtime-owner.json" 2>/dev/null || true
+    trap - EXIT INT TERM
+    exit $CHILD_EXIT
+fi
+
 # 5. Official Discord configuration and endpoint
 DISCORD_CONFIG_DIR="/home/cordbrief/.config/discord"
 mkdir -p "$DISCORD_CONFIG_DIR"
