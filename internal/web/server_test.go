@@ -57,10 +57,20 @@ func setupTestEnv(t *testing.T) (*Server, string, string) {
 		t.Fatal(err)
 	}
 
-	server, err := NewServer(ServerOptions{
-		ExchangeDir: exchangeDir,
+	delSvc, err := delivery.NewService(delivery.ServiceOptions{
 		DataDir:     dataDir,
+		ExchangeDir: exchangeDir,
 		Store:       store,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	server, err := NewServer(ServerOptions{
+		ExchangeDir:     exchangeDir,
+		DataDir:         dataDir,
+		Store:           store,
+		DeliveryService: delSvc,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -81,8 +91,31 @@ func TestServer_GetIndex(t *testing.T) {
 	}
 
 	body := rec.Body.String()
-	if !strings.Contains(body, "CordBrief Setup Control Plane") {
-		t.Errorf("missing header in response")
+	if !strings.Contains(body, "CordBrief") || !strings.Contains(body, "Overview") {
+		t.Errorf("missing header or page title in response")
+	}
+	if !strings.Contains(body, "Collector Daemon") || !strings.Contains(body, "Watched Channels") {
+		t.Errorf("missing subsystem cards in Overview HTML: %s", body)
+	}
+	if !strings.Contains(body, `class="nav-item active"`) {
+		t.Errorf("expected active nav item on overview")
+	}
+}
+
+func TestServer_GetChannels(t *testing.T) {
+	srv, _, _ := setupTestEnv(t)
+
+	req := httptest.NewRequest(http.MethodGet, "/channels", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK, got %d", rec.Code)
+	}
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "Watched Channels") {
+		t.Errorf("missing page title in response")
 	}
 	if !strings.Contains(body, "Test Server") || !strings.Contains(body, "#general") {
 		t.Errorf("missing catalog server or channel in HTML: %s", body)
@@ -295,7 +328,7 @@ func TestServer_XSSSanitization(t *testing.T) {
 	_ = os.WriteFile(filepath.Join(exchangeDir, "catalog.json"), []byte(adversarialCatalog), 0644)
 
 	// Send request with adversarial flash messages
-	req := httptest.NewRequest(http.MethodGet, "/?flash=%3Cscript%3Ealert('flash-pwn')%3C/script%3E&error=%3Cscript%3Ealert('err-pwn')%3C/script%3E", nil)
+	req := httptest.NewRequest(http.MethodGet, "/channels?flash=%3Cscript%3Ealert('flash-pwn')%3C/script%3E&error=%3Cscript%3Ealert('err-pwn')%3C/script%3E", nil)
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 
@@ -345,7 +378,7 @@ func TestServer_SecretSourceDisplayAndRejection(t *testing.T) {
 	srv, _, _ := setupTestEnv(t)
 
 	// 1. None initially
-	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	req := httptest.NewRequest(http.MethodGet, "/provider", nil)
 	rec := httptest.NewRecorder()
 	srv.ServeHTTP(rec, req)
 	if !strings.Contains(rec.Body.String(), "Not Configured") {
@@ -355,7 +388,7 @@ func TestServer_SecretSourceDisplayAndRejection(t *testing.T) {
 	// 2. Stored key
 	_ = srv.store.SaveGeminiKey("my-stored-key")
 	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	req = httptest.NewRequest(http.MethodGet, "/provider", nil)
 	srv.ServeHTTP(rec, req)
 	if !strings.Contains(rec.Body.String(), "Configured (stored in secrets.json)") {
 		t.Errorf("expected 'Configured (stored in secrets.json)' status")
@@ -364,7 +397,7 @@ func TestServer_SecretSourceDisplayAndRejection(t *testing.T) {
 	// 3. Environment override
 	t.Setenv("GEMINI_API_KEY", "env-provided-key")
 	rec = httptest.NewRecorder()
-	req = httptest.NewRequest(http.MethodGet, "/", nil)
+	req = httptest.NewRequest(http.MethodGet, "/provider", nil)
 	srv.ServeHTTP(rec, req)
 	body := rec.Body.String()
 	if !strings.Contains(body, "Configured (via environment)") {
@@ -1383,16 +1416,16 @@ func TestWebDeliveryHandlers(t *testing.T) {
 			t.Errorf("expected StateSent, got %s", recState.State)
 		}
 
-		// Verify Index UI has Telegram settings card
-		idxReq := httptest.NewRequest(http.MethodGet, "/", nil)
+		// Verify Telegram UI has Telegram settings card
+		idxReq := httptest.NewRequest(http.MethodGet, "/telegram", nil)
 		idxRec := httptest.NewRecorder()
 		srv.ServeHTTP(idxRec, idxReq)
 		idxHTML := idxRec.Body.String()
 		if !strings.Contains(idxHTML, "Telegram Delivery Configuration") {
-			t.Errorf("Index UI missing Telegram Delivery Configuration card")
+			t.Errorf("Telegram UI missing Telegram Delivery Configuration card")
 		}
 		if !strings.Contains(idxHTML, "Discover Chats") {
-			t.Errorf("Index UI missing Discover Chats button")
+			t.Errorf("Telegram UI missing Discover Chats button")
 		}
 
 		// Verify Inbox UI has Telegram delivery badge
@@ -1422,8 +1455,8 @@ func TestWebDeliveryHandlers(t *testing.T) {
 		}
 	})
 
-	// 14. Requirements 7 & 8: Index UI defense-in-depth filters hidden Discord channel sentinels
-	t.Run("Index UI filters hidden channel sentinels from catalog", func(t *testing.T) {
+	// 14. Requirements 7 & 8: Channels UI defense-in-depth filters hidden Discord channel sentinels
+	t.Run("Channels UI filters hidden channel sentinels from catalog", func(t *testing.T) {
 		catData := `{
   "version": 1,
   "updated_at": "2026-09-06T00:00:00Z",
@@ -1444,7 +1477,7 @@ func TestWebDeliveryHandlers(t *testing.T) {
 			t.Fatal(err)
 		}
 
-		idxReq := httptest.NewRequest(http.MethodGet, "/", nil)
+		idxReq := httptest.NewRequest(http.MethodGet, "/channels", nil)
 		idxRec := httptest.NewRecorder()
 		srv.ServeHTTP(idxRec, idxReq)
 
@@ -1469,4 +1502,249 @@ func TestWebDeliveryHandlers(t *testing.T) {
 		}
 	})
 }
+
+func TestServer_NavigationArchitecture(t *testing.T) {
+	srv, _, _ := setupTestEnv(t)
+
+	cases := []struct {
+		path         string
+		expectedNav  string
+		expectedText string
+	}{
+		{"/", "overview", "Overview"},
+		{"/overview", "overview", "Overview"},
+		{"/inbox", "inbox", "Inbox"},
+		{"/channels", "channels", "Watched Channels"},
+		{"/schedule", "schedule", "Schedule"},
+		{"/provider", "provider", "LLM Synthesis Provider"},
+		{"/telegram", "telegram", "Telegram Delivery Configuration"},
+		{"/system", "system", "System Status"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.path, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
+			rec := httptest.NewRecorder()
+			srv.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusOK {
+				t.Fatalf("expected 200 OK for %s, got %d", tc.path, rec.Code)
+			}
+
+			body := rec.Body.String()
+
+			// 1. Sidebar shell present
+			if !strings.Contains(body, `<aside class="sidebar">`) {
+				t.Errorf("missing sidebar shell on %s", tc.path)
+			}
+
+			// 2. Active nav link highlighted
+			expectedActiveLink := fmt.Sprintf(`href="%s" class="nav-item active"`, tc.path)
+			if tc.path == "/overview" {
+				expectedActiveLink = `href="/" class="nav-item active"`
+			}
+			if !strings.Contains(body, expectedActiveLink) {
+				t.Errorf("missing active nav link on %s: expected %s in HTML", tc.path, expectedActiveLink)
+			}
+
+			// 3. Expected page content present
+			if !strings.Contains(body, tc.expectedText) {
+				t.Errorf("missing expected page text %q on %s", tc.expectedText, tc.path)
+			}
+		})
+	}
+}
+
+func TestServer_SystemPageSecretHygiene(t *testing.T) {
+	srv, _, _ := setupTestEnv(t)
+
+	envKey := "super-secret-env-gemini-key-12345"
+	storedKey := "super-secret-stored-gemini-key-67890"
+	tgToken := "987654321:super-secret-tg-token-abcdef"
+
+	t.Setenv("GEMINI_API_KEY", envKey)
+	_ = srv.store.SaveGeminiKey(storedKey)
+	_ = srv.store.SaveTelegramBotToken(tgToken)
+
+	req := httptest.NewRequest(http.MethodGet, "/system", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusOK {
+		t.Fatalf("expected 200 OK for /system, got %d", rec.Code)
+	}
+
+	body := rec.Body.String()
+
+	// Verify system diagnostic cards
+	if !strings.Contains(body, "Collector Daemon") {
+		t.Errorf("missing Collector Daemon card in /system")
+	}
+	if !strings.Contains(body, "Journal &amp; Storage Telemetry") && !strings.Contains(body, "Journal & Storage Telemetry") {
+		t.Errorf("missing Journal & Storage Telemetry card in /system")
+	}
+	if !strings.Contains(body, "Core Runtime Service") {
+		t.Errorf("missing Core Runtime Service card in /system")
+	}
+	if !strings.Contains(body, "Security &amp; Secret Hygiene") && !strings.Contains(body, "Security & Secret Hygiene") {
+		t.Errorf("missing Security card in /system")
+	}
+
+	// Verify ZERO secret leaks
+	if strings.Contains(body, envKey) {
+		t.Fatalf("SECURITY VIOLATION: Environment Gemini key leaked in /system HTML!")
+	}
+	if strings.Contains(body, storedKey) {
+		t.Fatalf("SECURITY VIOLATION: Stored Gemini key leaked in /system HTML!")
+	}
+	if strings.Contains(body, tgToken) {
+		t.Fatalf("SECURITY VIOLATION: Telegram bot token leaked in /system HTML!")
+	}
+	if strings.Contains(body, "super-secret") {
+		t.Fatalf("SECURITY VIOLATION: Secret fragment leaked in /system HTML!")
+	}
+}
+
+func TestServer_DedicatedSecretStatusAndResolution(t *testing.T) {
+	// A, B, C: Gemini Provider secret status on /provider
+	t.Run("Gemini secret status states", func(t *testing.T) {
+		srv, _, _ := setupTestEnv(t)
+
+		// C. Gemini absent -> /provider says "Not Configured"
+		req := httptest.NewRequest(http.MethodGet, "/provider", nil)
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if !strings.Contains(rec.Body.String(), "Not Configured") {
+			t.Errorf("expected 'Not Configured' when Gemini key is absent")
+		}
+
+		// B. Gemini stored key present -> /provider says "Configured (stored in secrets.json)"
+		_ = srv.store.SaveGeminiKey("stored-gemini-secret-999")
+		rec = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodGet, "/provider", nil)
+		srv.ServeHTTP(rec, req)
+		body := rec.Body.String()
+		if !strings.Contains(body, "Configured (stored in secrets.json)") {
+			t.Errorf("expected 'Configured (stored in secrets.json)' when key is stored")
+		}
+
+		// A. Gemini env key present -> /provider says "Configured (via environment)"
+		t.Setenv("GEMINI_API_KEY", "env-gemini-secret-888")
+		rec = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodGet, "/provider", nil)
+		srv.ServeHTTP(rec, req)
+		body = rec.Body.String()
+		if !strings.Contains(body, "Configured (via environment)") {
+			t.Errorf("expected 'Configured (via environment)' when env key is set")
+		}
+		if !strings.Contains(body, "disabled") {
+			t.Errorf("expected input to be disabled when env key is set")
+		}
+
+		// I. No rendered page contains raw secret values
+		if strings.Contains(body, "stored-gemini-secret-999") || strings.Contains(body, "env-gemini-secret-888") {
+			t.Fatalf("CRITICAL: raw Gemini secret leaked in /provider HTML")
+		}
+	})
+
+	// D, E, F: Telegram secret status on /telegram
+	t.Run("Telegram secret status states", func(t *testing.T) {
+		srv, _, _ := setupTestEnv(t)
+
+		// F. Telegram absent -> /telegram says "NOT CONFIGURED"
+		req := httptest.NewRequest(http.MethodGet, "/telegram", nil)
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if !strings.Contains(rec.Body.String(), "NOT CONFIGURED") {
+			t.Errorf("expected 'NOT CONFIGURED' when Telegram token is absent")
+		}
+
+		// D. Telegram stored key present -> /telegram says "CONFIGURED (STORED IN SECRETS.JSON)"
+		_ = srv.store.SaveTelegramBotToken("111111:stored-token-secret")
+		rec = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodGet, "/telegram", nil)
+		srv.ServeHTTP(rec, req)
+		body := rec.Body.String()
+		if !strings.Contains(body, "CONFIGURED (STORED IN SECRETS.JSON)") {
+			t.Errorf("expected 'CONFIGURED (STORED IN SECRETS.JSON)' when token is stored in secrets.json, got: %s", body)
+		}
+
+		// E. Telegram env token present -> /telegram says "CONFIGURED (FROM ENVIRONMENT)"
+		t.Setenv("TELEGRAM_BOT_TOKEN", "222222:env-token-secret")
+		rec = httptest.NewRecorder()
+		req = httptest.NewRequest(http.MethodGet, "/telegram", nil)
+		srv.ServeHTTP(rec, req)
+		body = rec.Body.String()
+		if !strings.Contains(body, "CONFIGURED (FROM ENVIRONMENT)") {
+			t.Errorf("expected 'CONFIGURED (FROM ENVIRONMENT)' when token is in env, got: %s", body)
+		}
+
+		// I. No rendered page contains raw secret values
+		if strings.Contains(body, "stored-token-secret") || strings.Contains(body, "env-token-secret") {
+			t.Fatalf("CRITICAL: raw Telegram token leaked in /telegram HTML")
+		}
+	})
+
+	// G: Test Connection uses resolved Gemini secret source
+	t.Run("Test Connection uses resolved Gemini secret source", func(t *testing.T) {
+		srv, _, _ := setupTestEnv(t)
+
+		// Absent key -> returns error
+		form := url.Values{}
+		form.Set("provider", "gemini")
+		req := httptest.NewRequest(http.MethodPost, "/api/llm/test", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Host = "127.0.0.1:8080"
+		req.Header.Set("Origin", "http://127.0.0.1:8080")
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if !strings.Contains(rec.Body.String(), "GEMINI_API_KEY is not configured") {
+			t.Errorf("expected error when key is absent, got: %s", rec.Body.String())
+		}
+
+		// Stored key -> store.GetGeminiKey() is used
+		_ = srv.store.SaveGeminiKey("stored-key-active")
+		if srv.store.GetGeminiKey() != "stored-key-active" {
+			t.Errorf("expected store.GetGeminiKey() to return stored key")
+		}
+
+		// Env key takes precedence over stored key
+		t.Setenv("GEMINI_API_KEY", "env-key-precedence")
+		if srv.store.GetGeminiKey() != "env-key-precedence" {
+			t.Errorf("expected store.GetGeminiKey() to return env key over stored key")
+		}
+	})
+
+	// H: Telegram Test Ping uses resolved Telegram token source
+	t.Run("Telegram Test Ping uses resolved Telegram token source", func(t *testing.T) {
+		srv, _, _ := setupTestEnv(t)
+
+		// Absent token -> returns error
+		form := url.Values{}
+		form.Set("chat_id", "123456")
+		req := httptest.NewRequest(http.MethodPost, "/api/telegram/send-test", strings.NewReader(form.Encode()))
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Host = "127.0.0.1:8080"
+		req.Header.Set("Origin", "http://127.0.0.1:8080")
+		rec := httptest.NewRecorder()
+		srv.ServeHTTP(rec, req)
+		if !strings.Contains(rec.Body.String(), "telegram bot token is not configured") {
+			t.Errorf("expected error when token is absent, got: %s", rec.Body.String())
+		}
+
+		// Stored token -> store.GetTelegramBotToken() is used
+		_ = srv.store.SaveTelegramBotToken("stored-bot-token-active")
+		if srv.store.GetTelegramBotToken() != "stored-bot-token-active" {
+			t.Errorf("expected store.GetTelegramBotToken() to return stored token")
+		}
+
+		// Env token takes precedence over stored token
+		t.Setenv("TELEGRAM_BOT_TOKEN", "env-bot-token-precedence")
+		if srv.store.GetTelegramBotToken() != "env-bot-token-precedence" {
+			t.Errorf("expected store.GetTelegramBotToken() to return env token over stored token")
+		}
+	})
+}
+
+
 

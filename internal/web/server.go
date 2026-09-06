@@ -85,9 +85,17 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) routes() {
-	s.mux.HandleFunc("/", s.handleIndex)
+	s.mux.HandleFunc("/", s.handleOverview)
+	s.mux.HandleFunc("/overview", s.handleOverview)
 	s.mux.HandleFunc("/inbox", s.handleInbox)
+	s.mux.HandleFunc("/channels", s.handleChannels)
+	s.mux.HandleFunc("/schedule", s.handleSchedulePage)
+	s.mux.HandleFunc("/provider", s.handleProviderPage)
+	s.mux.HandleFunc("/telegram", s.handleTelegramPage)
+	s.mux.HandleFunc("/system", s.handleSystemPage)
 	s.mux.HandleFunc("/digests/", s.handleDigestDetail)
+
+	// API / Mutation routes (PRG)
 	s.mux.HandleFunc("/api/schedule", s.handleSchedule)
 	s.mux.HandleFunc("/api/watchlist", s.handleWatchlist)
 	s.mux.HandleFunc("/api/llm", s.handleLLMSettings)
@@ -126,45 +134,139 @@ func (s *Server) validateCSRF(r *http.Request) bool {
 	return strings.EqualFold(u.Host, r.Host)
 }
 
-type indexViewModel struct {
-	CollectorRunning          bool
-	CollectorStale            bool
-	CollectorMode             string
-	CollectorStateStr         string
-	DiscordAuthenticated      bool
-	SetupRequired             bool
-	ReauthRequired            bool
-	CatalogState              string
-	CatalogGuildCount         int
-	CatalogChannelCount       int
-	WatchedGeneration         int
-	WatchedChannelCount       int
-	WatchedSet                map[string]bool
-	CommittedCursor           journal.Cursor
-	ActiveSegment             int
-	JournalFinalOffset        int64
-	Config                    config.AppConfig
-	GeminiConfigured          bool
-	GeminiKeySource           config.SecretSource
-	FocusJoined               string
-	Catalog                   *catalog.Catalog
-	FlashMessage              string
-	FlashError                string
-	RecoveryState             string
-	RecoveryPendingChannels   int
-	RecoveryLastError         string
-	ScheduleState             scheduler.State
-	ScheduleNextDue           time.Time
-	ScheduleNextDueFormatted string
-	TelegramEnabled          bool
-	TelegramTokenSource      config.SecretSource
-	TelegramConfigured       bool
-	TelegramChatID           string
-	TelegramChatLabel        string
+func (s *Server) getCorePort() int {
+	if portStr := os.Getenv("CORDBRIEF_WEB_PORT"); portStr != "" {
+		if p, err := strconv.Atoi(portStr); err == nil && p > 0 {
+			return p
+		}
+	}
+	return config.DefaultCorePort
+}
+
+type overviewViewModel struct {
+	PageTitle           string
+	PageDescription     string
+	ActiveNav           string
+	FlashMessage        string
+	FlashError          string
+	CorePort            int
+	CollectorRunning    bool
+	CollectorStale      bool
+	CollectorMode       string
+	CollectorStateStr   string
+	DiscordAuth         bool
+	SetupRequired       bool
+	ReauthRequired      bool
+	CatalogState        string
+	CatalogGuildCount   int
+	CatalogChannelCount int
+	WatchedGeneration   int
+	WatchedChannelCount int
+	HasLastDigest       bool
+	LastDigestTitle     string
+	LastDigestID        string
+	LastDigestTime      string
+	ScheduleEnabled     bool
+	ScheduleTime        string
+	ScheduleTimezone    string
+	ScheduleNextDue     string
+	TelegramEnabled     bool
+	TelegramConfigured  bool
+	TelegramDestination string
+	AIProvider          string
+	AIModel             string
+	AIKeySource         config.SecretSource
+	BacklogCount        int64
+	RecoveryStatusStr   string
+}
+
+type channelsViewModel struct {
+	PageTitle           string
+	PageDescription     string
+	ActiveNav           string
+	FlashMessage        string
+	FlashError          string
+	Catalog             *catalog.Catalog
+	CatalogState        string
+	CatalogGuildCount   int
+	CatalogChannelCount int
+	WatchedCount        int
+	WatchedGeneration   int
+	WatchedSet          map[string]bool
+}
+
+type scheduleViewModel struct {
+	PageTitle        string
+	PageDescription  string
+	ActiveNav        string
+	FlashMessage     string
+	FlashError       string
+	Config           config.ScheduleConfig
+	State            scheduler.State
+	NextDueFormatted string
+	NextDueDuration  string
+}
+
+type providerViewModel struct {
+	PageTitle        string
+	PageDescription  string
+	ActiveNav        string
+	FlashMessage     string
+	FlashError       string
+	LLMConfig        config.LLMConfig
+	DigestConfig     config.DigestConfig
+	GeminiKeySource  config.SecretSource
+	GeminiConfigured bool
+	FocusJoined      string
+}
+
+type telegramViewModel struct {
+	PageTitle       string
+	PageDescription string
+	ActiveNav       string
+	FlashMessage    string
+	FlashError      string
+	Enabled         bool
+	TokenSource     config.SecretSource
+	Configured      bool
+	ChatID          string
+	ChatLabel       string
+}
+
+type systemViewModel struct {
+	PageTitle               string
+	PageDescription         string
+	ActiveNav               string
+	FlashMessage            string
+	FlashError              string
+	CorePort                int
+	DataDir                 string
+	ExchangeDir             string
+	CollectorRunning        bool
+	CollectorStale          bool
+	CollectorMode           string
+	CollectorStateStr       string
+	DiscordAuth             bool
+	CatalogState            string
+	CatalogUpdatedFormatted string
+	RecoveryState           string
+	RecoveryPendingChannels int
+	WatchedGeneration       int
+	WatchedChannelCount     int
+	ActiveSegment           int
+	JournalSizeBytes        int64
+	CommittedCursor         journal.Cursor
+	UnconsumedBytes         int64
+	SchedulerState          scheduler.State
+	SchedulerNextDue        string
 }
 
 func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
-	if r.URL.Path != "/" {
+	s.handleOverview(w, r)
+}
+
+func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
+	if r.URL.Path != "/" && r.URL.Path != "/overview" {
 		http.NotFound(w, r)
 		return
 	}
@@ -174,16 +276,22 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 	}
 
 	appConfig := s.store.GetAppConfig()
-	vm := indexViewModel{
-		Config:     appConfig,
-		WatchedSet: make(map[string]bool),
+	vm := overviewViewModel{
+		PageTitle:        "Overview",
+		PageDescription:  "Live operational status of CordBrief appliance subsystems.",
+		ActiveNav:        "overview",
+		FlashMessage:     r.URL.Query().Get("flash"),
+		FlashError:       r.URL.Query().Get("error"),
+		CorePort:         s.getCorePort(),
+		ScheduleEnabled:  appConfig.Schedule.Enabled,
+		ScheduleTime:     appConfig.Schedule.Time,
+		ScheduleTimezone: appConfig.Schedule.Timezone,
+		AIProvider:       appConfig.LLM.Provider,
+		AIModel:          appConfig.LLM.Model,
+		AIKeySource:      s.store.GetGeminiKeySource(),
 	}
 
-	// Flash messages from query params
-	vm.FlashMessage = r.URL.Query().Get("flash")
-	vm.FlashError = r.URL.Query().Get("error")
-
-	// 1. Read collector-status.json with freshness check (30s threshold)
+	// 1. Collector status with freshness check (30s threshold)
 	statPath := filepath.Join(s.exchangeDir, "collector-status.json")
 	if stat, err := journal.ReadCollectorStatus(statPath); err == nil {
 		isFresh := stat.IsFresh(time.Now().UTC(), 30*time.Second)
@@ -193,30 +301,143 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 
 		if isFresh {
 			vm.CollectorRunning = (stat.CollectorState == "running")
-			vm.DiscordAuthenticated = (stat.DiscordAuthenticated != nil && *stat.DiscordAuthenticated)
+			vm.DiscordAuth = (stat.DiscordAuthenticated != nil && *stat.DiscordAuthenticated)
 			vm.SetupRequired = (stat.CollectorState == "setup_required" || stat.Mode == "setup")
 			vm.ReauthRequired = (stat.CollectorState == "reauth_required" || stat.Mode == "reauth")
 			vm.CatalogState = stat.CatalogState
 			vm.WatchedGeneration = int(stat.WatchedGeneration)
 			vm.WatchedChannelCount = stat.WatchedChannelCount
-			vm.ActiveSegment = int(stat.ActiveSegment)
-			vm.RecoveryState = stat.RecoveryState
-			vm.RecoveryPendingChannels = stat.RecoveryPendingChannels
-			if stat.RecoveryLastError != nil {
-				vm.RecoveryLastError = *stat.RecoveryLastError
+
+			switch stat.RecoveryState {
+			case "ready":
+				vm.RecoveryStatusStr = "✓ Up to date"
+			case "recovering":
+				vm.RecoveryStatusStr = fmt.Sprintf("Recovering (%d remaining)", stat.RecoveryPendingChannels)
+			case "error":
+				vm.RecoveryStatusStr = "Recovery Warning"
+			default:
+				if stat.RecoveryState != "" {
+					vm.RecoveryStatusStr = stat.RecoveryState
+				}
 			}
 		} else {
 			vm.CollectorRunning = false
-			vm.DiscordAuthenticated = false
-			vm.RecoveryState = "unavailable"
+			vm.DiscordAuth = false
+			vm.CollectorStateStr = "Collector Offline"
 		}
 	} else {
 		vm.CollectorRunning = false
 		vm.CollectorStale = true
-		vm.RecoveryState = "unavailable"
+		vm.CollectorStateStr = "Collector Offline"
 	}
 
-	// 2. Read catalog.json
+	// 2. Catalog
+	if cat, err := catalog.Load(s.exchangeDir); err == nil {
+		vm.CatalogGuildCount = len(cat.Guilds)
+		for _, g := range cat.Guilds {
+			for _, ch := range g.Channels {
+				if !catalog.IsHiddenChannelSentinel(ch.Name) {
+					vm.CatalogChannelCount++
+				}
+			}
+		}
+		if vm.CatalogState == "" {
+			vm.CatalogState = "ready"
+		}
+	} else {
+		if vm.CatalogState == "" {
+			vm.CatalogState = "unavailable"
+		}
+	}
+
+	// 3. Watchlist fallback if collector unread
+	if vm.WatchedChannelCount == 0 {
+		wlPath := filepath.Join(s.exchangeDir, "watchlist.json")
+		if wlData, err := os.ReadFile(wlPath); err == nil {
+			var wl struct {
+				Generation int      `json:"generation"`
+				ChannelIDs []string `json:"channel_ids"`
+			}
+			if err := json.Unmarshal(wlData, &wl); err == nil {
+				vm.WatchedGeneration = wl.Generation
+				vm.WatchedChannelCount = len(wl.ChannelIDs)
+			}
+		}
+	}
+
+	// 4. Cursor and backlog
+	var curOffset int64
+	ackPath := filepath.Join(s.exchangeDir, "core-ack.json")
+	if cur, err := journal.LoadCursor(ackPath); err == nil {
+		curOffset = cur.Offset
+	}
+	eventsDir := filepath.Join(s.exchangeDir, "events")
+	seg1Path := filepath.Join(eventsDir, "0000000000000001.ndjson")
+	if info, err := os.Stat(seg1Path); err == nil {
+		if info.Size() >= curOffset {
+			vm.BacklogCount = info.Size() - curOffset
+		}
+	}
+
+	// 5. Last Digest
+	digestsDir := filepath.Join(s.dataDir, "digests")
+	if summaries, _, err := inbox.ListDigests(digestsDir); err == nil && len(summaries) > 0 {
+		vm.HasLastDigest = true
+		vm.LastDigestTitle = summaries[0].Title
+		vm.LastDigestID = summaries[0].BatchID
+		vm.LastDigestTime = FormatDisplayTime(summaries[0].CreatedAt, s.getDisplayTimezone())
+	}
+
+	// 6. Schedule Next Due
+	var nextDue time.Time
+	if s.scheduler != nil {
+		status, _ := s.scheduler.GetStatus()
+		if status.NextRunTime != nil {
+			nextDue = *status.NextRunTime
+		}
+	} else {
+		var st scheduler.State
+		if sLoad, err := scheduler.LoadState(s.dataDir); err == nil {
+			st = *sLoad
+		}
+		status := scheduler.EvaluateSlot(appConfig.Schedule, &st, time.Now())
+		if status.NextRunTime != nil {
+			nextDue = *status.NextRunTime
+		}
+	}
+	if !nextDue.IsZero() {
+		vm.ScheduleNextDue = FormatDisplayTime(nextDue, s.getDisplayTimezone())
+	}
+
+	// 7. Telegram
+	delCfg := s.store.GetDeliveryConfig()
+	vm.TelegramEnabled = delCfg.Telegram.Enabled
+	vm.TelegramConfigured = s.store.IsTelegramConfigured()
+	if delCfg.Telegram.ChatLabel != "" {
+		vm.TelegramDestination = delCfg.Telegram.ChatLabel
+	} else if delCfg.Telegram.ChatID != "" {
+		vm.TelegramDestination = delCfg.Telegram.ChatID
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = OverviewTemplate.Execute(w, vm)
+}
+
+func (s *Server) handleChannels(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	vm := channelsViewModel{
+		PageTitle:       "Watched Channels",
+		PageDescription: "Select Discord channels to monitor for daily digest synthesis.",
+		ActiveNav:       "channels",
+		FlashMessage:    r.URL.Query().Get("flash"),
+		FlashError:      r.URL.Query().Get("error"),
+		WatchedSet:      make(map[string]bool),
+	}
+
+	// 1. Read catalog.json, strictly filtering hidden channel sentinels
 	if cat, err := catalog.Load(s.exchangeDir); err == nil {
 		sanitizedCat := &catalog.Catalog{
 			Version:   cat.Version,
@@ -242,16 +463,12 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 		for _, g := range sanitizedCat.Guilds {
 			vm.CatalogChannelCount += len(g.Channels)
 		}
-		if vm.CatalogState == "" {
-			vm.CatalogState = "ready"
-		}
+		vm.CatalogState = "ready"
 	} else {
-		if vm.CatalogState == "" {
-			vm.CatalogState = "unavailable"
-		}
+		vm.CatalogState = "unavailable"
 	}
 
-	// 3. Read watchlist.json to populate pre-checked set
+	// 2. Read watchlist.json to populate checked set
 	wlPath := filepath.Join(s.exchangeDir, "watchlist.json")
 	if wlData, err := os.ReadFile(wlPath); err == nil {
 		var wl struct {
@@ -262,62 +479,189 @@ func (s *Server) handleIndex(w http.ResponseWriter, r *http.Request) {
 			for _, id := range wl.ChannelIDs {
 				vm.WatchedSet[id] = true
 			}
-			if vm.WatchedGeneration == 0 {
-				vm.WatchedGeneration = wl.Generation
-				vm.WatchedChannelCount = len(wl.ChannelIDs)
-			}
+			vm.WatchedGeneration = wl.Generation
+			vm.WatchedCount = len(wl.ChannelIDs)
 		}
 	}
 
-	// 4. Read core-ack.json committed cursor
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = ChannelsTemplate.Execute(w, vm)
+}
+
+func (s *Server) handleSchedulePage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	appConfig := s.store.GetAppConfig()
+	vm := scheduleViewModel{
+		PageTitle:       "Schedule",
+		PageDescription: "Configure autonomous daily digest generation timing and timezone.",
+		ActiveNav:       "schedule",
+		FlashMessage:    r.URL.Query().Get("flash"),
+		FlashError:      r.URL.Query().Get("error"),
+		Config:          appConfig.Schedule,
+	}
+
+	var nextDue time.Time
+	if s.scheduler != nil {
+		status, st := s.scheduler.GetStatus()
+		vm.State = st
+		if status.NextRunTime != nil {
+			nextDue = *status.NextRunTime
+		}
+	} else {
+		if st, err := scheduler.LoadState(s.dataDir); err == nil {
+			vm.State = *st
+		}
+		status := scheduler.EvaluateSlot(vm.Config, &vm.State, time.Now())
+		if status.NextRunTime != nil {
+			nextDue = *status.NextRunTime
+		}
+	}
+
+	if !nextDue.IsZero() {
+		vm.NextDueFormatted = FormatDisplayTime(nextDue, s.getDisplayTimezone())
+		dur := time.Until(nextDue).Round(time.Minute)
+		if dur > 0 {
+			vm.NextDueDuration = fmt.Sprintf("in %s", dur)
+		} else {
+			vm.NextDueDuration = "due now"
+		}
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = ScheduleTemplate.Execute(w, vm)
+}
+
+func (s *Server) handleProviderPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	appConfig := s.store.GetAppConfig()
+	keySource := s.store.GetGeminiKeySource()
+	vm := providerViewModel{
+		PageTitle:        "AI Provider",
+		PageDescription:  "Configure LLM synthesis provider parameters and digest prompt focus.",
+		ActiveNav:        "provider",
+		FlashMessage:     r.URL.Query().Get("flash"),
+		FlashError:       r.URL.Query().Get("error"),
+		LLMConfig:        appConfig.LLM,
+		DigestConfig:     appConfig.Digest,
+		GeminiKeySource:  keySource,
+		GeminiConfigured: (keySource != config.SecretSourceNone),
+		FocusJoined:      strings.Join(appConfig.Digest.Focus, ", "),
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = ProviderTemplate.Execute(w, vm)
+}
+
+func (s *Server) handleTelegramPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	delCfg := s.store.GetDeliveryConfig()
+	vm := telegramViewModel{
+		PageTitle:       "Telegram Delivery",
+		PageDescription: "Configure first-class daily digest delivery directly to a Telegram chat or DM.",
+		ActiveNav:       "telegram",
+		FlashMessage:    r.URL.Query().Get("flash"),
+		FlashError:      r.URL.Query().Get("error"),
+		Enabled:         delCfg.Telegram.Enabled,
+		TokenSource:     s.store.GetTelegramTokenSource(),
+		Configured:      s.store.IsTelegramConfigured(),
+		ChatID:          delCfg.Telegram.ChatID,
+		ChatLabel:       delCfg.Telegram.ChatLabel,
+	}
+
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	_ = TelegramTemplate.Execute(w, vm)
+}
+
+func (s *Server) handleSystemPage(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	vm := systemViewModel{
+		PageTitle:       "System Status",
+		PageDescription: "Operational telemetry, storage offsets, and appliance control plane.",
+		ActiveNav:       "system",
+		FlashMessage:    r.URL.Query().Get("flash"),
+		FlashError:      r.URL.Query().Get("error"),
+		CorePort:        s.getCorePort(),
+		DataDir:         s.dataDir,
+		ExchangeDir:     s.exchangeDir,
+	}
+
+	// 1. Collector status
+	statPath := filepath.Join(s.exchangeDir, "collector-status.json")
+	if stat, err := journal.ReadCollectorStatus(statPath); err == nil {
+		isFresh := stat.IsFresh(time.Now().UTC(), 30*time.Second)
+		vm.CollectorStale = !isFresh
+		vm.CollectorMode = stat.Mode
+		vm.CollectorStateStr = stat.CollectorState
+		if isFresh {
+			vm.CollectorRunning = (stat.CollectorState == "running")
+			vm.DiscordAuth = (stat.DiscordAuthenticated != nil && *stat.DiscordAuthenticated)
+			vm.WatchedGeneration = int(stat.WatchedGeneration)
+			vm.WatchedChannelCount = stat.WatchedChannelCount
+			vm.ActiveSegment = int(stat.ActiveSegment)
+			vm.RecoveryState = stat.RecoveryState
+			vm.RecoveryPendingChannels = stat.RecoveryPendingChannels
+		} else {
+			vm.CollectorRunning = false
+			vm.RecoveryState = "stale"
+		}
+	} else {
+		vm.CollectorRunning = false
+		vm.CollectorStale = true
+		vm.RecoveryState = "unavailable"
+	}
+
+	// 2. Catalog freshness
+	if cat, err := catalog.Load(s.exchangeDir); err == nil {
+		vm.CatalogState = "ready"
+		vm.CatalogUpdatedFormatted = FormatDisplayTime(cat.UpdatedAt, s.getDisplayTimezone())
+	} else {
+		vm.CatalogState = "unavailable"
+	}
+
+	// 3. Cursor & offsets
 	ackPath := filepath.Join(s.exchangeDir, "core-ack.json")
 	if cur, err := journal.LoadCursor(ackPath); err == nil {
 		vm.CommittedCursor = *cur
 	}
-
-	// 5. Active journal file size
 	eventsDir := filepath.Join(s.exchangeDir, "events")
 	seg1Path := filepath.Join(eventsDir, "0000000000000001.ndjson")
 	if info, err := os.Stat(seg1Path); err == nil {
-		vm.JournalFinalOffset = info.Size()
+		vm.JournalSizeBytes = info.Size()
 		if vm.ActiveSegment == 0 {
 			vm.ActiveSegment = 1
 		}
 	}
+	if vm.JournalSizeBytes >= vm.CommittedCursor.Offset {
+		vm.UnconsumedBytes = vm.JournalSizeBytes - vm.CommittedCursor.Offset
+	}
 
-	vm.GeminiKeySource = s.store.GetGeminiKeySource()
-	vm.GeminiConfigured = (vm.GeminiKeySource != config.SecretSourceNone)
-	vm.FocusJoined = strings.Join(vm.Config.Digest.Focus, ", ")
-
-	// 6. Scheduler status & next due evaluation
+	// 4. Scheduler state
 	if s.scheduler != nil {
 		status, st := s.scheduler.GetStatus()
-		vm.ScheduleState = st
+		vm.SchedulerState = st
 		if status.NextRunTime != nil {
-			vm.ScheduleNextDue = *status.NextRunTime
+			vm.SchedulerNextDue = FormatDisplayTime(*status.NextRunTime, s.getDisplayTimezone())
 		}
 	} else {
 		if st, err := scheduler.LoadState(s.dataDir); err == nil {
-			vm.ScheduleState = *st
-		}
-		status := scheduler.EvaluateSlot(vm.Config.Schedule, &vm.ScheduleState, time.Now())
-		if status.NextRunTime != nil {
-			vm.ScheduleNextDue = *status.NextRunTime
+			vm.SchedulerState = *st
 		}
 	}
-	if !vm.ScheduleNextDue.IsZero() {
-		vm.ScheduleNextDueFormatted = vm.ScheduleNextDue.Format("2006-01-02 15:04 MST")
-	}
-
-	delCfg := s.store.GetDeliveryConfig()
-	vm.TelegramEnabled = delCfg.Telegram.Enabled
-	vm.TelegramTokenSource = s.store.GetTelegramTokenSource()
-	vm.TelegramConfigured = s.store.IsTelegramConfigured()
-	vm.TelegramChatID = delCfg.Telegram.ChatID
-	vm.TelegramChatLabel = delCfg.Telegram.ChatLabel
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	_ = IndexTemplate.Execute(w, vm)
+	_ = SystemTemplate.Execute(w, vm)
 }
 
 func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
@@ -336,7 +680,7 @@ func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := r.ParseForm(); err != nil {
-		http.Redirect(w, r, "/?error=Failed+parsing+form", http.StatusSeeOther)
+		http.Redirect(w, r, "/schedule?error=Failed+parsing+form", http.StatusSeeOther)
 		return
 	}
 
@@ -351,16 +695,16 @@ func (s *Server) handleSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := newSched.Validate(); err != nil {
-		http.Redirect(w, r, fmt.Sprintf("/?error=Invalid+schedule+settings:+%s", url.QueryEscape(err.Error())), http.StatusSeeOther)
+		http.Redirect(w, r, fmt.Sprintf("/schedule?error=Invalid+schedule+settings:+%s", url.QueryEscape(err.Error())), http.StatusSeeOther)
 		return
 	}
 
 	if err := s.store.SaveScheduleConfig(newSched); err != nil {
-		http.Redirect(w, r, fmt.Sprintf("/?error=Failed+saving+schedule:+%s", url.QueryEscape(err.Error())), http.StatusSeeOther)
+		http.Redirect(w, r, fmt.Sprintf("/schedule?error=Failed+saving+schedule:+%s", url.QueryEscape(err.Error())), http.StatusSeeOther)
 		return
 	}
 
-	http.Redirect(w, r, "/?flash=Schedule+settings+saved+successfully", http.StatusSeeOther)
+	http.Redirect(w, r, "/schedule?flash=Schedule+settings+saved+successfully", http.StatusSeeOther)
 }
 
 type inboxItemViewModel struct {
@@ -371,8 +715,13 @@ type inboxItemViewModel struct {
 }
 
 type inboxViewModel struct {
-	Digests      []inboxItemViewModel
-	CorruptCount int
+	PageTitle       string
+	PageDescription string
+	ActiveNav       string
+	FlashMessage    string
+	FlashError      string
+	Digests         []inboxItemViewModel
+	CorruptCount    int
 }
 
 func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
@@ -408,8 +757,13 @@ func (s *Server) handleInbox(w http.ResponseWriter, r *http.Request) {
 	}
 
 	vm := inboxViewModel{
-		Digests:      items,
-		CorruptCount: corrupt,
+		PageTitle:       "Inbox",
+		PageDescription: "Generated executive digests synthesized from watched Discord channels.",
+		ActiveNav:       "inbox",
+		FlashMessage:    r.URL.Query().Get("flash"),
+		FlashError:      r.URL.Query().Get("error"),
+		Digests:         items,
+		CorruptCount:    corrupt,
 	}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
@@ -455,12 +809,15 @@ type DetailItemView struct {
 }
 
 type detailViewModel struct {
+	PageTitle          string
+	PageDescription    string
+	ActiveNav          string
+	FlashMessage       string
+	FlashError         string
 	Artifact           *digest.Artifact
 	CreatedAtFormatted string
 	Items              []DetailItemView
 	Delivery           *delivery.DeliveryRecord
-	FlashMessage       string
-	FlashError         string
 }
 
 func (s *Server) handleDigestDetail(w http.ResponseWriter, r *http.Request) {
@@ -470,9 +827,7 @@ func (s *Server) handleDigestDetail(w http.ResponseWriter, r *http.Request) {
 	}
 
 	batchID := strings.TrimPrefix(r.URL.Path, "/digests/")
-	batchID = strings.TrimSpace(batchID)
-
-	if !inbox.ValidBatchIDRegex.MatchString(batchID) {
+	if batchID == "" || strings.Contains(batchID, "/") {
 		http.NotFound(w, r)
 		return
 	}
@@ -480,22 +835,22 @@ func (s *Server) handleDigestDetail(w http.ResponseWriter, r *http.Request) {
 	digestsDir := filepath.Join(s.dataDir, "digests")
 	art, err := inbox.GetDigest(digestsDir, batchID)
 	if err != nil {
-		if errors.Is(err, os.ErrNotExist) {
+		if errors.Is(err, os.ErrNotExist) || errors.Is(err, inbox.ErrInvalidBatchID) {
 			http.NotFound(w, r)
 			return
 		}
-		http.Error(w, fmt.Sprintf("Failed loading digest: %v", err), http.StatusInternalServerError)
+		http.Error(w, fmt.Sprintf("Failed reading digest: %v", err), http.StatusInternalServerError)
 		return
 	}
 
-	// Attempt to reconstruct source message links from journal if available
+	// Build source map for jump links
 	sourceMap := make(map[string]digest.SourceMessage)
 	eventsDir := filepath.Join(s.exchangeDir, "events")
 	startCur := art.CursorStart
+	endCur := art.CursorEnd
 	if startCur.Version == 0 {
 		startCur.Version = journal.CurrentSchemaVersion
 	}
-	endCur := art.CursorEnd
 	if endCur.Version == 0 {
 		endCur.Version = journal.CurrentSchemaVersion
 	}
@@ -569,6 +924,9 @@ func (s *Server) handleDigestDetail(w http.ResponseWriter, r *http.Request) {
 
 	tzName := s.getDisplayTimezone()
 	vm := detailViewModel{
+		PageTitle:          art.Digest.Title,
+		PageDescription:    fmt.Sprintf("Synthesized on %s via %s (%s)", FormatDisplayTime(art.CreatedAt, tzName), art.Provider, art.Model),
+		ActiveNav:          "inbox",
 		Artifact:           art,
 		CreatedAtFormatted: FormatDisplayTime(art.CreatedAt, tzName),
 		Items:              items,
@@ -597,7 +955,7 @@ func (s *Server) handleWatchlist(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := r.ParseForm(); err != nil {
-		http.Redirect(w, r, "/?error=Failed+parsing+form", http.StatusSeeOther)
+		http.Redirect(w, r, "/channels?error=Failed+parsing+form", http.StatusSeeOther)
 		return
 	}
 
@@ -631,11 +989,11 @@ func (s *Server) handleWatchlist(w http.ResponseWriter, r *http.Request) {
 		ChannelIDs: journal.NormalizeChannelIDs(cleanIDs),
 	}
 	if err := journal.WriteWatchlist(wlPath, newWL); err != nil {
-		http.Redirect(w, r, fmt.Sprintf("/?error=Failed+writing+watchlist:+%s", url.QueryEscape(err.Error())), http.StatusSeeOther)
+		http.Redirect(w, r, fmt.Sprintf("/channels?error=Failed+writing+watchlist:+%s", url.QueryEscape(err.Error())), http.StatusSeeOther)
 		return
 	}
 
-	http.Redirect(w, r, fmt.Sprintf("/?flash=Watchlist+updated+to+generation+%d+(%d+channels)", nextGen, len(cleanIDs)), http.StatusSeeOther)
+	http.Redirect(w, r, fmt.Sprintf("/channels?flash=Watchlist+updated+to+generation+%d+(%d+channels)", nextGen, len(cleanIDs)), http.StatusSeeOther)
 }
 
 func (s *Server) handleLLMSettings(w http.ResponseWriter, r *http.Request) {
@@ -654,7 +1012,7 @@ func (s *Server) handleLLMSettings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := r.ParseForm(); err != nil {
-		http.Redirect(w, r, "/?error=Failed+parsing+form", http.StatusSeeOther)
+		http.Redirect(w, r, "/provider?error=Failed+parsing+form", http.StatusSeeOther)
 		return
 	}
 
@@ -672,11 +1030,11 @@ func (s *Server) handleLLMSettings(w http.ResponseWriter, r *http.Request) {
 		// Optional secret key entered in UI
 		if key := strings.TrimSpace(r.FormValue("gemini_api_key")); key != "" {
 			if s.store.GetGeminiKeySource() == config.SecretSourceEnvironment {
-				http.Redirect(w, r, "/?error=GEMINI_API_KEY+is+managed+by+environment;+UI+override+is+disabled", http.StatusSeeOther)
+				http.Redirect(w, r, "/provider?error=GEMINI_API_KEY+is+managed+by+environment;+UI+override+is+disabled", http.StatusSeeOther)
 				return
 			}
 			if err := s.store.SaveGeminiKey(key); err != nil {
-				http.Redirect(w, r, fmt.Sprintf("/?error=Failed+saving+secret:+%s", url.QueryEscape(err.Error())), http.StatusSeeOther)
+				http.Redirect(w, r, fmt.Sprintf("/provider?error=Failed+saving+secret:+%s", url.QueryEscape(err.Error())), http.StatusSeeOther)
 				return
 			}
 		}
@@ -685,22 +1043,22 @@ func (s *Server) handleLLMSettings(w http.ResponseWriter, r *http.Request) {
 		baseURL := strings.TrimSpace(r.FormValue("local_base_url"))
 		model := strings.TrimSpace(r.FormValue("local_model"))
 		if baseURL == "" || model == "" {
-			http.Redirect(w, r, "/?error=Local+provider+requires+both+Base+URL+and+Model", http.StatusSeeOther)
+			http.Redirect(w, r, "/provider?error=Local+provider+requires+both+Base+URL+and+Model", http.StatusSeeOther)
 			return
 		}
 		cfg.LLM.BaseURL = baseURL
 		cfg.LLM.Model = model
 	} else {
-		http.Redirect(w, r, "/?error=Unsupported+provider", http.StatusSeeOther)
+		http.Redirect(w, r, "/provider?error=Unsupported+provider", http.StatusSeeOther)
 		return
 	}
 
 	if err := s.store.SaveAppConfig(cfg); err != nil {
-		http.Redirect(w, r, fmt.Sprintf("/?error=Failed+saving+config:+%s", url.QueryEscape(err.Error())), http.StatusSeeOther)
+		http.Redirect(w, r, fmt.Sprintf("/provider?error=Failed+saving+config:+%s", url.QueryEscape(err.Error())), http.StatusSeeOther)
 		return
 	}
 
-	http.Redirect(w, r, "/?flash=LLM+settings+saved+successfully", http.StatusSeeOther)
+	http.Redirect(w, r, "/provider?flash=LLM+settings+saved+successfully", http.StatusSeeOther)
 }
 
 func (s *Server) handleLLMTest(w http.ResponseWriter, r *http.Request) {
@@ -728,10 +1086,9 @@ func (s *Server) handleLLMTest(w http.ResponseWriter, r *http.Request) {
 		if model == "" {
 			model = config.DefaultGeminiModel
 		}
-		// Use submitted key or active store key
-		if key := strings.TrimSpace(r.FormValue("gemini_api_key")); key != "" {
-			apiKey = key
-		} else {
+		// If user entered key in input, use it; otherwise use stored/env key
+		apiKey = strings.TrimSpace(r.FormValue("gemini_api_key"))
+		if apiKey == "" {
 			apiKey = s.store.GetGeminiKey()
 		}
 		if apiKey == "" {
@@ -741,12 +1098,13 @@ func (s *Server) handleLLMTest(w http.ResponseWriter, r *http.Request) {
 	} else if providerType == config.ProviderLocal {
 		baseURL = strings.TrimSpace(r.FormValue("local_base_url"))
 		model = strings.TrimSpace(r.FormValue("local_model"))
+		apiKey = strings.TrimSpace(r.FormValue("local_api_key"))
 		if baseURL == "" || model == "" {
-			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "Local provider requires both Base URL and Model"})
+			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "Base URL and Model are required for local provider test"})
 			return
 		}
 	} else {
-		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "Unsupported provider"})
+		writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "Unknown provider: " + providerType})
 		return
 	}
 
@@ -782,7 +1140,7 @@ func (s *Server) handleDigestSettings(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if err := r.ParseForm(); err != nil {
-		http.Redirect(w, r, "/?error=Failed+parsing+form", http.StatusSeeOther)
+		http.Redirect(w, r, "/provider?error=Failed+parsing+form", http.StatusSeeOther)
 		return
 	}
 
@@ -804,11 +1162,11 @@ func (s *Server) handleDigestSettings(w http.ResponseWriter, r *http.Request) {
 	cfg.Digest.IgnoreBots = (r.FormValue("ignore_bots") == "true")
 
 	if err := s.store.SaveAppConfig(cfg); err != nil {
-		http.Redirect(w, r, fmt.Sprintf("/?error=Failed+saving+digest+settings:+%s", url.QueryEscape(err.Error())), http.StatusSeeOther)
+		http.Redirect(w, r, fmt.Sprintf("/provider?error=Failed+saving+digest+settings:+%s", url.QueryEscape(err.Error())), http.StatusSeeOther)
 		return
 	}
 
-	http.Redirect(w, r, "/?flash=Digest+settings+saved+successfully", http.StatusSeeOther)
+	http.Redirect(w, r, "/provider?flash=Digest+settings+saved+successfully", http.StatusSeeOther)
 }
 
 func (s *Server) handleDigestPreview(w http.ResponseWriter, r *http.Request) {
@@ -923,7 +1281,7 @@ func (s *Server) handleCollectorCommand(w http.ResponseWriter, r *http.Request) 
 	if command == "return_normal" {
 		msg = "Normal collection mode requested."
 	}
-	http.Redirect(w, r, "/?flash="+url.QueryEscape(msg), http.StatusSeeOther)
+	http.Redirect(w, r, "/system?flash="+url.QueryEscape(msg), http.StatusSeeOther)
 }
 
 func parseForm(r *http.Request) {
@@ -961,7 +1319,7 @@ func (s *Server) handleTelegramSettings(w http.ResponseWriter, r *http.Request) 
 	if token != "" {
 		if s.store.GetTelegramTokenSource() != config.SecretSourceEnvironment {
 			if err := s.store.SaveTelegramBotToken(token); err != nil {
-				http.Redirect(w, r, fmt.Sprintf("/?error=Failed+saving+token:+%s", url.QueryEscape(err.Error())), http.StatusSeeOther)
+				http.Redirect(w, r, fmt.Sprintf("/telegram?error=Failed+saving+token:+%s", url.QueryEscape(err.Error())), http.StatusSeeOther)
 				return
 			}
 		}
@@ -981,7 +1339,7 @@ func (s *Server) handleTelegramSettings(w http.ResponseWriter, r *http.Request) 
 				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": errMsg})
 				return
 			}
-			http.Redirect(w, r, "/?error="+url.QueryEscape(errMsg), http.StatusSeeOther)
+			http.Redirect(w, r, "/telegram?error="+url.QueryEscape(errMsg), http.StatusSeeOther)
 			return
 		}
 		if chatID == "" {
@@ -990,13 +1348,13 @@ func (s *Server) handleTelegramSettings(w http.ResponseWriter, r *http.Request) 
 				writeJSON(w, http.StatusBadRequest, map[string]any{"ok": false, "error": errMsg})
 				return
 			}
-			http.Redirect(w, r, "/?error="+url.QueryEscape(errMsg), http.StatusSeeOther)
+			http.Redirect(w, r, "/telegram?error="+url.QueryEscape(errMsg), http.StatusSeeOther)
 			return
 		}
 	}
 
 	if err := s.store.SaveDeliveryConfig(delCfg); err != nil {
-		http.Redirect(w, r, fmt.Sprintf("/?error=Failed+saving+delivery+settings:+%s", url.QueryEscape(err.Error())), http.StatusSeeOther)
+		http.Redirect(w, r, fmt.Sprintf("/telegram?error=Failed+saving+delivery+settings:+%s", url.QueryEscape(err.Error())), http.StatusSeeOther)
 		return
 	}
 
@@ -1005,7 +1363,7 @@ func (s *Server) handleTelegramSettings(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 
-	http.Redirect(w, r, "/?flash=Telegram+delivery+settings+saved", http.StatusSeeOther)
+	http.Redirect(w, r, "/telegram?flash=Telegram+delivery+settings+saved", http.StatusSeeOther)
 }
 
 func (s *Server) handleTelegramTest(w http.ResponseWriter, r *http.Request) {
