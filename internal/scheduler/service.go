@@ -11,6 +11,7 @@ import (
 
 	"cordbrief/internal/config"
 	"cordbrief/internal/digest"
+	"cordbrief/internal/journal"
 	"cordbrief/internal/llm"
 )
 
@@ -274,9 +275,11 @@ func (s *Service) Start(ctx context.Context) {
 
 // CoreDigestRunner implements TransactionRunner using the Core pipeline and store.
 type CoreDigestRunner struct {
-	ExchangeDir string
-	DataDir     string
-	Store       *config.Store
+	ExchangeDir      string
+	DataDir          string
+	Store            *config.Store
+	DeliveryPreparer func(batchID string, targetCur journal.Cursor, req *digest.DeliveryRequest) error
+	DeliveryPromoter func(batchID string) error
 }
 
 // RunDigest constructs the pipeline and executes digest.RunTransaction with commit=true.
@@ -303,15 +306,29 @@ func (r *CoreDigestRunner) RunDigest(ctx context.Context, trigger *digest.Trigge
 		Focus:    appCfg.Digest.Focus,
 	})
 
+	delCfg := r.Store.GetDeliveryConfig()
+	shouldDeliver := delCfg.Telegram.Enabled && r.Store.IsTelegramConfigured() && delCfg.Telegram.ChatID != ""
+	var delReq *digest.DeliveryRequest
+	if shouldDeliver {
+		delReq = &digest.DeliveryRequest{
+			Provider:  "telegram",
+			ChatID:    delCfg.Telegram.ChatID,
+			ChatLabel: delCfg.Telegram.ChatLabel,
+		}
+	}
+
 	opts := digest.TransactionOptions{
-		ExchangeDir:  r.ExchangeDir,
-		DataDir:      r.DataDir,
-		IgnoreBots:   appCfg.Digest.IgnoreBots,
-		BatchLimit:   1000,
-		ProviderName: appCfg.LLM.Provider,
-		ModelName:    appCfg.LLM.Model,
-		Commit:       true, // Real committing transaction
-		Trigger:      trigger,
+		ExchangeDir:             r.ExchangeDir,
+		DataDir:                 r.DataDir,
+		IgnoreBots:              appCfg.Digest.IgnoreBots,
+		BatchLimit:              1000,
+		ProviderName:            appCfg.LLM.Provider,
+		ModelName:               appCfg.LLM.Model,
+		Commit:                  true, // Real committing transaction
+		Trigger:                 trigger,
+		DeliveryRequest:         delReq,
+		PrepareDeliveryIntentFn: r.DeliveryPreparer,
+		PromoteDeliveryIntentFn: r.DeliveryPromoter,
 	}
 
 	return digest.RunTransaction(ctx, pipe, opts)

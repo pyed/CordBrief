@@ -1,6 +1,8 @@
 package digest
 
 import (
+	"fmt"
+	"strings"
 	"time"
 
 	"cordbrief/internal/journal"
@@ -75,17 +77,62 @@ type TriggerInfo struct {
 	SlotID string `json:"slot_id,omitempty"` // e.g. "Asia/Riyadh/2026-09-04/08:00"
 }
 
+// IsValidSnowflake validates that s is a canonical Discord decimal snowflake ID.
+// Rejects empty strings, strings over 32 characters, whitespace, non-digits, and path traversal characters.
+func IsValidSnowflake(s string) bool {
+	s = strings.TrimSpace(s)
+	if s == "" || len(s) > 32 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		if s[i] < '0' || s[i] > '9' {
+			return false
+		}
+	}
+	return true
+}
+
+// SourceRef represents the minimal identity metadata required to construct a Discord jump link.
+// It contains strictly NO message content, author text, tokens, attachments, or journal records.
+type SourceRef struct {
+	GuildID   string `json:"guild_id"`
+	ChannelID string `json:"channel_id"`
+	MessageID string `json:"message_id"`
+}
+
+// JumpLink returns the canonical Discord web jump link for the source reference.
+// Returns an empty string if any of GuildID, ChannelID, or MessageID are not valid decimal snowflakes.
+func (r SourceRef) JumpLink() string {
+	g := strings.TrimSpace(r.GuildID)
+	c := strings.TrimSpace(r.ChannelID)
+	msg := strings.TrimSpace(r.MessageID)
+	if !IsValidSnowflake(g) || !IsValidSnowflake(c) || !IsValidSnowflake(msg) {
+		return ""
+	}
+	return fmt.Sprintf("https://discord.com/channels/%s/%s/%s", g, c, msg)
+}
+
+// DeliveryRequest snapshots the exact intended delivery target for a transaction.
+// Contains destination identity only; contains strictly NO credentials or tokens.
+type DeliveryRequest struct {
+	Provider  string `json:"provider"`             // e.g. "telegram"
+	ChatID    string `json:"chat_id"`              // destination chat ID
+	ChatLabel string `json:"chat_label,omitempty"` // optional non-sensitive destination label
+}
+
 // Artifact represents the durable on-disk record of a completed digest.
 type Artifact struct {
-	Version              int            `json:"version"`
-	BatchID              string         `json:"batch_id"`
-	CreatedAt            time.Time      `json:"created_at"`
-	CursorStart          journal.Cursor `json:"cursor_start"`
-	CursorEnd            journal.Cursor `json:"cursor_end"`
-	InputMessageCount    int            `json:"input_message_count"`
-	IncludedMessageCount int            `json:"included_message_count"`
-	Provider             string         `json:"provider"`
-	Model                string         `json:"model"`
-	Trigger              *TriggerInfo   `json:"trigger,omitempty"`
-	Digest               *Digest        `json:"digest"`
+	Version              int                  `json:"version"`
+	BatchID              string               `json:"batch_id"`
+	CreatedAt            time.Time            `json:"created_at"`
+	CursorStart          journal.Cursor       `json:"cursor_start"`
+	CursorEnd            journal.Cursor       `json:"cursor_end"`
+	InputMessageCount    int                  `json:"input_message_count"`
+	IncludedMessageCount int                  `json:"included_message_count"`
+	Provider             string               `json:"provider"`
+	Model                string               `json:"model"`
+	Trigger              *TriggerInfo         `json:"trigger,omitempty"`
+	DeliveryRequest      *DeliveryRequest     `json:"delivery_request,omitempty"`
+	SourceRefs           map[string]SourceRef `json:"source_refs,omitempty"`
+	Digest               *Digest              `json:"digest"`
 }

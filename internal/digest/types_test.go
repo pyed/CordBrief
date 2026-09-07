@@ -79,3 +79,35 @@ func TestArtifact_JSONRoundtrip(t *testing.T) {
 		t.Errorf("mismatch decoded artifact: %+v", decoded)
 	}
 }
+
+func TestSourceRefValidation(t *testing.T) {
+	// 1. Valid snowflakes
+	validRef := SourceRef{
+		GuildID:   "1545114461868658862",
+		ChannelID: "1545115236619518014",
+		MessageID: "1545224975760494715",
+	}
+	expectedURL := "https://discord.com/channels/1545114461868658862/1545115236619518014/1545224975760494715"
+	if link := validRef.JumpLink(); link != expectedURL {
+		t.Errorf("expected %s, got %s", expectedURL, link)
+	}
+
+	// 2. Malicious / malformed inputs must return empty string safely
+	invalidCases := []SourceRef{
+		{GuildID: "", ChannelID: "1545115236619518014", MessageID: "1545224975760494715"},
+		{GuildID: "123/456", ChannelID: "1545115236619518014", MessageID: "1545224975760494715"},
+		{GuildID: "1545114461868658862", ChannelID: "123?query=1", MessageID: "1545224975760494715"},
+		{GuildID: "1545114461868658862", ChannelID: "1545115236619518014", MessageID: "123#frag"},
+		{GuildID: "1545114461868658862", ChannelID: "1545115236619518014", MessageID: "12 34"},
+		{GuildID: "1545114461868658862", ChannelID: "1545115236619518014", MessageID: "abc"},
+		{GuildID: "1545114461868658862", ChannelID: "1545115236619518014", MessageID: "../evil/path"},
+		{GuildID: "12345678901234567890123456789012345", ChannelID: "1", MessageID: "2"}, // > 32 chars
+	}
+
+	for i, c := range invalidCases {
+		if link := c.JumpLink(); link != "" {
+			t.Errorf("case %d: expected empty link for invalid ref %+v, got %s", i, c, link)
+		}
+	}
+}
+

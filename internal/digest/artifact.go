@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"cordbrief/internal/durable"
 )
@@ -73,3 +74,33 @@ func VerifyArtifactMatch(art *Artifact, b *Batch) error {
 	}
 	return nil
 }
+
+// BuildSourceRefs extracts minimal SourceRef identities for all grounded source IDs cited in d.
+// It records strictly identity metadata (guild_id, channel_id, message_id) and NO message content.
+// If d is nil, it returns an empty map.
+func BuildSourceRefs(d *Digest, sourceMap map[string]SourceMessage) map[string]SourceRef {
+	refs := make(map[string]SourceRef)
+	if d == nil {
+		return refs
+	}
+	for _, item := range d.Items {
+		for _, sID := range item.SourceIDs {
+			sIDTrim := strings.TrimSpace(sID)
+			if sIDTrim == "" {
+				continue
+			}
+			if _, exists := refs[sIDTrim]; exists {
+				continue
+			}
+			if sm, ok := sourceMap[sIDTrim]; ok {
+				refs[sIDTrim] = SourceRef{
+					GuildID:   strings.TrimSpace(sm.GuildID),
+					ChannelID: strings.TrimSpace(sm.ChannelID),
+					MessageID: strings.TrimSpace(sm.MessageID),
+				}
+			}
+		}
+	}
+	return refs
+}
+

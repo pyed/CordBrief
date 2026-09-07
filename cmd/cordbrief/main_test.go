@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -595,5 +596,114 @@ func TestCommitLock(t *testing.T) {
 	}
 	l3.Release()
 }
+
+func TestMigrateCommitLock(t *testing.T) {
+	tmpDir := t.TempDir()
+	exchangeDir := filepath.Join(tmpDir, "exchange")
+	eventsDir := filepath.Join(exchangeDir, "events")
+	dataDir := filepath.Join(tmpDir, "data")
+	digestsDir := filepath.Join(dataDir, "digests")
+	_ = os.MkdirAll(eventsDir, 0755)
+	_ = os.MkdirAll(digestsDir, 0755)
+
+	// Create test journal event
+	segPath := filepath.Join(eventsDir, "0000000000000001.ndjson")
+	eventLine := `{"version":1,"event":"message_create","message_id":"1545224975760494701","channel_id":"1545115236619518014","guild_id":"1545114461868658862","timestamp":"2026-09-06T10:00:00Z","author":{"id":"u1","name":"alice"},"content":"test content"}` + "\n"
+	if err := os.WriteFile(segPath, []byte(eventLine), 0644); err != nil {
+		t.Fatal(err)
+	}
+	fi, _ := os.Stat(segPath)
+
+	// Create unmigrated test artifact
+	batchID := "4444444444444444444444444444444444444444444444444444444444444444"
+	artPath := filepath.Join(digestsDir, batchID+".json")
+	artJSON := fmt.Sprintf(`{
+		"version": 1,
+		"batch_id": "%s",
+		"created_at": "2026-09-06T10:00:00Z",
+		"cursor_start": {"version": 1, "segment": 1, "offset": 0},
+		"cursor_end": {"version": 1, "segment": 1, "offset": %d},
+		"input_message_count": 1,
+		"included_message_count": 1,
+		"provider": "gemini",
+		"model": "gemini-3.7-flash",
+		"digest": {
+			"title": "Test Title",
+			"items": [{"kind": "finding", "text": "Test Item", "source_ids": ["S000001"]}]
+		}
+	}`, batchID, fi.Size())
+	if err := os.WriteFile(artPath, []byte(artJSON), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	initialHash := func() [32]byte {
+		b, err := os.ReadFile(artPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return sha256.Sum256(b)
+	}
+	baselineHash := initialHash()
+
+	// A & B: Acquire commit lock (simulating running cordbrief serve)
+	holderLock, err := journal.AcquireCommitLock(dataDir)
+	if err != nil {
+		t.Fatalf("failed acquiring commit lock: %v", err)
+	}
+
+	// Test A: serve/holder owns commit lock -> migrate --dry-run is ALLOWED (read-only)
+	var stdoutA, stderrA bytes.Buffer
+	codeA := Run([]string{"migrate", "--dry-run", "-exchange-dir=" + exchangeDir, "-data-dir=" + dataDir}, &stdoutA, &stderrA)
+	if codeA != 0 {
+		t.Fatalf("Test A failed: expected migrate --dry-run to succeed while lock held, got %d. stderr: %s", codeA, stderrA.String())
+	}
+	if !strings.Contains(stdoutA.String(), "=== DRY-RUN MIGRATION COMPLETE") {
+		t.Fatalf("Test A unexpected stdout: %s", stdoutA.String())
+	}
+	if initialHash() != baselineHash {
+		t.Fatal("Test A: dry-run modified the artifact file!")
+	}
+
+	// Test B: serve/holder owns commit lock -> mutating migrate is REFUSED immediately with zero file modifications
+	var stdoutB, stderrB bytes.Buffer
+	codeB := Run([]string{"migrate", "-exchange-dir=" + exchangeDir, "-data-dir=" + dataDir}, &stdoutB, &stderrB)
+	if codeB != 1 {
+		t.Fatalf("Test B failed: expected mutating migrate to be refused with exit code 1, got %d", codeB)
+	}
+	if !strings.Contains(stderrB.String(), "migrate: acquisition refused:") {
+		t.Fatalf("Test B: expected acquisition refused error, got: %s", stderrB.String())
+	}
+	if initialHash() != baselineHash {
+		t.Fatal("Test B: refused migrate unexpectedly modified the artifact file!")
+	}
+
+	// Test C: lock free -> mutating migrate SUCCEEDS
+	holderLock.Release()
+
+	var stdoutC, stderrC bytes.Buffer
+	codeC := Run([]string{"migrate", "-exchange-dir=" + exchangeDir, "-data-dir=" + dataDir}, &stdoutC, &stderrC)
+	if codeC != 0 {
+		t.Fatalf("Test C failed: expected migrate to succeed when lock free, got %d. stderr: %s", codeC, stderrC.String())
+	}
+	if !strings.Contains(stdoutC.String(), "=== LIVE MIGRATION COMPLETE") {
+		t.Fatalf("Test C unexpected stdout: %s", stdoutC.String())
+	}
+	// Verify artifact was mutated with durable source_refs
+	migratedBytes, err := os.ReadFile(artPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(migratedBytes), `"source_refs"`) {
+		t.Fatal("Test C: expected migrated artifact to contain source_refs")
+	}
+
+	// Test D: kernel lock release verification (lock can be re-acquired cleanly after release)
+	checkLock, err := journal.AcquireCommitLock(dataDir)
+	if err != nil {
+		t.Fatalf("Test D failed: lock was not released after migration: %v", err)
+	}
+	checkLock.Release()
+}
+
 
 

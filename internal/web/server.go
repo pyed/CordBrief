@@ -864,25 +864,27 @@ func (s *Server) handleDigestDetail(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build source map for jump links
+	// Build source map for jump links only if legacy artifact lacks SourceRefs
 	sourceMap := make(map[string]digest.SourceMessage)
-	eventsDir := filepath.Join(s.exchangeDir, "events")
-	startCur := art.CursorStart
-	endCur := art.CursorEnd
-	if startCur.Version == 0 {
-		startCur.Version = journal.CurrentSchemaVersion
-	}
-	if endCur.Version == 0 {
-		endCur.Version = journal.CurrentSchemaVersion
-	}
-	if wm, err := journal.CaptureWatermark(eventsDir); err == nil && wm != nil {
-		reader := journal.NewReader(eventsDir, wm)
-		records, _, err := reader.ReadBatch(startCur, art.InputMessageCount+100)
-		if err == nil && len(records) > 0 {
-			cat, _ := catalog.Load(s.exchangeDir)
-			batch, err := digest.BuildBatch(records, startCur, endCur, wm, false, cat)
-			if err == nil && batch != nil {
-				sourceMap = batch.SourceMap
+	if len(art.SourceRefs) == 0 {
+		eventsDir := filepath.Join(s.exchangeDir, "events")
+		startCur := art.CursorStart
+		endCur := art.CursorEnd
+		if startCur.Version == 0 {
+			startCur.Version = journal.CurrentSchemaVersion
+		}
+		if endCur.Version == 0 {
+			endCur.Version = journal.CurrentSchemaVersion
+		}
+		if wm, err := journal.CaptureWatermark(eventsDir); err == nil && wm != nil {
+			reader := journal.NewReader(eventsDir, wm)
+			records, _, err := reader.ReadBatch(startCur, art.InputMessageCount+100)
+			if err == nil && len(records) > 0 {
+				cat, _ := catalog.Load(s.exchangeDir)
+				batch, err := digest.BuildBatch(records, startCur, endCur, wm, false, cat)
+				if err == nil && batch != nil {
+					sourceMap = batch.SourceMap
+				}
 			}
 		}
 	}
@@ -902,7 +904,9 @@ func (s *Server) handleDigestDetail(w http.ResponseWriter, r *http.Request) {
 					continue
 				}
 				var jumpURL string
-				if sm, ok := sourceMap[sIDTrim]; ok {
+				if ref, ok := art.SourceRefs[sIDTrim]; ok {
+					jumpURL = ref.JumpLink()
+				} else if sm, ok := sourceMap[sIDTrim]; ok {
 					jumpURL = digest.JumpLink(sm)
 				}
 				label := sIDTrim

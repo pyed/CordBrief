@@ -52,7 +52,7 @@ func BuildSourceDisplayMap(d *digest.Digest) map[string]string {
 // RenderTelegramHTML formats a structured digest artifact into one or more Unicode-safe HTML chunks.
 // All user and LLM content is strictly escaped with html.EscapeString to prevent HTML injection.
 // Source references are presented as clickable 1-based numbers ("1, 2") backed by stable digest-wide mapping.
-func RenderTelegramHTML(d *digest.Digest, sourceMap map[string]digest.SourceMessage) []string {
+func RenderTelegramHTML(d *digest.Digest, sourceMap map[string]digest.SourceMessage, sourceRefs ...map[string]digest.SourceRef) []string {
 	if d == nil {
 		return nil
 	}
@@ -105,7 +105,12 @@ func RenderTelegramHTML(d *digest.Digest, sourceMap map[string]digest.SourceMess
 			}
 			escapedLabel := html.EscapeString(displayLabel)
 			var jumpURL string
-			if sourceMap != nil {
+			if len(sourceRefs) > 0 && sourceRefs[0] != nil {
+				if ref, ok := sourceRefs[0][sIDTrim]; ok {
+					jumpURL = ref.JumpLink()
+				}
+			}
+			if jumpURL == "" && sourceMap != nil {
 				if sm, ok := sourceMap[sIDTrim]; ok {
 					jumpURL = digest.JumpLink(sm)
 				}

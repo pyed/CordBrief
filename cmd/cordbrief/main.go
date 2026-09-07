@@ -88,6 +88,9 @@ func Run(args []string, stdout, stderr io.Writer) int {
 	case "lock-probe":
 		return runLockProbe(subArgs, stdout, stderr)
 
+	case "migrate":
+		return runMigrate(subArgs, stdout, stderr)
+
 	case "help", "-help", "--help", "-h":
 		printUsage(stdout)
 		return 0
@@ -590,14 +593,58 @@ func runDigest(args []string, stdout, stderr io.Writer) int {
 		defer commitLock.Release()
 	}
 
+	var delSvc *delivery.Service
+	var delReq *digest.DeliveryRequest
+	if commit && *deliverFlag {
+		actualDataDir := getDataDir(*dataDir)
+		actualExchangeDir := getExchangeDir(*exchangeDir)
+		store, storeErr := config.NewStore(actualDataDir, *cfgPath)
+		if storeErr != nil {
+			fmt.Fprintf(stderr, "error initializing config store: %v\n", storeErr)
+			return 1
+		}
+		delCfg := store.GetDeliveryConfig()
+		if !delCfg.Telegram.Enabled || !store.IsTelegramConfigured() || delCfg.Telegram.ChatID == "" {
+			fmt.Fprintln(stderr, "error: --deliver specified but Telegram is not enabled or configured")
+			return 1
+		}
+		delReq = &digest.DeliveryRequest{
+			Provider:  "telegram",
+			ChatID:    delCfg.Telegram.ChatID,
+			ChatLabel: delCfg.Telegram.ChatLabel,
+		}
+		var svcErr error
+		delSvc, svcErr = delivery.NewService(delivery.ServiceOptions{
+			DataDir:     actualDataDir,
+			ExchangeDir: actualExchangeDir,
+			Store:       store,
+		})
+		if svcErr != nil {
+			fmt.Fprintf(stderr, "error initializing delivery service: %v\n", svcErr)
+			return 1
+		}
+	}
+
 	opts := digest.TransactionOptions{
-		ExchangeDir:  getExchangeDir(*exchangeDir),
-		DataDir:      getDataDir(*dataDir),
-		IgnoreBots:   ignoreBots,
-		BatchLimit:   *limit,
-		ProviderName: providerType,
-		ModelName:    llmModel,
-		Commit:       commit,
+		ExchangeDir:     getExchangeDir(*exchangeDir),
+		DataDir:         getDataDir(*dataDir),
+		IgnoreBots:      ignoreBots,
+		BatchLimit:      *limit,
+		ProviderName:    providerType,
+		ModelName:       llmModel,
+		Commit:          commit,
+		DeliveryRequest: delReq,
+	}
+
+	if delSvc != nil {
+		opts.PrepareDeliveryIntentFn = func(batchID string, targetCur journal.Cursor, req *digest.DeliveryRequest) error {
+			_, err := delSvc.PrepareDeliveryIntent(batchID, targetCur, req)
+			return err
+		}
+		opts.PromoteDeliveryIntentFn = func(batchID string) error {
+			_, err := delSvc.PromoteDeliveryIntent(batchID)
+			return err
+		}
 	}
 
 	res, err := digest.RunTransaction(context.Background(), pipe, opts)
@@ -639,26 +686,12 @@ func runDigest(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintln(stdout, "\n--- Rendered Digest ---")
 	fmt.Fprint(stdout, digest.RenderMarkdown(res.Digest, res.Batch))
 
-	if commit && *deliverFlag && res != nil && res.Artifact != nil {
-		actualDataDir := getDataDir(*dataDir)
-		actualExchangeDir := getExchangeDir(*exchangeDir)
-		store, storeErr := config.NewStore(actualDataDir, *cfgPath)
-		if storeErr == nil {
-			delSvc, svcErr := delivery.NewService(delivery.ServiceOptions{
-				DataDir:     actualDataDir,
-				ExchangeDir: actualExchangeDir,
-				Store:       store,
-			})
-			if svcErr == nil {
-				delRec, delErr := delSvc.DeliverBatch(context.Background(), res.Artifact.BatchID, false)
-				if delErr != nil {
-					fmt.Fprintf(stderr, "\n[WARN] Telegram delivery failed: %v\n", delErr)
-				} else if delRec != nil {
-					fmt.Fprintf(stdout, "\n[PASS] Delivered to Telegram (batch: %s, parts: %d)\n", res.Artifact.BatchID, delRec.TotalParts)
-				}
-			} else {
-				fmt.Fprintf(stderr, "\n[WARN] Failed initializing delivery service: %v\n", svcErr)
-			}
+	if delSvc != nil && res != nil && res.Artifact != nil {
+		delRec, delErr := delSvc.DeliverBatch(context.Background(), res.Artifact.BatchID, false)
+		if delErr != nil {
+			fmt.Fprintf(stderr, "\n[WARN] Telegram delivery failed: %v\n", delErr)
+		} else if delRec != nil {
+			fmt.Fprintf(stdout, "\n[PASS] Delivered to Telegram (batch: %s, parts: %d)\n", res.Artifact.BatchID, delRec.TotalParts)
 		}
 	}
 
@@ -733,13 +766,6 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 
-	digestLock := &sync.Mutex{}
-	runner := &scheduler.CoreDigestRunner{
-		ExchangeDir: actualExchangeDir,
-		DataDir:     actualDataDir,
-		Store:       store,
-	}
-
 	deliveryService, err := delivery.NewService(delivery.ServiceOptions{
 		DataDir:     actualDataDir,
 		ExchangeDir: actualExchangeDir,
@@ -750,6 +776,21 @@ func runServe(args []string, stdout, stderr io.Writer) int {
 		return 1
 	}
 	defer deliveryService.Close()
+
+	digestLock := &sync.Mutex{}
+	runner := &scheduler.CoreDigestRunner{
+		ExchangeDir: actualExchangeDir,
+		DataDir:     actualDataDir,
+		Store:       store,
+		DeliveryPreparer: func(batchID string, targetCur journal.Cursor, req *digest.DeliveryRequest) error {
+			_, err := deliveryService.PrepareDeliveryIntent(batchID, targetCur, req)
+			return err
+		},
+		DeliveryPromoter: func(batchID string) error {
+			_, err := deliveryService.PromoteDeliveryIntent(batchID)
+			return err
+		},
+	}
 
 	sched, err := scheduler.NewService(scheduler.ServiceOptions{
 		Store:            store,
@@ -866,6 +907,60 @@ func runLockProbe(args []string, stdout, stderr io.Writer) int {
 	}
 	return 0
 }
+
+func runMigrate(args []string, stdout, stderr io.Writer) int {
+	fs := flag.NewFlagSet("migrate", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dryRun := fs.Bool("dry-run", false, "dry run without modifying artifacts")
+	exchangeDir := fs.String("exchange-dir", "", "path to exchange directory")
+	dataDir := fs.String("data-dir", "", "path to data directory")
+
+	if err := fs.Parse(args); err != nil {
+		return 2
+	}
+
+	actualExchangeDir := getExchangeDir(*exchangeDir)
+	actualDataDir := getDataDir(*dataDir)
+
+	if !*dryRun {
+		commitLock, err := journal.AcquireCommitLock(actualDataDir)
+		if err != nil {
+			fmt.Fprintf(stderr, "migrate: acquisition refused: %v\n", err)
+			return 1
+		}
+		defer commitLock.Release()
+	}
+
+	reports, err := digest.MigrateArtifacts(actualExchangeDir, actualDataDir, *dryRun)
+	if err != nil {
+		fmt.Fprintf(stderr, "migration error: %v\n", err)
+		return 1
+	}
+
+	modeLabel := "LIVE MIGRATION"
+	if *dryRun {
+		modeLabel = "DRY-RUN MIGRATION"
+	}
+	fmt.Fprintf(stdout, "=== Artifact SourceRef %s (Count: %d) ===\n", modeLabel, len(reports))
+	allEligible := true
+	for _, r := range reports {
+		fmt.Fprintf(stdout, "Batch ID:          %s\n", r.BatchID)
+		fmt.Fprintf(stdout, "  Cited Sources:   %d\n", r.SourceCount)
+		fmt.Fprintf(stdout, "  Resolved:        %d\n", r.ResolvedCount)
+		fmt.Fprintf(stdout, "  Eligible:        %t\n", r.Eligible)
+		fmt.Fprintf(stdout, "  AlreadyMigrated: %t\n", r.AlreadyMigrated)
+		if !r.Eligible {
+			allEligible = false
+		}
+	}
+	if !allEligible {
+		fmt.Fprintln(stderr, "error: one or more artifacts could not be fully resolved")
+		return 1
+	}
+	fmt.Fprintf(stdout, "=== %s COMPLETE (All Eligible: true) ===\n", modeLabel)
+	return 0
+}
+
 
 
 

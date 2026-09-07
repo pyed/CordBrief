@@ -18,14 +18,17 @@ type Summarizer interface {
 
 // TransactionOptions contains parameters for running the digest transaction.
 type TransactionOptions struct {
-	ExchangeDir  string
-	DataDir      string
-	IgnoreBots   bool
-	BatchLimit   int
-	ProviderName string
-	ModelName    string
-	Commit       bool // true for 'run', false for 'preview'
-	Trigger      *TriggerInfo
+	ExchangeDir             string
+	DataDir                 string
+	IgnoreBots              bool
+	BatchLimit              int
+	ProviderName            string
+	ModelName               string
+	Commit                  bool // true for 'run', false for 'preview'
+	Trigger                 *TriggerInfo
+	DeliveryRequest         *DeliveryRequest
+	PrepareDeliveryIntentFn func(batchID string, targetCur journal.Cursor, req *DeliveryRequest) error
+	PromoteDeliveryIntentFn func(batchID string) error
 }
 
 // TransactionResult encapsulates the outcome of a digest transaction execution.
@@ -40,7 +43,7 @@ type TransactionResult struct {
 	AllExcluded      bool
 }
 
-// RunTransaction coordinates the 10-step atomic processing transaction.
+// RunTransaction coordinates the 11-step atomic processing transaction.
 func RunTransaction(ctx context.Context, s Summarizer, opts TransactionOptions) (*TransactionResult, error) {
 	if opts.BatchLimit <= 0 {
 		opts.BatchLimit = 1000
@@ -56,26 +59,25 @@ func RunTransaction(ctx context.Context, s Summarizer, opts TransactionOptions) 
 	eventsDir := filepath.Join(opts.ExchangeDir, "events")
 	digestsDir := filepath.Join(opts.DataDir, "digests")
 
-	// 1. Load committed cursor
+	// 1. Read cursor from exchange/core-ack.json
 	cur, err := journal.LoadCursor(ackPath)
 	if err != nil {
 		return nil, fmt.Errorf("load cursor: %w", err)
 	}
 
-	// 2. Capture finite watermark
+	// 2. Capture read watermark
 	wm, err := journal.CaptureWatermark(eventsDir)
 	if err != nil {
 		return nil, fmt.Errorf("capture watermark: %w", err)
 	}
 
-	// 3. Read complete records up to watermark
+	// 3. Sequential segment read up to limit or watermark
 	reader := journal.NewReader(eventsDir, wm)
 	records, nextCur, err := reader.ReadBatch(*cur, opts.BatchLimit)
 	if err != nil {
 		return nil, fmt.Errorf("read batch: %w", err)
 	}
 
-	// Case A: Zero new records
 	if len(records) == 0 {
 		return &TransactionResult{
 			Empty:           true,
@@ -83,18 +85,19 @@ func RunTransaction(ctx context.Context, s Summarizer, opts TransactionOptions) 
 		}, nil
 	}
 
-	// 4. Construct deterministic DigestBatch
+	// 4. Batch Construction & Ingestion filtering
 	cat, _ := catalog.Load(opts.ExchangeDir)
 	batch, err := BuildBatch(records, *cur, nextCur, wm, opts.IgnoreBots, cat)
 	if err != nil {
 		return nil, fmt.Errorf("build batch: %w", err)
 	}
 
-	// Case B: All records excluded (e.g. all bots)
 	if len(batch.IncludedMessages) == 0 {
+		// All messages were excluded by filter (e.g. bots or non-watched channels).
+		// Advance cursor without invoking LLM or creating artifact.
 		if opts.Commit {
 			if err := journal.SaveCursor(ackPath, &nextCur); err != nil {
-				return nil, fmt.Errorf("commit cursor for excluded batch: %w", err)
+				return nil, fmt.Errorf("commit cursor for empty filtered batch: %w", err)
 			}
 		}
 		return &TransactionResult{
@@ -113,8 +116,19 @@ func RunTransaction(ctx context.Context, s Summarizer, opts TransactionOptions) 
 		}
 
 		if opts.Commit {
+			// Reconstruct PREPARED intent from ARTIFACT's DeliveryRequest (not current config!)
+			if existingArt.DeliveryRequest != nil && opts.PrepareDeliveryIntentFn != nil {
+				if err := opts.PrepareDeliveryIntentFn(existingArt.BatchID, nextCur, existingArt.DeliveryRequest); err != nil {
+					return nil, fmt.Errorf("prepare delivery intent on idempotent replay: %w", err)
+				}
+			}
 			if err := journal.SaveCursor(ackPath, &nextCur); err != nil {
 				return nil, fmt.Errorf("commit cursor on idempotent replay: %w", err)
+			}
+			if existingArt.DeliveryRequest != nil && opts.PromoteDeliveryIntentFn != nil {
+				if err := opts.PromoteDeliveryIntentFn(existingArt.BatchID); err != nil {
+					return nil, fmt.Errorf("promote delivery intent on idempotent replay: %w", err)
+				}
 			}
 		}
 
@@ -157,6 +171,8 @@ func RunTransaction(ctx context.Context, s Summarizer, opts TransactionOptions) 
 		Provider:             opts.ProviderName,
 		Model:                opts.ModelName,
 		Trigger:              opts.Trigger,
+		DeliveryRequest:      opts.DeliveryRequest,
+		SourceRefs:           BuildSourceRefs(d, batch.SourceMap),
 		Digest:               d,
 	}
 
@@ -184,9 +200,23 @@ func RunTransaction(ctx context.Context, s Summarizer, opts TransactionOptions) 
 		return nil, fmt.Errorf("verify saved artifact on disk: %w", err)
 	}
 
-	// 10. ONLY AFTER artifact persistence succeeds: commit journal cursor
+	// 9b. BEFORE cursor commit: persist durable PREPARED delivery intent (outbox) if requested
+	if opts.DeliveryRequest != nil && opts.PrepareDeliveryIntentFn != nil {
+		if err := opts.PrepareDeliveryIntentFn(art.BatchID, nextCur, opts.DeliveryRequest); err != nil {
+			return nil, fmt.Errorf("prepare delivery intent: %w", err)
+		}
+	}
+
+	// 10. ONLY AFTER artifact and PREPARED delivery intent persistence succeed: commit journal cursor
 	if err := journal.SaveCursor(ackPath, &nextCur); err != nil {
 		return nil, fmt.Errorf("commit cursor: %w", err)
+	}
+
+	// 11. ONLY AFTER cursor commit: promote PREPARED delivery intent to sendable PENDING
+	if opts.DeliveryRequest != nil && opts.PromoteDeliveryIntentFn != nil {
+		if err := opts.PromoteDeliveryIntentFn(art.BatchID); err != nil {
+			return nil, fmt.Errorf("promote delivery intent: %w", err)
+		}
 	}
 
 	return &TransactionResult{

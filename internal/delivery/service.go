@@ -18,6 +18,14 @@ import (
 	"cordbrief/internal/journal"
 )
 
+// testHookBeforeSuccessPersist allows deterministic testing of process death
+// immediately after network receipt but prior to local disk persistence.
+var testHookBeforeSuccessPersist func()
+
+// testHookConfirmationSave allows deterministic testing of local disk persistence failure
+// specifically when persisting the confirmed delivery state after network success.
+var testHookConfirmationSave func(rec *DeliveryRecord) error
+
 // Service coordinates Telegram delivery of digests.
 type Service struct {
 	mu           sync.Mutex
@@ -111,66 +119,222 @@ func (s *Service) GetDelivery(batchID string) (*DeliveryRecord, error) {
 	return rec, nil
 }
 
-// Enqueue adds a batch to the delivery queue.
-func (s *Service) Enqueue(batchID string) error {
+// PrepareDeliveryIntent atomically creates a non-sendable PREPARED delivery record on disk.
+// It snapshots destination identity and the intended target cursor boundary.
+func (s *Service) PrepareDeliveryIntent(batchID string, targetCur journal.Cursor, req *digest.DeliveryRequest) (*DeliveryRecord, error) {
 	trimmed := strings.TrimSpace(batchID)
 	if err := digest.ValidateBatchID(trimmed); err != nil {
-		return fmt.Errorf("invalid batch_id: %w", err)
+		return nil, fmt.Errorf("invalid batch_id: %w", err)
 	}
 
-	// Create or ensure initial pending delivery record
 	rec, err := s.GetDelivery(trimmed)
 	if err != nil {
-		return err
+		return nil, err
+	}
+	if rec != nil {
+		return rec, nil
 	}
 
-	cfg := s.store.GetDeliveryConfig()
+	destID := ""
+	destLabel := ""
+	if req != nil {
+		destID = req.ChatID
+		destLabel = req.ChatLabel
+	} else {
+		delCfg := s.store.GetDeliveryConfig()
+		destID = delCfg.Telegram.ChatID
+		destLabel = delCfg.Telegram.ChatLabel
+	}
+
+	rec = &DeliveryRecord{
+		Version:          CurrentDeliveryRecordVersion,
+		DigestBatchID:    trimmed,
+		DestinationID:    destID,
+		DestinationLabel: destLabel,
+		State:            StatePrepared,
+		TargetCursorEnd:  &targetCur,
+		CreatedAt:        time.Now().UTC(),
+		UpdatedAt:        time.Now().UTC(),
+	}
+	if err := SaveDeliveryRecord(s.dataDir, rec); err != nil {
+		return nil, err
+	}
+	return rec, nil
+}
+
+// PromoteDeliveryIntent atomically transitions a PREPARED delivery record to sendable PENDING
+// and signals the background worker.
+func (s *Service) PromoteDeliveryIntent(batchID string) (*DeliveryRecord, error) {
+	trimmed := strings.TrimSpace(batchID)
+	if err := digest.ValidateBatchID(trimmed); err != nil {
+		return nil, fmt.Errorf("invalid batch_id: %w", err)
+	}
+
+	rec, err := s.GetDelivery(trimmed)
+	if err != nil {
+		return nil, err
+	}
 	if rec == nil {
-		rec = &DeliveryRecord{
-			DigestBatchID:    trimmed,
-			DestinationID:    cfg.Telegram.ChatID,
-			DestinationLabel: cfg.Telegram.ChatLabel,
-			State:            StatePending,
-			CreatedAt:        time.Now().UTC(),
-			UpdatedAt:        time.Now().UTC(),
-		}
+		return nil, fmt.Errorf("delivery record not found for batch %s", trimmed)
+	}
+
+	if rec.State == StatePrepared {
+		rec.State = StatePending
+		rec.UpdatedAt = time.Now().UTC()
 		if err := SaveDeliveryRecord(s.dataDir, rec); err != nil {
-			return err
+			return nil, fmt.Errorf("promote to pending: %w", err)
+		}
+		s.WakeWorker(trimmed)
+	} else if rec.State == StatePending {
+		s.WakeWorker(trimmed)
+	}
+	return rec, nil
+}
+
+// EnsureDeliveryIntent is a convenience helper for manual/CLI operations.
+// Creates prepared intent and promotes to pending if transaction is committed.
+func (s *Service) EnsureDeliveryIntent(batchID string) (*DeliveryRecord, error) {
+	trimmed := strings.TrimSpace(batchID)
+	if err := digest.ValidateBatchID(trimmed); err != nil {
+		return nil, fmt.Errorf("invalid batch_id: %w", err)
+	}
+
+	rec, err := s.GetDelivery(trimmed)
+	if err != nil {
+		return nil, err
+	}
+	if rec != nil {
+		if rec.State == StatePrepared {
+			return s.PromoteDeliveryIntent(trimmed)
+		}
+		return rec, nil
+	}
+
+	delCfg := s.store.GetDeliveryConfig()
+	req := &digest.DeliveryRequest{
+		Provider:  "telegram",
+		ChatID:    delCfg.Telegram.ChatID,
+		ChatLabel: delCfg.Telegram.ChatLabel,
+	}
+
+	var targetCur journal.Cursor
+	if art, err := s.inboxService.GetDigest(trimmed); err == nil && art != nil {
+		targetCur = art.CursorEnd
+		if art.DeliveryRequest != nil {
+			req = art.DeliveryRequest
 		}
 	}
 
+	if _, err := s.PrepareDeliveryIntent(trimmed, targetCur, req); err != nil {
+		return nil, err
+	}
+	return s.PromoteDeliveryIntent(trimmed)
+}
+
+// WakeWorker wakes the background delivery worker for batchID if queue has capacity.
+// If queue is full, the pending state remains safely durable on disk and is picked up by ScanAndResume.
+func (s *Service) WakeWorker(batchID string) {
+	trimmed := strings.TrimSpace(batchID)
 	select {
 	case s.queue <- trimmed:
-		return nil
 	default:
-		// Queue full, state is safely persisted as pending and will be picked up
-		return nil
+		// Queue full; pending record is durable and discovered by ScanAndResume
 	}
 }
 
-// ScanAndResume inspects persisted delivery records on disk and resumes pending attempts.
+// Enqueue ensures durable delivery intent on disk and signals the background worker.
+func (s *Service) Enqueue(batchID string) error {
+	trimmed := strings.TrimSpace(batchID)
+	if _, err := s.EnsureDeliveryIntent(trimmed); err != nil {
+		return err
+	}
+	s.WakeWorker(trimmed)
+	return nil
+}
+
+// ScanAndResume inspects persisted delivery records on disk and resumes safe pending attempts.
 // CRITICAL: Does NOT automatically touch StateUncertain, StateSent, or StateFailed.
+// Promotes StatePrepared ONLY if Core ack has advanced to or past target cursor end.
+// Marks StateSending as StateUncertain if an unresolved in-flight attempt is detected.
 func (s *Service) ScanAndResume(ctx context.Context) {
+	ackPath := filepath.Join(s.exchangeDir, journal.DefaultAckFilename)
+	ackCur, ackErr := journal.LoadCursor(ackPath)
+
 	deliveriesDir := filepath.Join(s.dataDir, "deliveries")
 	entries, err := os.ReadDir(deliveriesDir)
-	if err != nil {
-		return
+	if err == nil {
+		for _, entry := range entries {
+			if !entry.IsDir() {
+				continue
+			}
+			batchID := entry.Name()
+			rec, err := LoadDeliveryRecord(s.dataDir, batchID)
+			if err != nil || rec == nil {
+				continue
+			}
+
+			switch rec.State {
+			case StatePrepared:
+				// Check Core ack against target cursor end
+				targetCur := rec.TargetCursorEnd
+				if targetCur == nil {
+					if art, err := s.inboxService.GetDigest(batchID); err == nil && art != nil {
+						targetCur = &art.CursorEnd
+					}
+				}
+				if ackErr == nil && targetCur != nil && CursorAtOrPast(*ackCur, *targetCur) {
+					log.Printf("[Delivery] Promoting committed prepared delivery for batch %s", batchID)
+					_, _ = s.PromoteDeliveryIntent(batchID)
+				} else {
+					log.Printf("[Delivery] Batch %s remains PREPARED (uncommitted cursor)", batchID)
+				}
+
+			case StatePending:
+				log.Printf("[Delivery] Resuming pending delivery for batch %s", batchID)
+				s.WakeWorker(batchID)
+
+			case StateSending:
+				if rec.InFlightPart != nil {
+					log.Printf("[Delivery] Batch %s has unresolved in-flight part %d -> marking UNCERTAIN", batchID, *rec.InFlightPart)
+					rec.State = StateUncertain
+					rec.LastSafeError = fmt.Sprintf("interrupted while part %d was in-flight; outcome is uncertain", *rec.InFlightPart)
+					rec.InFlightPart = nil
+					_ = SaveDeliveryRecord(s.dataDir, rec)
+				} else {
+					log.Printf("[Delivery] Resuming sending delivery for batch %s from part %d", batchID, rec.NextPart)
+					s.WakeWorker(batchID)
+				}
+
+			case StateSent, StateFailed, StateUncertain:
+				// Do not touch
+			}
+		}
 	}
 
-	for _, entry := range entries {
-		if !entry.IsDir() {
-			continue
-		}
-		batchID := entry.Name()
-		rec, err := LoadDeliveryRecord(s.dataDir, batchID)
-		if err != nil || rec == nil {
-			continue
-		}
-
-		// Only resume pending, or sending (which was interrupted by process restart)
-		if rec.State == StatePending || rec.State == StateSending {
-			log.Printf("[Delivery] Resuming pending delivery for batch %s", batchID)
-			_ = s.Enqueue(batchID)
+	// Reconcile artifacts where durable metadata proves delivery was requested
+	// Do NOT automatically infer historical intent if DeliveryRequest is absent
+	digestsDir := filepath.Join(s.dataDir, "digests")
+	artEntries, err := os.ReadDir(digestsDir)
+	if err == nil {
+		for _, entry := range artEntries {
+			if !entry.IsDir() {
+				continue
+			}
+			batchID := entry.Name()
+			art, err := digest.LoadArtifact(digestsDir, batchID)
+			if err != nil || art == nil {
+				continue
+			}
+			if art.DeliveryRequest != nil {
+				rec, err := s.GetDelivery(batchID)
+				if err == nil && rec == nil {
+					log.Printf("[Delivery] Reconciling missing outbox for requested delivery batch %s", batchID)
+					_, _ = s.PrepareDeliveryIntent(batchID, art.CursorEnd, art.DeliveryRequest)
+					if ackErr == nil && CursorAtOrPast(*ackCur, art.CursorEnd) {
+						_, _ = s.PromoteDeliveryIntent(batchID)
+					}
+				}
+			}
 		}
 	}
 }
@@ -203,12 +367,17 @@ func (s *Service) DeliverBatch(ctx context.Context, batchID string, force bool) 
 		}
 	}
 
-	// 1. Guard against duplicate sending of already sent digests
+	// 1. Guard against sending prepared records whose transaction is uncommitted (structurally non-sendable, even with force)
+	if rec.State == StatePrepared {
+		return rec, fmt.Errorf("delivery intent is prepared but transaction is not yet committed")
+	}
+
+	// 2. Guard against duplicate sending of already sent digests
 	if rec.State == StateSent && !force {
 		return rec, nil
 	}
 
-	// 2. Guard against automatic retry of ambiguous/uncertain outcomes
+	// 3. Guard against automatic retry of ambiguous/uncertain outcomes
 	if rec.State == StateUncertain && !force {
 		return rec, fmt.Errorf("delivery outcome is uncertain; operator confirmation required")
 	}
@@ -217,15 +386,16 @@ func (s *Service) DeliverBatch(ctx context.Context, batchID string, force bool) 
 	if force && (rec.State == StateUncertain || rec.State == StateFailed) {
 		rec.State = StatePending
 		rec.LastSafeError = ""
+		rec.InFlightPart = nil
 	}
 
-	// Ensure destination is current
+	// Ensure destination is set
 	if rec.DestinationID == "" {
 		rec.DestinationID = delCfg.Telegram.ChatID
 		rec.DestinationLabel = delCfg.Telegram.ChatLabel
 	}
 
-	// 3. Verify Telegram configuration
+	// 4. Verify Telegram configuration
 	token := s.store.GetTelegramBotToken()
 	if token == "" {
 		rec.State = StateFailed
@@ -241,7 +411,7 @@ func (s *Service) DeliverBatch(ctx context.Context, batchID string, force bool) 
 		return rec, errors.New(rec.LastSafeError)
 	}
 
-	// 4. Load durable digest artifact
+	// 5. Load durable digest artifact
 	art, err := s.inboxService.GetDigest(trimmedID)
 	if err != nil {
 		rec.State = StateFailed
@@ -250,11 +420,14 @@ func (s *Service) DeliverBatch(ctx context.Context, batchID string, force bool) 
 		return rec, errors.New(rec.LastSafeError)
 	}
 
-	// 5. Reconstruct source message jump links if journal available
-	sourceMap := s.reconstructSourceMap(art)
+	// 6. Reconstruct source message jump links only if legacy artifact lacks SourceRefs
+	var sourceMap map[string]digest.SourceMessage
+	if len(art.SourceRefs) == 0 {
+		sourceMap = s.reconstructSourceMap(art)
+	}
 
-	// 6. Render HTML chunks deterministically
-	chunks := RenderTelegramHTML(art.Digest, sourceMap)
+	// 7. Render HTML chunks deterministically
+	chunks := RenderTelegramHTML(art.Digest, sourceMap, art.SourceRefs)
 	if len(chunks) == 0 {
 		rec.State = StateFailed
 		rec.LastSafeError = "digest rendered 0 message chunks"
@@ -269,15 +442,23 @@ func (s *Service) DeliverBatch(ctx context.Context, batchID string, force bool) 
 
 	client := s.clientGetter(token)
 
-	// 7. Send multipart chunks sequentially; NEVER resend already-confirmed parts
+	// 8. Send multipart chunks sequentially; NEVER resend already-confirmed parts
 	for i := rec.NextPart; i < len(chunks); i++ {
 		chunkText := chunks[i]
+
+		// Record in-flight attempt on disk BEFORE sending over the network
+		partIdx := i
+		rec.InFlightPart = &partIdx
+		rec.State = StateSending
+		rec.UpdatedAt = time.Now().UTC()
+		if err := SaveDeliveryRecord(s.dataDir, rec); err != nil {
+			return rec, fmt.Errorf("persist in-flight state: %w", err)
+		}
 
 		result, err := client.SendMessage(ctx, rec.DestinationID, chunkText)
 		if err != nil {
 			var apiErr *APIError
 			if errors.As(err, &apiErr) && apiErr.ErrorCode == 429 && apiErr.RetryAfter > 0 {
-				// Rate limit: back off if reasonable
 				if apiErr.RetryAfter <= 5 {
 					select {
 					case <-ctx.Done():
@@ -290,6 +471,7 @@ func (s *Service) DeliverBatch(ctx context.Context, batchID string, force bool) 
 		}
 
 		if err != nil {
+			rec.InFlightPart = nil
 			if errors.Is(err, ErrAmbiguousTransport) {
 				rec.State = StateUncertain
 				rec.LastSafeError = sanitizeDescription(err.Error(), token)
@@ -303,18 +485,34 @@ func (s *Service) DeliverBatch(ctx context.Context, batchID string, force bool) 
 			return rec, err
 		}
 
-		// Confirmed part delivered! Record progress immediately
-		rec.TelegramMessageIDs = append(rec.TelegramMessageIDs, result.MessageID)
-		rec.NextPart = i + 1
-		rec.LastSafeError = ""
-		if rec.NextPart >= rec.TotalParts {
-			rec.State = StateSent
+		// Confirmed part delivered!
+		if testHookBeforeSuccessPersist != nil {
+			testHookBeforeSuccessPersist()
+		}
+
+		// Construct candidate confirmed state without mutating in-memory rec yet
+		candidate := *rec
+		candidate.TelegramMessageIDs = append(append([]int64(nil), rec.TelegramMessageIDs...), result.MessageID)
+		candidate.NextPart = i + 1
+		candidate.InFlightPart = nil
+		candidate.LastSafeError = ""
+		if candidate.NextPart >= candidate.TotalParts {
+			candidate.State = StateSent
 		} else {
-			rec.State = StateSending
+			candidate.State = StateSending
 		}
-		if saveErr := SaveDeliveryRecord(s.dataDir, rec); saveErr != nil {
-			log.Printf("[Delivery] Warning: failed saving multipart delivery progress: %v", saveErr)
+		candidate.UpdatedAt = time.Now().UTC()
+
+		if testHookConfirmationSave != nil {
+			if hookErr := testHookConfirmationSave(&candidate); hookErr != nil {
+				return rec, fmt.Errorf("persist delivery confirmation for part %d: %w", i, hookErr)
+			}
 		}
+
+		if saveErr := SaveDeliveryRecord(s.dataDir, &candidate); saveErr != nil {
+			return rec, fmt.Errorf("persist delivery confirmation for part %d: %w", i, saveErr)
+		}
+		*rec = candidate
 	}
 
 	return rec, nil

@@ -11,12 +11,14 @@ import (
 
 	"cordbrief/internal/digest"
 	"cordbrief/internal/durable"
+	"cordbrief/internal/journal"
 )
 
 // DeliveryState represents the lifecycle status of a Telegram digest dispatch.
 type DeliveryState string
 
 const (
+	StatePrepared  DeliveryState = "prepared"
 	StatePending   DeliveryState = "pending"
 	StateSending   DeliveryState = "sending"
 	StateSent      DeliveryState = "sent"
@@ -28,18 +30,32 @@ const (
 
 // DeliveryRecord captures durable state for a Telegram digest delivery.
 type DeliveryRecord struct {
-	Version            int           `json:"version"`
-	DigestBatchID      string        `json:"digest_batch_id"`
-	DestinationID      string        `json:"destination_id"`
-	DestinationLabel   string        `json:"destination_label,omitempty"`
-	State              DeliveryState `json:"state"`
-	CreatedAt          time.Time     `json:"created_at"`
-	UpdatedAt          time.Time     `json:"updated_at"`
-	AttemptCount       int           `json:"attempt_count"`
-	NextPart           int           `json:"next_part"`
-	TotalParts         int           `json:"total_parts"`
-	TelegramMessageIDs []int64       `json:"telegram_message_ids"`
-	LastSafeError      string        `json:"last_safe_error,omitempty"`
+	Version            int             `json:"version"`
+	DigestBatchID      string          `json:"digest_batch_id"`
+	DestinationID      string          `json:"destination_id"`
+	DestinationLabel   string          `json:"destination_label,omitempty"`
+	State              DeliveryState   `json:"state"`
+	CreatedAt          time.Time       `json:"created_at"`
+	UpdatedAt          time.Time       `json:"updated_at"`
+	AttemptCount       int             `json:"attempt_count"`
+	NextPart           int             `json:"next_part"`
+	TotalParts         int             `json:"total_parts"`
+	TelegramMessageIDs []int64         `json:"telegram_message_ids"`
+	LastSafeError      string          `json:"last_safe_error,omitempty"`
+	TargetCursorEnd    *journal.Cursor `json:"target_cursor_end,omitempty"`
+	InFlightPart       *int            `json:"in_flight_part,omitempty"`
+}
+
+// CursorAtOrPast reports whether cur has advanced to or past target.
+// Comparison is strictly lexicographical: first by Segment, then by Offset.
+func CursorAtOrPast(cur, target journal.Cursor) bool {
+	if cur.Segment > target.Segment {
+		return true
+	}
+	if cur.Segment == target.Segment && cur.Offset >= target.Offset {
+		return true
+	}
+	return false
 }
 
 // DeliveryRecordPath returns the canonical path to a delivery state file.
