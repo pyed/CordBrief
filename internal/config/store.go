@@ -14,20 +14,14 @@ import (
 )
 
 // Secrets holds private credentials, strictly isolated from public application configuration.
-// Secrets holds private credentials, strictly isolated from public application configuration.
 // Persisted exclusively to /var/cordbrief/data/secrets.json (mode 0600).
 type Secrets struct {
 	GeminiAPIKey     string `json:"gemini_api_key,omitempty"`
 	TelegramBotToken string `json:"telegram_bot_token,omitempty"`
 }
 
-// AppConfig represents non-secret runtime configuration for Schedule, LLM, Digest, and Delivery parameters.
-type AppConfig struct {
-	Schedule ScheduleConfig `json:"schedule"`
-	LLM      LLMConfig      `json:"llm"`
-	Digest   DigestConfig   `json:"digest"`
-	Delivery DeliveryConfig `json:"delivery"`
-}
+// AppConfig uses the same non-secret schema as file-based configuration.
+type AppConfig = Config
 
 // DefaultAppConfig returns a safe, production-ready default application configuration.
 func DefaultAppConfig() AppConfig {
@@ -47,12 +41,9 @@ func DefaultAppConfig() AppConfig {
 			TimeoutSeconds:  DefaultGeminiTimeout,
 		},
 		Digest: DigestConfig{
-			OutputLanguage:        DefaultLanguage,
-			Focus:                 nil,
-			IgnoreBots:            true,
-			FirstRunLookbackRaw:   DefaultLookback,
-			MaxCatchupRaw:         DefaultCatchup,
-			MaxMessagesPerChannel: DefaultMaxMessagesPerChannel,
+			OutputLanguage: DefaultLanguage,
+			Focus:          nil,
+			IgnoreBots:     true,
 		},
 		Delivery: DeliveryConfig{
 			Telegram: TelegramConfig{
@@ -66,10 +57,10 @@ func DefaultAppConfig() AppConfig {
 
 // Store manages non-secret AppConfig and private Secrets.
 type Store struct {
-	mu       sync.RWMutex
-	dataDir  string
-	config   AppConfig
-	secrets  Secrets
+	mu      sync.RWMutex
+	dataDir string
+	config  AppConfig
+	secrets Secrets
 }
 
 // NewStore initializes the configuration store, reading from dataDir or initialConfigPath.
@@ -77,7 +68,9 @@ func NewStore(dataDir, initialConfigPath string) (*Store, error) {
 	if dataDir == "" {
 		dataDir = "/var/cordbrief/data"
 	}
-	_ = os.MkdirAll(dataDir, 0755)
+	if err := os.MkdirAll(dataDir, 0755); err != nil {
+		return nil, fmt.Errorf("creating config directory: %w", err)
+	}
 
 	s := &Store{
 		dataDir: dataDir,
@@ -90,21 +83,20 @@ func NewStore(dataDir, initialConfigPath string) (*Store, error) {
 
 	if data, err := os.ReadFile(persistedConfigPath); err == nil {
 		var cfg AppConfig
-		if err := json.Unmarshal(data, &cfg); err == nil {
-			s.config = cfg
-			loaded = true
+		if err := json.Unmarshal(data, &cfg); err != nil {
+			return nil, fmt.Errorf("reading saved config: %w", err)
 		}
+		s.config = cfg
+		loaded = true
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("reading saved config: %w", err)
 	}
 
 	if !loaded && initialConfigPath != "" {
 		if cfg, err := Load(initialConfigPath); err == nil {
-			s.config = AppConfig{
-				Schedule: cfg.Schedule,
-				LLM:      cfg.LLM,
-				Digest:   cfg.Digest,
-				Delivery: cfg.Delivery,
-			}
-			loaded = true
+			s.config = *cfg
+		} else if !errors.Is(err, os.ErrNotExist) || initialConfigPath != "config.json" {
+			return nil, fmt.Errorf("reading initial config: %w", err)
 		}
 	}
 
@@ -115,8 +107,12 @@ func NewStore(dataDir, initialConfigPath string) (*Store, error) {
 	secretsPath := filepath.Join(dataDir, "secrets.json")
 	if data, err := os.ReadFile(secretsPath); err == nil {
 		var sec Secrets
-		_ = json.Unmarshal(data, &sec)
+		if err := json.Unmarshal(data, &sec); err != nil {
+			return nil, fmt.Errorf("reading saved secrets: %w", err)
+		}
 		s.secrets = sec
+	} else if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("reading saved secrets: %w", err)
 	}
 
 	return s, nil
@@ -159,15 +155,6 @@ func (s *Store) applyDefaultsAndValidate(cfg *AppConfig) {
 
 	if strings.TrimSpace(cfg.Digest.OutputLanguage) == "" {
 		cfg.Digest.OutputLanguage = DefaultLanguage
-	}
-	if cfg.Digest.FirstRunLookbackRaw == "" {
-		cfg.Digest.FirstRunLookbackRaw = DefaultLookback
-	}
-	if cfg.Digest.MaxCatchupRaw == "" {
-		cfg.Digest.MaxCatchupRaw = DefaultCatchup
-	}
-	if cfg.Digest.MaxMessagesPerChannel <= 0 {
-		cfg.Digest.MaxMessagesPerChannel = DefaultMaxMessagesPerChannel
 	}
 
 	// Schedule validation & defaults
@@ -233,7 +220,7 @@ func (s *Store) SaveAppConfig(newCfg AppConfig) error {
 	}
 
 	persistedConfigPath := filepath.Join(s.dataDir, "config.json")
-	if err := safeWriteJSON(persistedConfigPath, newCfg, 0644); err != nil {
+	if err := durable.AtomicWriteJSON(persistedConfigPath, newCfg, 0644); err != nil {
 		return fmt.Errorf("saving config: %w", err)
 	}
 
@@ -269,7 +256,7 @@ func (s *Store) SaveScheduleConfig(sch ScheduleConfig) error {
 	s.applyDefaultsAndValidate(&cfg)
 
 	persistedConfigPath := filepath.Join(s.dataDir, "config.json")
-	if err := safeWriteJSON(persistedConfigPath, cfg, 0644); err != nil {
+	if err := durable.AtomicWriteJSON(persistedConfigPath, cfg, 0644); err != nil {
 		return fmt.Errorf("saving schedule config: %w", err)
 	}
 
@@ -332,7 +319,7 @@ func (s *Store) SaveGeminiKey(key string) error {
 
 	s.secrets.GeminiAPIKey = strings.TrimSpace(key)
 	secretsPath := filepath.Join(s.dataDir, "secrets.json")
-	return safeWriteJSON(secretsPath, s.secrets, 0600)
+	return durable.AtomicWriteJSON(secretsPath, s.secrets, 0600)
 }
 
 // IsTelegramConfigured reports whether a Telegram bot token is available via environment or private storage.
@@ -381,7 +368,7 @@ func (s *Store) SaveTelegramBotToken(token string) error {
 
 	s.secrets.TelegramBotToken = strings.TrimSpace(token)
 	secretsPath := filepath.Join(s.dataDir, "secrets.json")
-	return safeWriteJSON(secretsPath, s.secrets, 0600)
+	return durable.AtomicWriteJSON(secretsPath, s.secrets, 0600)
 }
 
 // GetDeliveryConfig returns a safe copy of the delivery configuration.
@@ -401,14 +388,10 @@ func (s *Store) SaveDeliveryConfig(del DeliveryConfig) error {
 	s.applyDefaultsAndValidate(&cfg)
 
 	persistedConfigPath := filepath.Join(s.dataDir, "config.json")
-	if err := safeWriteJSON(persistedConfigPath, cfg, 0644); err != nil {
+	if err := durable.AtomicWriteJSON(persistedConfigPath, cfg, 0644); err != nil {
 		return fmt.Errorf("saving delivery config: %w", err)
 	}
 
 	s.config = cfg
 	return nil
-}
-
-func safeWriteJSON(dest string, data any, mode os.FileMode) error {
-	return durable.AtomicWriteJSON(dest, data, mode)
 }

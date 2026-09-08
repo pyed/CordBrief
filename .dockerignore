@@ -1,0 +1,14 @@
+.git
+.agents
+.claude
+.unlazy
+.env
+.env.*
+config.json
+**/secrets.json
+**/*.ndjson
+**/*.log
+node_modules
+bin
+build
+dist

@@ -121,7 +121,7 @@ RUN chmod +x /usr/local/bin/entrypoint-setup.sh \
 USER cordbrief
 WORKDIR /home/cordbrief
 
-EXPOSE 14500
+EXPOSE 28742
 
 VOLUME ["/home/cordbrief/.config/discord", "/home/cordbrief/.local/share/keyrings", "/var/cordbrief/exchange", "/var/lib/cordbrief", "/var/cordbrief/runtime"]
 

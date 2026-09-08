@@ -21,6 +21,7 @@ COPY --from=builder /bin/cordbrief /usr/local/bin/cordbrief
 
 ENV CORDBRIEF_EXCHANGE_DIR=/var/cordbrief/exchange
 ENV CORDBRIEF_DATA_DIR=/var/cordbrief/data
+ENV CORDBRIEF_WEB_ADDR=0.0.0.0
 
 ENTRYPOINT ["/usr/local/bin/cordbrief"]
 CMD ["--help"]

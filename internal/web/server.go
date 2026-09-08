@@ -1056,6 +1056,7 @@ func (s *Server) handleLLMSettings(w http.ResponseWriter, r *http.Request) {
 
 	if provider == config.ProviderGemini {
 		cfg.LLM.Provider = config.ProviderGemini
+		cfg.LLM.BaseURL = config.DefaultGeminiBaseURL
 		model := strings.TrimSpace(r.FormValue("gemini_model"))
 		if model == "" {
 			model = config.DefaultGeminiModel
@@ -1138,7 +1139,6 @@ func (s *Server) handleLLMTest(w http.ResponseWriter, r *http.Request) {
 	} else if providerType == config.ProviderLocal {
 		baseURL = strings.TrimSpace(r.FormValue("local_base_url"))
 		model = strings.TrimSpace(r.FormValue("local_model"))
-		apiKey = strings.TrimSpace(r.FormValue("local_api_key"))
 		if baseURL == "" || model == "" {
 			writeJSON(w, http.StatusOK, map[string]any{"ok": false, "error": "Base URL and Model are required for local provider test"})
 			return

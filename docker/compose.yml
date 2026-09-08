@@ -93,12 +93,7 @@ services:
       - CORDBRIEF_EXCHANGE_DIR=/var/cordbrief/exchange
       - CORDBRIEF_DATA_DIR=/var/cordbrief/data
       - CORDBRIEF_WEB_PORT=28741
-      # Note: GEMINI_API_KEY and TELEGRAM_BOT_TOKEN are injected via env_file (../.env).
-      # Bare environment entries (- GEMINI_API_KEY, - TELEGRAM_BOT_TOKEN) must not be specified
-      # here because in Docker Compose, bare environment entries take precedence over env_file
-      # and clobber them with null if not set in the host shell.
-      # - GEMINI_API_KEY
-      # - TELEGRAM_BOT_TOKEN
+      # Credentials come from env_file; bare entries here would override it.
     volumes:
       # Shared filesystem exchange (reads events/status/catalog, writes watchlist/core-ack)
       - cordbrief_exchange:/var/cordbrief/exchange

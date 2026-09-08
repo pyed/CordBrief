@@ -1,16 +1,40 @@
 package config
 
 import (
+	"bytes"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 )
 
+func TestStore_RejectsUnreadableSettings(t *testing.T) {
+	for _, name := range []string{"config.json", "secrets.json"} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			file := filepath.Join(dir, name)
+			broken := []byte(`{"broken":`)
+			if err := os.WriteFile(file, broken, 0600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := NewStore(dir, ""); err == nil {
+				t.Fatal("corrupt settings silently replaced by defaults")
+			}
+			if data, err := os.ReadFile(file); err != nil || !bytes.Equal(data, broken) {
+				t.Fatalf("original settings changed: %v", err)
+			}
+		})
+	}
+	if _, err := NewStore(t.TempDir(), filepath.Join(t.TempDir(), "missing.json")); err == nil {
+		t.Fatal("explicit missing seed config was ignored")
+	}
+}
+
 func TestStore_DefaultsAndPersistence(t *testing.T) {
 	tmpDir := t.TempDir()
+	t.Chdir(t.TempDir())
 
-	store, err := NewStore(tmpDir, "")
+	store, err := NewStore(tmpDir, "config.json")
 	if err != nil {
 		t.Fatalf("failed creating store: %v", err)
 	}

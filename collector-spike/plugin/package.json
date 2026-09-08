@@ -1,7 +1,0 @@
-{
-  "name": "cordbrief-collector-plugin",
-  "version": "0.1.0",
-  "description": "Vencord userplugin capturing allowlisted Discord messages to NDJSON journal",
-  "main": "index.ts",
-  "private": true
-}

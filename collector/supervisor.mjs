@@ -783,11 +783,16 @@ export class CollectorSupervisor {
             } catch (stErr) {
                 console.error("[Supervisor] Runtime staging error:", stErr.message);
                 this.lastError = `runtime_staging_failed: ${stErr.message}`;
+                this.mode = MODES.SETUP;
+                this.collectorState = "error";
+                this.publishStatus();
+                throw stErr;
             }
 
             // Write final setup completion status
             this.mode = MODES.NORMAL;
             this.collectorState = "ready";
+            this.lastError = null;
             this.discordAuthenticated = true;
             this.publishStatus();
 

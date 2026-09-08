@@ -39,12 +39,19 @@ Cache/
 GPUCache/
 Cookies*
 
-# Diagnostic image captures and screenshots
-*.png
-*.jpg
-*.jpeg
-*.gif
-*.webp
+# Keep local runtime secrets and snapshots out of source control.
+secrets.json
+core-ack.json
+recovery-state.json
+collector-status.json
+collector-runtime-status.json
+retention-manifest.json
+*.ids.json
+/data/
+/exchange/
+/backups/
+*.tar
+*.tar.gz
 
 # Editor and IDE caches
 .idea/

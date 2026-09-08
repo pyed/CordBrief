@@ -67,15 +67,7 @@ type ServiceOptions struct {
 	DeliveryEnqueuer DeliveryEnqueuer
 	Clock            Clock
 	CheckInterval    time.Duration
-	// Lock coordinates single-flight mutual exclusion within the running Core process
-	// (e.g. between the scheduler loop and web control plane actions).
-	//
-	// Architectural Boundary & Single-Flight Limitation:
-	// This in-memory sync.Mutex protects committing operations exclusively within the
-	// single running Core process. A separate CLI process (e.g. `cordbrief digest run`)
-	// cannot share this mutex with the background serve process. Only one Core instance
-	// is supported. Users must not invoke committing CLI transactions concurrently
-	// with the running scheduler. Preview remains safe via journal snapshot semantics.
+	// Lock serializes scheduler and web commits. The CLI's commit lock excludes other processes.
 	Lock        *sync.Mutex
 	SaveStateFn StateSaver // Optional override for testing persistence failures
 }

@@ -226,6 +226,26 @@ func TestServer_PostLLMTest(t *testing.T) {
 	}
 }
 
+func TestSwitchToGeminiResetsEndpoint(t *testing.T) {
+	srv, _, _ := setupTestEnv(t)
+	cfg := srv.store.GetAppConfig()
+	cfg.LLM.Provider = config.ProviderLocal
+	cfg.LLM.BaseURL = "http://127.0.0.1:11434/v1"
+	cfg.LLM.Model = "local-model"
+	if err := srv.store.SaveAppConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/api/llm", strings.NewReader("provider=gemini"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	req.Host = "127.0.0.1:8080"
+	req.Header.Set("Origin", "http://127.0.0.1:8080")
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	if rec.Code != http.StatusSeeOther || srv.store.GetAppConfig().LLM.BaseURL != config.DefaultGeminiBaseURL {
+		t.Fatalf("Gemini retained local endpoint: status=%d config=%+v", rec.Code, srv.store.GetAppConfig().LLM)
+	}
+}
+
 func TestServer_PostDigestPreview(t *testing.T) {
 	srv, exchangeDir, _ := setupTestEnv(t)
 	fake := llm.NewFakeLLMServer()
@@ -1207,7 +1227,8 @@ func TestWebDeliveryHandlers(t *testing.T) {
 
 	// 7. Environment variable precedence: env token is authoritative and never overwritten
 	t.Run("Environment variable token precedence", func(t *testing.T) {
-		envStore, err := config.NewStore(dataDir, "env-authoritative-token")
+		t.Setenv("TELEGRAM_BOT_TOKEN", "env-authoritative-token")
+		envStore, err := config.NewStore(dataDir, "")
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1973,6 +1994,3 @@ func TestCSRFProtectionAndThreatModel(t *testing.T) {
 		}
 	}
 }
-
-
-

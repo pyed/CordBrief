@@ -860,10 +860,6 @@ const providerTemplateHTML = `
           <label for="localModel">Model Name</label>
           <input type="text" id="localModel" name="local_model" value="{{.LLMConfig.Model}}" placeholder="llama3:latest">
         </div>
-        <div class="form-group">
-          <label for="localAPIKey">API Key (Optional for local)</label>
-          <input type="password" id="localAPIKey" name="local_api_key" placeholder="Optional bearer token...">
-        </div>
       </div>
 
       <div class="btn-group">
