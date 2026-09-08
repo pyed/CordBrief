@@ -7,6 +7,7 @@
 import { IpcMainInvokeEvent } from "electron";
 import * as fs from "fs";
 import * as path from "path";
+import { createHash } from "crypto";
 
 export interface WatchlistConfig {
     valid: boolean;
@@ -122,7 +123,7 @@ let recoveryPendingChannels = 0;
 let recoveryLastError: string | null = null;
 
 // In-memory deduplication ledger seeded from recent journal segments
-const recentJournalMessageIds = new Set<string>();
+const recentJournalMessageIds = new Map<string, string>();
 let journalMaxID = 0n;
 let journalRecordCount = 0;
 let journalValidated = false;
@@ -140,6 +141,10 @@ function padSegmentNumber(num: number): string {
 }
 
 function ensureDirectories(): void {
+    if (process.env.CORDBRIEF_RETENTION_INSPECT === "1") {
+        if (!fs.statSync(EVENTS_DIR).isDirectory()) throw new Error("Missing journal directory");
+        return;
+    }
     if (!fs.existsSync(EXCHANGE_DIR)) {
         fs.mkdirSync(EXCHANGE_DIR, { recursive: true, mode: 0o755 });
     }
@@ -204,8 +209,8 @@ export function initDedupeLedger(): void {
         journalChannels.add(record.channel_id);
         const n = BigInt(record.message_id);
         if (n > journalMaxID) journalMaxID = n;
-        recentJournalMessageIds.add(record.message_id);
-        if (recentJournalMessageIds.size > MAX_DEDUPE_ENTRIES) recentJournalMessageIds.delete(recentJournalMessageIds.values().next().value!);
+        recentJournalMessageIds.set(record.message_id, record.channel_id);
+        if (recentJournalMessageIds.size > MAX_DEDUPE_ENTRIES) recentJournalMessageIds.delete(recentJournalMessageIds.keys().next().value!);
     });
     journalValidated = true;
 }
@@ -221,12 +226,101 @@ function requireKeys(value: any, keys: string[]): void {
 
 function validateJournalTopology(): string[] {
     const files = fs.readdirSync(EVENTS_DIR).filter(f => f.endsWith(".ndjson")).sort();
+    const retired = readRetiredEvidence();
+    const first = files.length ? Number(files[0].slice(0, 16)) : 1;
+    if (first > retired.size + 1 || (retired.size && (!files.length || Number(files.at(-1)!.slice(0, 16)) <= retired.size))) {
+        throw new Error("Invalid retired journal topology");
+    }
     for (let i = 0; i < files.length; i++) {
-        if (files[i] !== padSegmentNumber(i + 1) || !fs.lstatSync(path.join(EVENTS_DIR, files[i])).isFile()) {
+        if (files[i] !== padSegmentNumber(first + i) || !fs.lstatSync(path.join(EVENTS_DIR, files[i])).isFile()) {
             throw new Error("Invalid or missing journal segment topology");
         }
     }
     return files;
+}
+
+interface RetiredIdentity { message_id: string; channel_id: string; offset: number; next_offset: number }
+interface RetiredSegment { version: number; segment: number; size: number; sha256: string; records: RetiredIdentity[] }
+const sha256 = (bytes: Buffer) => createHash("sha256").update(bytes).digest("hex");
+function exactKeys(value: any, keys: string[]): void {
+    requireKeys(value, keys);
+    if (Object.keys(value).length !== keys.length) throw new Error("Missing retention fields");
+}
+function readRegular(file: string): Buffer {
+    if (!fs.lstatSync(file).isFile()) throw new Error("Non-regular retention evidence");
+    return fs.readFileSync(file);
+}
+function parseRetentionJSON(bytes: Buffer): any {
+    const text = bytes.toString("utf8"), value = JSON.parse(text);
+    // JSON.parse silently accepts duplicate object keys. Reject them so Core and
+    // Collector cannot give different meanings to the same correctness document.
+    const stack: ({ keys: Set<string>; key: boolean } | null)[] = [];
+    for (const [token] of text.matchAll(/"(?:\\.|[^"\\])*"|[{}\[\],:]/g)) {
+        if (token === "{") stack.push({ keys: new Set(), key: true });
+        else if (token === "[") stack.push(null);
+        else if (token === "}" || token === "]") stack.pop();
+        else {
+            const object = stack.at(-1);
+            if (token === "," && object) object.key = true;
+            else if (token.startsWith('"') && object?.key) {
+                const key = JSON.parse(token);
+                if (object.keys.has(key)) throw new Error("Duplicate retention JSON key");
+                object.keys.add(key);
+                object.key = false;
+            }
+        }
+    }
+    return value;
+}
+
+// Immutable evidence replaces identities, never transcripts. No cache: missing or
+// corrupted evidence must fail even if a previous request loaded a valid manifest.
+function readRetiredEvidence(): Map<number, RetiredSegment> {
+    const result = new Map<number, RetiredSegment>();
+    const manifestFile = path.join(EXCHANGE_DIR, "retention-manifest.json");
+    let manifestBytes: Buffer;
+    try { manifestBytes = readRegular(manifestFile); }
+    catch (error: any) { if (error.code === "ENOENT") return result; throw error; }
+    const manifest = parseRetentionJSON(manifestBytes);
+    exactKeys(manifest, ["version", "retired_through", "segments"]);
+    if (manifest.version !== 1 || !Number.isSafeInteger(manifest.retired_through) || manifest.retired_through < 1 ||
+        !Array.isArray(manifest.segments) || manifest.segments.length !== manifest.retired_through) throw new Error("Invalid retention manifest");
+    const directory = path.join(EXCHANGE_DIR, "retention");
+    if (!fs.lstatSync(directory).isDirectory()) throw new Error("Invalid retention directory");
+    for (let i = 0; i < manifest.segments.length; i++) {
+        const entry = manifest.segments[i];
+        exactKeys(entry, ["segment", "size", "sha256", "sidecar_sha256"]);
+        if (entry.segment !== i + 1 || !Number.isSafeInteger(entry.size) || entry.size < 0 ||
+            !/^[a-f0-9]{64}$/.test(entry.sha256) || !/^[a-f0-9]{64}$/.test(entry.sidecar_sha256)) throw new Error("Invalid retention entry");
+        const bytes = readRegular(path.join(directory, String(entry.segment).padStart(16, "0") + ".ids.json"));
+        if (sha256(bytes) !== entry.sidecar_sha256) throw new Error("Retention sidecar checksum mismatch");
+        const sidecar = parseRetentionJSON(bytes);
+        exactKeys(sidecar, ["version", "segment", "size", "sha256", "records"]);
+        if (sidecar.version !== 1 || sidecar.segment !== entry.segment || sidecar.size !== entry.size ||
+            sidecar.sha256 !== entry.sha256 || !Array.isArray(sidecar.records)) throw new Error("Invalid retention sidecar");
+        let offset = 0;
+        for (const record of sidecar.records) {
+            exactKeys(record, ["message_id", "channel_id", "offset", "next_offset"]);
+            if (!isID(record.message_id) || record.message_id === "0" || !isID(record.channel_id) || record.channel_id === "0" ||
+                record.offset !== offset || !Number.isSafeInteger(record.next_offset) || record.next_offset <= offset || record.next_offset > sidecar.size) {
+                throw new Error("Invalid retired identity/position");
+            }
+            offset = record.next_offset;
+        }
+        if (offset !== sidecar.size) throw new Error("Incomplete retention sidecar");
+        const raw = path.join(EVENTS_DIR, padSegmentNumber(entry.segment));
+        if (fs.existsSync(raw)) {
+            const original = readRegular(raw);
+            if (sha256(original) !== entry.sha256 || original.length !== entry.size) throw new Error("Retired raw file checksum mismatch");
+            for (const record of sidecar.records) {
+                if (original[record.next_offset - 1] !== 10 || original.indexOf(10, record.offset) !== record.next_offset - 1) throw new Error("Retired position differs from raw record");
+                const source = JSON.parse(original.subarray(record.offset, record.next_offset - 1).toString("utf8"));
+                if (source.version !== 1 || source.event !== "message_create" || source.message_id !== record.message_id || source.channel_id !== record.channel_id) throw new Error("Retired identity differs from raw record");
+            }
+        }
+        result.set(entry.segment, sidecar);
+    }
+    return result;
 }
 
 function validateBoundary(value: JournalStartBoundary): void {
@@ -247,9 +341,23 @@ function scanJournal(start: JournalStartBoundary, end: JournalStartBoundary,
     validateBoundary(end);
     if (compareBoundary(start, end) > 0) throw new Error("Journal boundary beyond end");
     const seen = new Set<string>();
+    const retired = readRetiredEvidence();
     for (let segment = start.segment; segment <= end.segment; segment++) {
         const file = path.join(EVENTS_DIR, padSegmentNumber(segment));
         const offset = segment === start.segment ? start.offset : 0;
+        const sidecar = retired.get(segment);
+        if (sidecar) {
+            const limit = segment === end.segment ? end.offset : sidecar.size;
+            const boundary = (n: number) => n === sidecar.size || sidecar.records.some(r => r.offset === n);
+            if (offset > limit || !boundary(offset) || !boundary(limit)) throw new Error("Invalid retired record boundary");
+            for (const record of sidecar.records) {
+                if (record.offset < offset || record.offset >= limit) continue;
+                if (seen.has(record.message_id)) throw new Error("Historical duplicate journal message ID");
+                seen.add(record.message_id);
+                visit({ version: 1, event: "message_create", ...record }, { segment, offset: record.offset });
+            }
+            continue;
+        }
         // Writer can reserve an as-yet uncreated empty active segment.
         if (segment === end.segment && end.offset === 0 && offset === 0 && !fs.existsSync(file)) continue;
         const bytes = fs.readFileSync(file);
@@ -470,9 +578,9 @@ export function appendRawLinesToJournal(lines: string[], ids: string[]): void {
         journalChannels.add(JSON.parse(lines[i]).channel_id);
         if (ids[i]) {
             if (BigInt(ids[i]) > journalMaxID) journalMaxID = BigInt(ids[i]);
-            recentJournalMessageIds.add(ids[i]);
+            recentJournalMessageIds.set(ids[i], JSON.parse(lines[i]).channel_id);
             if (recentJournalMessageIds.size > MAX_DEDUPE_ENTRIES) {
-                const oldest = recentJournalMessageIds.values().next().value;
+                const oldest = recentJournalMessageIds.keys().next().value;
                 if (oldest) recentJournalMessageIds.delete(oldest);
             }
         }
@@ -700,14 +808,20 @@ export async function appendEventToJournal(_: IpcMainInvokeEvent, eventJson: str
             await beginChannelInitialization(undefined, record.channel_id);
         }
         // A cache miss is never proof of absence. Delayed Gateway replays can be old.
-        if (recentJournalMessageIds.has(record.message_id)) return true;
+        if (recentJournalMessageIds.has(record.message_id)) {
+            if (recentJournalMessageIds.get(record.message_id) !== record.channel_id) throw new Error("Message belongs to another journal channel");
+            return true;
+        }
         if (!journalValidated) throw new Error("Journal initialization failed");
         let present = false;
         // A complete startup scan plus every append maintains an exact maximum.
         // IDs above it cannot be duplicates; out-of-order IDs need a durable scan.
         if (recentJournalMessageIds.size !== journalRecordCount && BigInt(record.message_id) <= journalMaxID) {
             scanJournal({ segment: 1, offset: 0 }, getCurrentJournalBoundary(), r => {
-                if (r.message_id === record.message_id) present = true;
+                if (r.message_id === record.message_id) {
+                    if (r.channel_id !== record.channel_id) throw new Error("Message belongs to another journal channel");
+                    present = true;
+                }
             });
         }
         if (!present) appendRawLinesToJournal([eventJson], [record.message_id]);
@@ -1022,8 +1136,20 @@ function startWatchlistMonitor(): void {
     }
 }
 
+// Maintenance validates without repair, migration, pending reconciliation, status,
+// or background watchers. It must hold the external runtime/Core exclusion leases.
+export function inspectRetentionState(): RecoveryStateRecord {
+    initSegment();
+    if (deferredTail) throw new Error("Active tail requires Collector repair");
+    const state = JSON.parse(readRegular(RECOVERY_STATE_PATH).toString("utf8"));
+    if (state.version !== 2) throw new Error("Retention requires recovery v2");
+    validateRecoveryState(state);
+    if (state.pending !== null) throw new Error("Retention blocked by pending recovery");
+    return state;
+}
+
 // Initialize on load
-try {
+if (process.env.CORDBRIEF_RETENTION_INSPECT !== "1") try {
     initSegment();
     loadRecoveryState(); // Entire state validates before repair/reconciliation/status writes.
     recoveryReady = true;

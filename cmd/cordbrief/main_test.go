@@ -1,12 +1,16 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -17,6 +21,52 @@ import (
 	"cordbrief/internal/llm"
 	"time"
 )
+
+func TestRetentionReaderProcessExclusion(t *testing.T) {
+	if dir := os.Getenv("CORDBRIEF_TEST_LOCK_CHILD"); dir != "" {
+		lock, err := journal.AcquireCommitLock(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer lock.Release()
+		fmt.Println("READY")
+		_, _ = io.Copy(io.Discard, os.Stdin)
+		return
+	}
+	dir := t.TempDir()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	child := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestRetentionReaderProcessExclusion$")
+	child.Env = append(os.Environ(), "CORDBRIEF_TEST_LOCK_CHILD="+dir)
+	input, err := child.StdinPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	output, err := child.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var childErrors bytes.Buffer
+	child.Stderr = &childErrors
+	if err := child.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() {
+		input.Close()
+		if err := child.Wait(); err != nil {
+			t.Errorf("lock child: %v %s", err, childErrors.String())
+		}
+	}()
+	line, err := bufio.NewReader(output).ReadString('\n')
+	if err != nil || strings.TrimSpace(line) != "READY" {
+		t.Fatalf("child not ready: %q %v", line, err)
+	}
+	var stdout, stderr bytes.Buffer
+	code := Run([]string{"exchange", "ingest", "--data-dir=" + dir, "--exchange-dir=" + dir}, &stdout, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "cannot acquire commit lock") {
+		t.Fatalf("reader bypassed process exclusion: %d %s", code, stderr.String())
+	}
+}
 
 func TestCLI_Version(t *testing.T) {
 	var stdout, stderr bytes.Buffer
@@ -283,7 +333,7 @@ func TestCLI_Exchange(t *testing.T) {
 	// 4. Ingest without commit (dry-run)
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"exchange", "ingest", "-exchange-dir=" + tmpDir}, &stdout, &stderr)
+	code = Run([]string{"exchange", "ingest", "-exchange-dir=" + tmpDir, "-data-dir=" + tmpDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("ingest dry-run failed with code %d: %s", code, stderr.String())
 	}
@@ -300,7 +350,7 @@ func TestCLI_Exchange(t *testing.T) {
 	// 5. Ingest with commit
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"exchange", "ingest", "-exchange-dir=" + tmpDir, "-commit"}, &stdout, &stderr)
+	code = Run([]string{"exchange", "ingest", "-exchange-dir=" + tmpDir, "-data-dir=" + tmpDir, "-commit"}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("ingest with commit failed with code %d: %s", code, stderr.String())
 	}
@@ -311,7 +361,7 @@ func TestCLI_Exchange(t *testing.T) {
 	// 6. Ingest again immediately (should return 0 events)
 	stdout.Reset()
 	stderr.Reset()
-	code = Run([]string{"exchange", "ingest", "-exchange-dir=" + tmpDir}, &stdout, &stderr)
+	code = Run([]string{"exchange", "ingest", "-exchange-dir=" + tmpDir, "-data-dir=" + tmpDir}, &stdout, &stderr)
 	if code != 0 {
 		t.Fatalf("second ingest failed with code %d: %s", code, stderr.String())
 	}
@@ -560,7 +610,8 @@ func TestCommitLock(t *testing.T) {
 		t.Fatal("expected ErrCommitLockActive on second acquire, got nil")
 	}
 
-	// 2. While lock is held, digest preview still succeeds (does not require commit lock)
+	defer l1.Release()
+	// Journal readers must exclude offline retention maintenance too.
 	fake := llm.NewFakeLLMServer()
 	defer fake.Close()
 	fake.ResponseContent = `{"title":"Test Digest","summary":"Summary","items":[]}`
@@ -572,8 +623,14 @@ func TestCommitLock(t *testing.T) {
 
 	var stdout, stderr bytes.Buffer
 	code := Run([]string{"digest", "preview", "-config=", "-exchange-dir=" + exchangeDir, "-data-dir=" + dataDir}, &stdout, &stderr)
-	if code != 0 {
-		t.Fatalf("expected preview to succeed while commit lock is held, got code %d: %s", code, stderr.String())
+	if code != 1 || !strings.Contains(stderr.String(), "cannot acquire commit lock") {
+		t.Fatalf("expected preview to refuse while lock is held, got code %d: %s", code, stderr.String())
+	}
+	stdout.Reset()
+	stderr.Reset()
+	code = Run([]string{"exchange", "ingest", "-exchange-dir=" + exchangeDir, "-data-dir=" + dataDir}, &stdout, &stderr)
+	if code != 1 || !strings.Contains(stderr.String(), "cannot acquire commit lock") {
+		t.Fatalf("unlocked dry-run ingest: %d %s", code, stderr.String())
 	}
 
 	// 3. While lock is held, digest run fails with lock error
@@ -651,14 +708,12 @@ func TestMigrateCommitLock(t *testing.T) {
 		t.Fatalf("failed acquiring commit lock: %v", err)
 	}
 
-	// Test A: serve/holder owns commit lock -> migrate --dry-run is ALLOWED (read-only)
+	defer holderLock.Release()
+	// Test A: dry-run migration reads transcripts and must be excluded too.
 	var stdoutA, stderrA bytes.Buffer
 	codeA := Run([]string{"migrate", "--dry-run", "-exchange-dir=" + exchangeDir, "-data-dir=" + dataDir}, &stdoutA, &stderrA)
-	if codeA != 0 {
-		t.Fatalf("Test A failed: expected migrate --dry-run to succeed while lock held, got %d. stderr: %s", codeA, stderrA.String())
-	}
-	if !strings.Contains(stdoutA.String(), "=== DRY-RUN MIGRATION COMPLETE") {
-		t.Fatalf("Test A unexpected stdout: %s", stdoutA.String())
+	if codeA != 1 || !strings.Contains(stderrA.String(), "acquisition refused") {
+		t.Fatalf("Test A failed: expected dry-run exclusion, got %d. stderr: %s", codeA, stderrA.String())
 	}
 	if initialHash() != baselineHash {
 		t.Fatal("Test A: dry-run modified the artifact file!")
@@ -704,6 +759,3 @@ func TestMigrateCommitLock(t *testing.T) {
 	}
 	checkLock.Release()
 }
-
-
-

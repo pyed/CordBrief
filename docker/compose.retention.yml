@@ -1,0 +1,11 @@
+# Opt-in offline evidence maintenance. Ordinary setup retains no Core-private access.
+# Combine with compose.yml; stop Core and Collector first. Invoke the setup service
+# with: bash /home/cordbrief/retention-publish.sh <closed-prefix-end>
+# Default publishes evidence only. An additional --delete-certified explicitly
+# deletes the already certified prefix after fresh locked validation.
+services:
+  cordbrief-setup:
+    environment:
+      - CORDBRIEF_CORE_DATA_DIR=/var/cordbrief/data
+    volumes:
+      - cordbrief_core_data:/var/cordbrief/data

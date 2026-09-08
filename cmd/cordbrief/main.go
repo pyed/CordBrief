@@ -2,13 +2,13 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
+	"net/http"
 	"os"
 	"os/signal"
-	"errors"
-	"net/http"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -385,6 +385,12 @@ func runExchange(args []string, stdout, stderr io.Writer) int {
 
 		exchangeDir := getExchangeDir(*dirFlag)
 		actualDataDir := getDataDir(*dataDirFlag)
+		commitLock, lockErr := journal.AcquireCommitLock(actualDataDir)
+		if lockErr != nil {
+			fmt.Fprintf(stderr, "cannot read journal: %v\n", lockErr)
+			return 1
+		}
+		defer commitLock.Release()
 		ackPath := filepath.Join(exchangeDir, journal.DefaultAckFilename)
 		eventsDir := filepath.Join(exchangeDir, "events")
 
@@ -417,13 +423,6 @@ func runExchange(args []string, stdout, stderr io.Writer) int {
 		fmt.Fprintf(stdout, "Cursor After:  segment=%d, offset=%d\n", nextCur.Segment, nextCur.Offset)
 
 		if *commitFlag {
-			commitLock, lockErr := journal.AcquireCommitLock(actualDataDir)
-			if lockErr != nil {
-				fmt.Fprintf(stderr, "cannot commit cursor: %v\n", lockErr)
-				return 1
-			}
-			defer commitLock.Release()
-
 			if err := journal.SaveCursor(ackPath, &nextCur); err != nil {
 				fmt.Fprintf(stderr, "error committing cursor: %v\n", err)
 				return 1
@@ -584,7 +583,7 @@ func runDigest(args []string, stdout, stderr io.Writer) int {
 
 	// 3. Execute transaction
 	commit := (sub == "run")
-	if commit {
+	{
 		commitLock, lockErr := journal.AcquireCommitLock(getDataDir(*dataDir))
 		if lockErr != nil {
 			fmt.Fprintf(stderr, "cannot run digest: %v\n", lockErr)
@@ -922,7 +921,7 @@ func runMigrate(args []string, stdout, stderr io.Writer) int {
 	actualExchangeDir := getExchangeDir(*exchangeDir)
 	actualDataDir := getDataDir(*dataDir)
 
-	if !*dryRun {
+	{
 		commitLock, err := journal.AcquireCommitLock(actualDataDir)
 		if err != nil {
 			fmt.Fprintf(stderr, "migrate: acquisition refused: %v\n", err)
@@ -960,7 +959,3 @@ func runMigrate(args []string, stdout, stderr io.Writer) int {
 	fmt.Fprintf(stdout, "=== %s COMPLETE (All Eligible: true) ===\n", modeLabel)
 	return 0
 }
-
-
-
-

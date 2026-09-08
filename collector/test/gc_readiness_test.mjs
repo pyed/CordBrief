@@ -109,6 +109,7 @@ if (process.argv[2] === "--child") {
         for (const n of request.ids) assert.equal(await native.appendEventToJournal(undefined, event(n)), true);
         result = native.getCurrentJournalBoundary();
     } else if (op === "renderer") {
+        const channel = request.channel || "1545115236619518001";
         const requests = [];
         let drained = 0;
         globalThis.VencordNative = { pluginHelpers: { CordBriefCollector: new Proxy({}, {
@@ -164,6 +165,9 @@ if (process.argv[2] === "--child") {
         native.clearDedupeLedgerForTesting();
         for (const n of request.ids) assert.equal(await native.appendEventToJournal(undefined, event(n)), true);
         result = native.getCurrentJournalBoundary();
+    } else if (op === "wrong-channel-live") {
+        if (request.clear) native.clearDedupeLedgerForTesting();
+        result = await native.appendEventToJournal(undefined, event(request.id, other));
     } else if (op === "scan-missing") {
         result = native.getAppendedMessageIdsSince(999999, 0);
     } else {

@@ -10,6 +10,22 @@ import (
 	"cordbrief/internal/durable"
 )
 
+// NeedsJournalSources identifies legacy citation reconstruction. An artifact
+// without cited IDs is already independent of journal history.
+func (a *Artifact) NeedsJournalSources() bool {
+	if a == nil || a.Digest == nil || len(a.SourceRefs) != 0 {
+		return false
+	}
+	for _, item := range a.Digest.Items {
+		for _, id := range item.SourceIDs {
+			if strings.TrimSpace(id) != "" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // ArtifactPath returns the canonical filesystem path for a digest artifact.
 // It verifies that batchID strictly matches 64 lowercase hexadecimal characters.
 func ArtifactPath(dir, batchID string) (string, error) {
@@ -103,4 +119,3 @@ func BuildSourceRefs(d *Digest, sourceMap map[string]SourceMessage) map[string]S
 	}
 	return refs
 }
-

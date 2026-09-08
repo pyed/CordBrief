@@ -422,7 +422,7 @@ func (s *Service) DeliverBatch(ctx context.Context, batchID string, force bool) 
 
 	// 6. Reconstruct source message jump links only if legacy artifact lacks SourceRefs
 	var sourceMap map[string]digest.SourceMessage
-	if len(art.SourceRefs) == 0 {
+	if art.NeedsJournalSources() {
 		sourceMap = s.reconstructSourceMap(art)
 	}
 

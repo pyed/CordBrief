@@ -109,6 +109,8 @@ COPY entrypoint-setup.sh /usr/local/bin/entrypoint-setup.sh
 COPY runtime.mjs /home/cordbrief/runtime.mjs
 COPY stage-runtime.mjs /home/cordbrief/stage-runtime.mjs
 COPY supervisor.mjs /home/cordbrief/supervisor.mjs
+COPY retention-publish.mjs retention-publish.sh /home/cordbrief/
+COPY plugin/native.ts /home/cordbrief/plugin/native.ts
 
 RUN chmod +x /usr/local/bin/entrypoint-setup.sh \
              /home/cordbrief/runtime.mjs \

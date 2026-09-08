@@ -12,6 +12,33 @@ import (
 	"cordbrief/internal/journal"
 )
 
+func TestUncitedArtifactNeedsNoRetiredTranscript(t *testing.T) {
+	dir := t.TempDir()
+	digests := filepath.Join(dir, "digests")
+	if err := os.MkdirAll(digests, 0755); err != nil {
+		t.Fatal(err)
+	}
+	art := &Artifact{Version: 1, BatchID: strings.Repeat("a", 64), Digest: &Digest{Items: []Item{{Text: "No citations", SourceIDs: []string{"", "  "}}}}}
+	if art.NeedsJournalSources() {
+		t.Fatal("uncited item depends on journal")
+	}
+	if err := SaveArtifact(digests, art); err != nil {
+		t.Fatal(err)
+	}
+	// Deliberately invalid evidence proves migration never tries to read it.
+	if err := os.WriteFile(filepath.Join(dir, "retention-manifest.json"), []byte("invalid"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	reports, err := MigrateArtifacts(dir, dir, true)
+	if err != nil || len(reports) != 1 || !reports[0].Eligible {
+		t.Fatalf("uncited migration: %+v %v", reports, err)
+	}
+	art.Digest.Items[0].SourceIDs = []string{"S000001"}
+	if !art.NeedsJournalSources() {
+		t.Fatal("legacy citation lost journal dependency")
+	}
+}
+
 func TestArtifactMigrationAndJournalIndependence(t *testing.T) {
 	tmpDir := t.TempDir()
 	exchangeDir := filepath.Join(tmpDir, "exchange")

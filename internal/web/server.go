@@ -866,7 +866,7 @@ func (s *Server) handleDigestDetail(w http.ResponseWriter, r *http.Request) {
 
 	// Build source map for jump links only if legacy artifact lacks SourceRefs
 	sourceMap := make(map[string]digest.SourceMessage)
-	if len(art.SourceRefs) == 0 {
+	if art.NeedsJournalSources() {
 		eventsDir := filepath.Join(s.exchangeDir, "events")
 		startCur := art.CursorStart
 		endCur := art.CursorEnd

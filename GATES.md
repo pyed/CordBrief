@@ -1,4 +1,10 @@
-# Gates: M13 Phase 3C complete recovery-state preflight
+# Gates: Phase 3D implementation complete
+
+Annotated milestone `m13-journal-retention` checkpoints completed retention/GC
+implementation and disposable proofs. Production deletion is explicitly deferred:
+the read-only preflight correctly refused mutation because no eligible closed
+segment existed. This milestone does not certify deployment or production GC.
+The historical Phase 3C and staged Phase 3D evidence follows.
 
 ## Current status: production recovery v2 deployed
 
@@ -128,3 +134,48 @@ Linux uses existing docker-cordbrief-setup:latest, read-only source mount,
 hashes unchanged; runtime/entrypoint/module diff empty; git diff --check exits 0.
 No dependency, production bypass, deployment, migration, journal GC, commit, tag,
 or push. Canonical HEAD/tag are unchanged. Stop for deployment review.
+# Phase 3D non-destructive foundation (current work)
+
+- [x] Exact sidecars preserve actual-native identity/position decisions with absent retired prefixes.
+  CHECK: node collector/test/retention_evidence_test.mjs
+  EXPECT: RETENTION EVIDENCE VERIFIED
+  EVIDENCE: Windows PowerShell and Linux container exited 0: 129 actual segments,
+  127 retired, 250 replay IDs, 12 corrupt-state refusals; new/re-added watches,
+  wrong-channel live replay, cache clear, partial-page process death pass.
+- [x] Manifest publication and real Linux lock/crash gates pass before any deletion code exists.
+  CHECK: docker run --rm --pull never --network none --mount "type=bind,source=C:\Users\Sheriff\Desktop\src\CordBrief\collector,target=/collector,readonly" --entrypoint node docker-cordbrief-setup:latest /collector/test/retention_publish_test.mjs
+  EXPECT: "passed":true
+  EVIDENCE: Linux exit 0; 55 segments, 54 sidecars, 108 identities, 3 crash
+  boundaries, 3 lock refusals, orphan/incremental publication and inherited lease
+  reuse. Additional run mounted disposable cross-compiled Core binary via
+  CORDBRIEF_TEST_CORE_BINARY: coreVerified=true, real Core suffix read passed.
+- [x] Core validates certified topology, refuses retired cursors, and excludes standalone readers.
+  CHECK: go test ./internal/journal ./internal/digest ./cmd/cordbrief ./internal/web ./internal/delivery
+  EXPECT: exit 0
+  EVIDENCE: Windows and Linux Go targeted packages exit 0, including process lock
+  contention; Linux additionally tests symlink refusal. Targeted vet exits 0;
+  go list -m all prints only cordbrief. Windows actual-native --require-safe
+  exits 0, including 1050-ID cap continuation. No deletion code or deployment.
+# Phase 3D certified physical deletion (current work)
+
+- [x] Certified ascending unlink, directory durability, process restart and invalid-state refusal.
+  CHECK: docker run --rm --pull never --network none --mount "type=bind,source=C:\Users\Sheriff\Desktop\src\CordBrief\collector,target=/collector,readonly" --entrypoint node docker-cordbrief-setup:latest /collector/test/retention_gc_test.mjs
+  EXPECT: CERTIFIED GC VERIFIED
+  EVIDENCE: Linux exit 0; 7 actual segments, 6 deleted prefix candidates, 24
+  per-unlink/sync crashes/failures, 15 byte-preserving refusals. Resumed GC is
+  idempotent, native retired replay appends zero, active bytes remain identical.
+  Additional disposable Core binary mount: coreVerified=true; real Core reads
+  retained event after actual unlink and commits the expected cursor.
+- [x] Existing publication/identity reader regression gates remain green.
+  CHECK: Linux container runs of retention_publish_test.mjs and retention_evidence_test.mjs
+  EXPECT: exit 0
+  EVIDENCE: Both exit 0: publication still deletes zero by default; reader gate
+  retains 250-ID exact dedupe and 12 corruption refusals. Go journal tests and
+  git diff --check exit 0. No production data mounts, deployment, or push.
+# Phase 3D production eligibility — blocked, not completed
+
+- [ ] Controlled production deployment, certified deletion, continuity and rollback proof.
+  EVIDENCE: 2026-09-08 read-only preflight found only active segment 1 (25,121
+  bytes), Core cursor (1,9451), recovery v2 with no pending/sweep, both services
+  healthy. No closed/Core-safe prefix exists. Production left unchanged; no
+  deployment/GC/checkpoint claimed. See docs/PHASE_3D_PRODUCTION_PREFLIGHT.md.

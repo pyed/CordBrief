@@ -63,9 +63,10 @@ func DiscoverSegments(eventsDir string) ([]uint64, error) {
 
 // Watermark represents an immutable boundary snapshot of existing segments and their byte lengths.
 type Watermark struct {
-	Segments     []uint64
-	SegmentSizes map[uint64]int64
-	MaxSegment   uint64
+	RetiredThrough uint64
+	Segments       []uint64
+	SegmentSizes   map[uint64]int64
+	MaxSegment     uint64
 }
 
 // CaptureWatermark captures the current snapshot of all segments up to this moment.
@@ -74,15 +75,25 @@ func CaptureWatermark(eventsDir string) (*Watermark, error) {
 	if err != nil {
 		return nil, err
 	}
+	retired, err := validateRetention(eventsDir, segments)
+	if err != nil {
+		return nil, err
+	}
+	for len(segments) > 0 && segments[0] <= retired {
+		segments = segments[1:]
+	}
 
 	sizes := make(map[uint64]int64, len(segments))
 	var maxSeg uint64
 
 	for _, seg := range segments {
 		path := filepath.Join(eventsDir, FormatSegmentFilename(seg))
-		info, err := os.Stat(path)
+		info, err := os.Lstat(path)
 		if err != nil {
 			return nil, fmt.Errorf("stat segment %d: %w", seg, err)
+		}
+		if !info.Mode().IsRegular() {
+			return nil, fmt.Errorf("non-regular journal segment %d", seg)
 		}
 		sizes[seg] = info.Size()
 		if seg > maxSeg {
@@ -91,9 +102,10 @@ func CaptureWatermark(eventsDir string) (*Watermark, error) {
 	}
 
 	return &Watermark{
-		Segments:     segments,
-		SegmentSizes: sizes,
-		MaxSegment:   maxSeg,
+		RetiredThrough: retired,
+		Segments:       segments,
+		SegmentSizes:   sizes,
+		MaxSegment:     maxSeg,
 	}, nil
 }
 
@@ -159,6 +171,12 @@ func NewReader(eventsDir string, watermark *Watermark) *Reader {
 func (r *Reader) ReadBatch(startCursor Cursor, maxRecords int) ([]Record, Cursor, error) {
 	if err := startCursor.Validate(); err != nil {
 		return nil, startCursor, fmt.Errorf("invalid start cursor: %w", err)
+	}
+	if r.watermark == nil {
+		return nil, startCursor, fmt.Errorf("missing journal watermark")
+	}
+	if startCursor.Segment <= r.watermark.RetiredThrough {
+		return nil, startCursor, fmt.Errorf("cursor requires retired transcript segment %d", startCursor.Segment)
 	}
 	if maxRecords <= 0 {
 		maxRecords = 1000
@@ -245,7 +263,7 @@ func readSegmentUpTo(f *os.File, segment uint64, startOffset, maxBytes int64, li
 			break
 		}
 
-		lineLen := newlineIdx + 1 // includes \n
+		lineLen := newlineIdx + 1                          // includes \n
 		lineBytes := buf[bufOffset : bufOffset+newlineIdx] // without \n
 		recordStart := currentPos
 		recordNext := currentPos + int64(lineLen)

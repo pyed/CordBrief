@@ -1,0 +1,2 @@
+# The Linux maintenance wrapper is also built from Windows working trees.
+collector/retention-publish.sh text eol=lf

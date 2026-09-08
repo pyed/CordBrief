@@ -64,7 +64,7 @@ func MigrateArtifacts(exchangeDir, dataDir string, dryRun bool) ([]MigrationRepo
 		sourceCount := len(citedSet)
 
 		// Check if already migrated
-		if len(art.SourceRefs) > 0 {
+		if len(art.SourceRefs) > 0 || sourceCount == 0 {
 			resolved := 0
 			for sID := range citedSet {
 				if ref, ok := art.SourceRefs[sID]; ok && ref.JumpLink() != "" {
