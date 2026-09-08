@@ -61,9 +61,6 @@ interface CordBriefEventV1 {
 
 const Native = VencordNative.pluginHelpers.CordBriefCollector as PluginNative<typeof NativeTypes>;
 
-const recoveringChannels = new Set<string>();
-const reconciledChannels = new Set<string>();
-const pendingLiveMessages = new Map<string, RawDiscordMessage[]>();
 let isRecoveryRunning = false;
 
 function getGuildIdForChannel(channelId: string): string | null {
@@ -159,9 +156,9 @@ async function runGapRecovery(): Promise<void> {
         await Native.reportRecoveryState("recovering", watchedChannels.length, null);
 
         let pendingCount = watchedChannels.length;
+        let failures = 0;
 
         for (const channelId of watchedChannels) {
-            recoveringChannels.add(channelId);
             let chSuccess = false;
             try {
                 // Invariant: Watched guild channels MUST have trusted non-empty guild ownership.
@@ -172,31 +169,52 @@ async function runGapRecovery(): Promise<void> {
                 }
 
                 const chState = recoveryState.channels[channelId];
-                if (!chState || !chState.checkpoint_message_id) {
+                if (!chState || (!chState.checkpoint_message_id && chState.checkpoint_source !== "baseline_pending")) {
                     // First-watch policy: initialize checkpoint from latest message without historical backfill
                     console.log(`[CordBrief] Initializing first-watch checkpoint for channel ${channelId}`);
+                    await Native.beginChannelInitialization(channelId);
                     const resp = await RestAPI.get({
                         url: `/channels/${channelId}/messages`,
                         query: { limit: 1 }
                     });
-                    let initialCheckpoint = "";
-                    if (resp && resp.ok && Array.isArray(resp.body) && resp.body.length > 0) {
-                        initialCheckpoint = String(resp.body[0].id);
-                    } else {
-                        // Empty channel or no messages: use current snowflake from timestamp
-                        initialCheckpoint = String((BigInt(Date.now()) - 1420070400000n) << 22n);
+                    if (!resp?.ok || !Array.isArray(resp.body)) throw new Error("First-watch REST lookup failed");
+                    // No visible ID leaves a durable open baseline, not a synthetic clock cutoff.
+                    if (resp.body.length) {
+                        const initialCheckpoint = String(resp.body[0].id);
+                        const saved = await Native.saveChannelCheckpoint(channelId, {
+                            checkpoint_message_id: initialCheckpoint,
+                            checkpoint_source: "baseline_rest",
+                            last_recovery_at: new Date().toISOString(), last_result: "success",
+                            last_error: null, recovered_count: 0
+                        });
+                        if (!saved) throw new Error("First-watch baseline persistence failed");
                     }
-                    await Native.saveChannelCheckpoint(channelId, {
-                        checkpoint_message_id: initialCheckpoint,
-                        last_recovery_at: new Date().toISOString(),
-                        last_result: "success",
-                        last_error: null,
-                        recovered_count: 0
-                    });
                     chSuccess = true;
                 } else {
                     // Existing checkpoint: fetch missed history with bounded pagination
-                    let currentCheckpoint = chState.checkpoint_message_id;
+                    let currentCheckpoint = chState.scan_after ?? chState.watch_after!;
+                    let until = chState.scan_until;
+                    if (until == null && !recoveryState.pending) {
+                        const latest = await RestAPI.get({ url: `/channels/${channelId}/messages`, query: { limit: 1 } });
+                        if (!latest?.ok || !Array.isArray(latest.body)) throw new Error("Recovery bound lookup failed");
+                        if (!latest.body.length) {
+                            const res = await Native.appendRecoveredMessages(channelId, [], chState.checkpoint_message_id || "0");
+                            if (!res.success) throw new Error(res.error);
+                            chSuccess = true;
+                            continue;
+                        }
+                        until = String(latest.body[0].id);
+                        if (BigInt(until) <= BigInt(chState.watch_after!)) {
+                            chSuccess = true;
+                            continue;
+                        }
+                        await Native.beginRecoveryScan(channelId, until);
+                    } else if (recoveryState.pending) {
+                        // Legacy/direct pending pages were fetched after the old checkpoint.
+                        // An unrelated channel must not start a sweep over their evidence.
+                        if (recoveryState.pending.channel_id !== channelId) throw new Error("Another channel has pending recovery");
+                        currentCheckpoint = chState.scan_after ?? (recoveryState.pending.old_checkpoint_message_id || "0");
+                    }
                     let pageCount = 0;
                     const maxPages = 10;
 
@@ -210,10 +228,17 @@ async function runGapRecovery(): Promise<void> {
                         if (!resp || !resp.ok) {
                             throw new Error(`Discord REST returned HTTP ${resp?.status || "unknown"}`);
                         }
+                        const currentWatchlist = await Native.getWatchlistConfig();
+                        if (!currentWatchlist.valid || !currentWatchlist.channel_ids.includes(channelId)) {
+                            throw new Error("Watch removed during recovery; page not committed");
+                        }
 
-                        const messages: RawDiscordMessage[] = resp.body;
-                        if (!Array.isArray(messages) || messages.length === 0) {
-                            break; // Gap fully caught up
+                        if (!Array.isArray(resp.body)) throw new Error("Unusable REST messages response");
+                        const messages: RawDiscordMessage[] = until == null ? resp.body
+                            : resp.body.filter((m: RawDiscordMessage) => BigInt(m.id) <= BigInt(until!));
+                        if (messages.length === 0) {
+                            await Native.finishRecoveryScan(channelId);
+                            break; // No visible page. Local journal evidence alone determines the floor.
                         }
 
                         // Deterministic sort: oldest -> newest by snowflake ID
@@ -237,10 +262,13 @@ async function runGapRecovery(): Promise<void> {
                         }
 
                         currentCheckpoint = pageNewestId;
-                        if (messages.length < 100) {
+                        if (until != null && BigInt(currentCheckpoint) >= BigInt(until)) {
+                            await Native.finishRecoveryScan(channelId);
                             break;
                         }
+                        // Even a short page is progress, not evidence of remote completeness.
                     }
+                    // A capped run may resume live capture; its local floor remains valid.
                     chSuccess = true;
                 }
             } catch (err: any) {
@@ -255,39 +283,13 @@ async function runGapRecovery(): Promise<void> {
                 });
                 chSuccess = false;
             } finally {
-                // Drain any live messages queued while this channel was recovering
-                const queue = pendingLiveMessages.get(channelId);
-                pendingLiveMessages.delete(channelId);
-                if (queue && queue.length > 0) {
-                    const curState = await Native.getRecoveryState();
-                    let latestCheckpoint = curState.channels[channelId]?.checkpoint_message_id || "0";
-                    queue.sort((a, b) => {
-                        const diff = BigInt(a.id) - BigInt(b.id);
-                        return diff < 0n ? -1 : (diff > 0n ? 1 : 0);
-                    });
-                    const qGuildId = getGuildIdForChannel(channelId) || "";
-                    for (const msg of queue) {
-                        if (BigInt(msg.id) <= BigInt(latestCheckpoint)) {
-                            continue; // Already accounted for in REST response
-                        }
-                        const jsonLine = JSON.stringify(normalizeMessage(msg, qGuildId));
-                        await Native.appendEventToJournal(jsonLine);
-                        // Invariant: Drained live events remain after latestCheckpoint's journal boundary
-                        // and do NOT advance the verified recovery checkpoint.
-                    }
-                }
-                recoveringChannels.delete(channelId);
-                if (chSuccess) {
-                    reconciledChannels.add(channelId);
-                } else {
-                    reconciledChannels.delete(channelId);
-                }
+                if (!chSuccess) failures++;
                 pendingCount--;
                 await Native.reportRecoveryState("recovering", pendingCount, null);
             }
         }
 
-        await Native.reportRecoveryState("ready", 0, null);
+        await Native.reportRecoveryState(failures ? "error" : "ready", failures, failures ? "Some channels require recovery retry" : null);
     } catch (err: any) {
         console.error("[CordBrief] Gap recovery encountered unexpected error:", err);
         await Native.reportRecoveryState("error", 0, String(err?.message || err));
@@ -324,19 +326,8 @@ export default definePlugin({
                 return;
             }
 
-            // Invariant: Live messages MUST NOT advance checkpoint across an unreconciled range.
-            // If the channel has not completed startup reconciliation, or is actively recovering, buffer it.
-            if (!reconciledChannels.has(message.channel_id) || recoveringChannels.has(message.channel_id)) {
-                let queue = pendingLiveMessages.get(message.channel_id);
-                if (!queue) {
-                    queue = [];
-                    pendingLiveMessages.set(message.channel_id, queue);
-                }
-                queue.push(message);
-                return;
-            }
-
-            // Channel is fully reconciled and up to date
+            // Persist immediately, including during initialization/recovery. Native
+            // serializes writes and deduplicates against durable journal evidence.
             let liveGuildId = message.guild_id ? String(message.guild_id) : "";
             if (!liveGuildId) {
                 liveGuildId = getGuildIdForChannel(message.channel_id) || "";
@@ -352,15 +343,6 @@ export default definePlugin({
 
     start() {
         console.log("[CordBrief] Production Collector plugin initialized.");
-
-        // Mark all currently watched channels as needing startup reconciliation before live events can advance checkpoints
-        Native.getWatchlistConfig().then(wl => {
-            if (wl && wl.valid && Array.isArray(wl.channel_ids)) {
-                for (const id of wl.channel_ids) {
-                    recoveringChannels.add(id);
-                }
-            }
-        }).catch(() => {});
 
         const extractAndPublishCatalog = async () => {
             try {

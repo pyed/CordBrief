@@ -9,6 +9,8 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import assert from "assert";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
 import {
     validateReleaseDirectory,
     evaluateRetentionPlan,
@@ -18,8 +20,16 @@ import {
     verifyLockOwnership
 } from "../runtime.mjs";
 
+const lockedRuntime = process.platform === "linux" && process.argv[2] === "--locked-case" ? process.argv[4] : null;
+let caseCount = 0;
+function runCase() {
+    const index = caseCount++;
+    return process.platform !== "linux" || (lockedRuntime && index === Number(process.argv[3]));
+}
+
 function makeTempDir(prefix = "cb-retention-test-") {
-    return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+    if (lockedRuntime && prefix === "cb-retention-test-") return lockedRuntime;
+    return fs.mkdtempSync(path.join(lockedRuntime || os.tmpdir(), prefix));
 }
 
 function createMockRelease(releasesDir, releaseId, options = {}) {
@@ -68,7 +78,7 @@ function setSymlink(runtimeDir, relativeTarget) {
     fs.symlinkSync(relativeTarget, currentLink, "junction");
 }
 
-function setupMockLock(runtimeDir, role = "setup") {
+function setupRuntimeLock(runtimeDir, role = "setup") {
     const lockFile = path.join(runtimeDir, "runtime.lock");
     const ownerFile = path.join(runtimeDir, "runtime-owner.json");
     fs.writeFileSync(lockFile, JSON.stringify({
@@ -84,21 +94,33 @@ function setupMockLock(runtimeDir, role = "setup") {
         hostname: "test-host",
         acquired_at: new Date().toISOString()
     }, null, 2));
-    return { role, acquired: true };
+    // Linux must use the inherited kernel lock; only Windows uses the old mock context.
+    const context = process.platform === "linux" ? { role } : { role, acquired: true };
+    assert.strictEqual(verifyLockOwnership({ runtimeDir, lockContext: context }), true);
+    return context;
 }
 
 async function runTests() {
-    console.log("=== Running Milestone 13 Phase 2 Retention & Rollback Tests ===");
+    if (lockedRuntime) {
+        const lockFile = path.join(lockedRuntime, "runtime.lock");
+        assert.strictEqual(fs.realpathSync("/proc/self/fd/9"), fs.realpathSync(lockFile));
+        assert.match(fs.readFileSync("/proc/self/fdinfo/9", "utf8"), /lock:\s+\d+:\s+FLOCK\s+ADVISORY\s+WRITE/);
+        assert.strictEqual(verifyLockOwnership({ runtimeDir: lockedRuntime, lockContext: { role: "setup" } }), true);
+        assert.strictEqual(spawnSync("flock", ["-n", lockFile, "true"]).status, 1, "Independent lock acquisition must fail");
+        console.log("  FIXTURE: intended FD 9, kernel FLOCK WRITE, production validator and exclusion verified.");
+    } else {
+        console.log("=== Running Milestone 13 Phase 2 Retention & Rollback Tests ===");
+    }
 
     // Test A: One valid current release -> delete nothing
-    {
+    if (runCase()) {
         console.log("[Test A] One valid current release -> delete nothing...");
         const tmp = makeTempDir();
         const releasesDir = path.join(tmp, "releases");
         fs.mkdirSync(releasesDir, { recursive: true });
         createMockRelease(releasesDir, "20260906010000");
         setSymlink(tmp, "releases/20260906010000");
-        const lockContext = setupMockLock(tmp, "setup");
+        const lockContext = setupRuntimeLock(tmp, "setup");
 
         const plan = evaluateRetentionPlan({ runtimeDir: tmp });
         assert(!plan.failClosed, "Must not fail closed");
@@ -114,7 +136,7 @@ async function runTests() {
     }
 
     // Test B: Two valid releases -> keep both
-    {
+    if (runCase()) {
         console.log("[Test B] Two valid releases -> keep both...");
         const tmp = makeTempDir();
         const releasesDir = path.join(tmp, "releases");
@@ -122,7 +144,7 @@ async function runTests() {
         createMockRelease(releasesDir, "20260906010000", { createdAt: "2026-09-06T01:00:00.000Z" });
         createMockRelease(releasesDir, "20260906020000", { createdAt: "2026-09-06T02:00:00.000Z" });
         setSymlink(tmp, "releases/20260906020000");
-        const lockContext = setupMockLock(tmp, "setup");
+        const lockContext = setupRuntimeLock(tmp, "setup");
 
         const plan = evaluateRetentionPlan({ runtimeDir: tmp });
         assert(!plan.failClosed);
@@ -139,7 +161,7 @@ async function runTests() {
     }
 
     // Test C: Three valid releases -> keep current + newest valid previous -> oldest pruned
-    {
+    if (runCase()) {
         console.log("[Test C] Three valid releases -> keep current + newest previous, prune oldest...");
         const tmp = makeTempDir();
         const releasesDir = path.join(tmp, "releases");
@@ -148,7 +170,7 @@ async function runTests() {
         createMockRelease(releasesDir, "20260906020000", { createdAt: "2026-09-06T02:00:00.000Z" });
         createMockRelease(releasesDir, "20260906030000", { createdAt: "2026-09-06T03:00:00.000Z" });
         setSymlink(tmp, "releases/20260906030000");
-        const lockContext = setupMockLock(tmp, "setup");
+        const lockContext = setupRuntimeLock(tmp, "setup");
 
         const plan = evaluateRetentionPlan({ runtimeDir: tmp });
         assert.strictEqual(plan.currentReleaseId, "20260906030000");
@@ -165,7 +187,7 @@ async function runTests() {
     }
 
     // Test D: Five valid releases -> exactly two retained
-    {
+    if (runCase()) {
         console.log("[Test D] Five valid releases -> exactly two retained...");
         const tmp = makeTempDir();
         const releasesDir = path.join(tmp, "releases");
@@ -176,7 +198,7 @@ async function runTests() {
             });
         }
         setSymlink(tmp, "releases/20260906050000");
-        const lockContext = setupMockLock(tmp, "setup");
+        const lockContext = setupRuntimeLock(tmp, "setup");
 
         const plan = evaluateRetentionPlan({ runtimeDir: tmp });
         assert.strictEqual(plan.keepReleaseIds.length, 2);
@@ -194,7 +216,7 @@ async function runTests() {
     }
 
     // Test E: Current is not lexicographically newest -> current STILL retained -> proper previous chosen
-    {
+    if (runCase()) {
         console.log("[Test E] Current not newest -> current still retained and rollback selected...");
         const tmp = makeTempDir();
         const releasesDir = path.join(tmp, "releases");
@@ -204,7 +226,7 @@ async function runTests() {
         createMockRelease(releasesDir, "20260906030000", { createdAt: "2026-09-06T03:00:00.000Z" });
         // Symlink is set to the middle release (e.g. following a rollback)
         setSymlink(tmp, "releases/20260906020000");
-        const lockContext = setupMockLock(tmp, "setup");
+        const lockContext = setupRuntimeLock(tmp, "setup");
 
         const plan = evaluateRetentionPlan({ runtimeDir: tmp });
         assert.strictEqual(plan.currentReleaseId, "20260906020000");
@@ -221,7 +243,7 @@ async function runTests() {
     }
 
     // Test F: Malformed manifest in old directory -> never considered rollback candidate
-    {
+    if (runCase()) {
         console.log("[Test F] Malformed manifest in old directory -> handled safely, not rollback candidate...");
         const tmp = makeTempDir();
         const releasesDir = path.join(tmp, "releases");
@@ -241,7 +263,7 @@ async function runTests() {
     }
 
     // Test G: Malformed current target -> FAIL CLOSED -> prune nothing
-    {
+    if (runCase()) {
         console.log("[Test G] Malformed current target -> fail closed and prune nothing...");
         const tmp = makeTempDir();
         const releasesDir = path.join(tmp, "releases");
@@ -249,7 +271,7 @@ async function runTests() {
         createMockRelease(releasesDir, "20260906010000");
         createMockRelease(releasesDir, "20260906020000", { missingDiscord: true });
         setSymlink(tmp, "releases/20260906020000");
-        const lockContext = setupMockLock(tmp, "setup");
+        const lockContext = setupRuntimeLock(tmp, "setup");
 
         const plan = evaluateRetentionPlan({ runtimeDir: tmp });
         assert.strictEqual(plan.failClosed, true);
@@ -263,13 +285,13 @@ async function runTests() {
     }
 
     // Test H: Current symlink missing -> prune nothing
-    {
+    if (runCase()) {
         console.log("[Test H] Current symlink missing -> prune nothing...");
         const tmp = makeTempDir();
         const releasesDir = path.join(tmp, "releases");
         fs.mkdirSync(releasesDir, { recursive: true });
         createMockRelease(releasesDir, "20260906010000");
-        const lockContext = setupMockLock(tmp, "setup");
+        const lockContext = setupRuntimeLock(tmp, "setup");
 
         const plan = evaluateRetentionPlan({ runtimeDir: tmp });
         assert.strictEqual(plan.failClosed, true);
@@ -283,7 +305,7 @@ async function runTests() {
     }
 
     // Test I: Current symlink points outside releases/ -> prune nothing
-    {
+    if (runCase()) {
         console.log("[Test I] Current symlink points outside releases/ -> prune nothing...");
         const tmp = makeTempDir();
         const releasesDir = path.join(tmp, "releases");
@@ -291,7 +313,7 @@ async function runTests() {
         createMockRelease(releasesDir, "20260906010000");
         // Point symlink to outside
         setSymlink(tmp, "../outside");
-        const lockContext = setupMockLock(tmp, "setup");
+        const lockContext = setupRuntimeLock(tmp, "setup");
 
         const plan = evaluateRetentionPlan({ runtimeDir: tmp });
         assert.strictEqual(plan.failClosed, true);
@@ -304,7 +326,7 @@ async function runTests() {
     }
 
     // Test J: Candidate directory symlink / path traversal -> refuse deletion
-    {
+    if (runCase()) {
         console.log("[Test J] Candidate directory symlink / path traversal -> refuse deletion...");
         const tmp = makeTempDir();
         const releasesDir = path.join(tmp, "releases");
@@ -322,21 +344,21 @@ async function runTests() {
         assert(plan.ignoredEntryIds.includes("symlink_dir"), "Symlinked release directory must be ignored");
         assert(!plan.pruneCandidateIds.includes("symlink_dir"));
 
-        const lockContext = setupMockLock(tmp, "setup");
+        const lockContext = setupRuntimeLock(tmp, "setup");
         pruneRuntimeReleases({ runtimeDir: tmp, lockContext });
         assert(fs.existsSync(outside), "Outside directory must not be deleted");
         console.log("  ✔ Test J passed.");
     }
 
     // Test K: Failed staging before activation -> previous releases untouched
-    {
+    if (runCase()) {
         console.log("[Test K] Failed staging before activation -> previous releases untouched...");
         const tmp = makeTempDir();
         const releasesDir = path.join(tmp, "releases");
         fs.mkdirSync(releasesDir, { recursive: true });
         createMockRelease(releasesDir, "20260906010000");
         setSymlink(tmp, "releases/20260906010000");
-        const lockContext = setupMockLock(tmp, "setup");
+        const lockContext = setupRuntimeLock(tmp, "setup");
 
         // Simulate failed staging: error thrown before activation
         try {
@@ -350,7 +372,7 @@ async function runTests() {
     }
 
     // Test L: Failed atomic activation -> previous releases untouched
-    {
+    if (runCase()) {
         console.log("[Test L] Failed atomic activation -> previous releases untouched...");
         const tmp = makeTempDir();
         const releasesDir = path.join(tmp, "releases");
@@ -358,7 +380,7 @@ async function runTests() {
         createMockRelease(releasesDir, "20260906010000");
         createMockRelease(releasesDir, "20260906020000");
         setSymlink(tmp, "releases/20260906010000");
-        const lockContext = setupMockLock(tmp, "setup");
+        const lockContext = setupRuntimeLock(tmp, "setup");
 
         // If activation fails to update current, current is still 010000
         const plan = evaluateRetentionPlan({ runtimeDir: tmp });
@@ -368,7 +390,7 @@ async function runTests() {
     }
 
     // Test M: Successful activation -> prune only after activation success
-    {
+    if (runCase()) {
         console.log("[Test M] Successful activation -> prune only after activation success...");
         const tmp = makeTempDir();
         const releasesDir = path.join(tmp, "releases");
@@ -377,7 +399,7 @@ async function runTests() {
         createMockRelease(releasesDir, "20260906020000", { createdAt: "2026-09-06T02:00:00.000Z" });
         createMockRelease(releasesDir, "20260906030000", { createdAt: "2026-09-06T03:00:00.000Z" });
         setSymlink(tmp, "releases/20260906030000");
-        const lockContext = setupMockLock(tmp, "setup");
+        const lockContext = setupRuntimeLock(tmp, "setup");
 
         const valCurrent = validateReleaseDirectory(path.join(tmp, "current"));
         assert(valCurrent.valid, "Current must validate");
@@ -387,14 +409,14 @@ async function runTests() {
     }
 
     // Test N: Stale known .tmp release while lock held -> safely cleaned
-    {
+    if (runCase()) {
         console.log("[Test N] Stale known .tmp release -> safely cleaned...");
         const tmp = makeTempDir();
         const releasesDir = path.join(tmp, "releases");
         fs.mkdirSync(releasesDir, { recursive: true });
         createMockRelease(releasesDir, "20260906010000");
         setSymlink(tmp, "releases/20260906010000");
-        const lockContext = setupMockLock(tmp, "setup");
+        const lockContext = setupRuntimeLock(tmp, "setup");
 
         const staleTmp = path.join(releasesDir, "20260906020000.tmp");
         fs.mkdirSync(staleTmp, { recursive: true });
@@ -410,14 +432,14 @@ async function runTests() {
     }
 
     // Test O: Ambiguous unknown directory -> preserved/reported, not deleted
-    {
+    if (runCase()) {
         console.log("[Test O] Ambiguous unknown directory -> preserved/reported, not deleted...");
         const tmp = makeTempDir();
         const releasesDir = path.join(tmp, "releases");
         fs.mkdirSync(releasesDir, { recursive: true });
         createMockRelease(releasesDir, "20260906010000");
         setSymlink(tmp, "releases/20260906010000");
-        const lockContext = setupMockLock(tmp, "setup");
+        const lockContext = setupRuntimeLock(tmp, "setup");
 
         const unknownDir = path.join(releasesDir, "custom_backup_snapshot");
         fs.mkdirSync(unknownDir, { recursive: true });
@@ -433,7 +455,7 @@ async function runTests() {
     }
 
     // Test P: Rollback activation to validated previous -> current switches atomically & validates
-    {
+    if (runCase()) {
         console.log("[Test P] Rollback activation to validated previous -> atomic switch and validates...");
         const tmp = makeTempDir();
         const releasesDir = path.join(tmp, "releases");
@@ -441,7 +463,7 @@ async function runTests() {
         createMockRelease(releasesDir, "20260906010000", { createdAt: "2026-09-06T01:00:00.000Z" });
         createMockRelease(releasesDir, "20260906020000", { createdAt: "2026-09-06T02:00:00.000Z" });
         setSymlink(tmp, "releases/20260906020000");
-        const lockContext = setupMockLock(tmp, "setup");
+        const lockContext = setupRuntimeLock(tmp, "setup");
 
         const rollbackRes = rollbackRuntimeRelease({
             runtimeDir: tmp,
@@ -465,14 +487,14 @@ async function runTests() {
     }
 
     // Test Q: Attempt rollback to arbitrary / outside path -> rejected
-    {
+    if (runCase()) {
         console.log("[Test Q] Attempt rollback to arbitrary / outside path -> rejected...");
         const tmp = makeTempDir();
         const releasesDir = path.join(tmp, "releases");
         fs.mkdirSync(releasesDir, { recursive: true });
         createMockRelease(releasesDir, "20260906010000");
         setSymlink(tmp, "releases/20260906010000");
-        const lockContext = setupMockLock(tmp, "setup");
+        const lockContext = setupRuntimeLock(tmp, "setup");
 
         assert.throws(() => {
             rollbackRuntimeRelease({
@@ -494,7 +516,7 @@ async function runTests() {
     }
 
     // Test R: Failure during atomic symlink switch leaves previous current intact
-    {
+    if (runCase()) {
         console.log("[Test R] Failure during atomic symlink switch leaves previous current intact...");
         const tmp = makeTempDir();
         const releasesDir = path.join(tmp, "releases");
@@ -502,7 +524,7 @@ async function runTests() {
         createMockRelease(releasesDir, "20260906010000");
         createMockRelease(releasesDir, "20260906020000");
         setSymlink(tmp, "releases/20260906020000");
-        const lockContext = setupMockLock(tmp, "setup");
+        const lockContext = setupRuntimeLock(tmp, "setup");
 
         assert.throws(() => {
             rollbackRuntimeRelease({
@@ -524,7 +546,7 @@ async function runTests() {
     }
 
     // Test S: On Windows, replacing without explicit test hook fails closed leaving previous current untouched
-    if (process.platform === "win32") {
+    if (process.platform === "win32" && runCase()) {
         console.log("[Test S] Windows fails closed when atomic replace unsupported, leaving current untouched...");
         const tmp = makeTempDir();
         const releasesDir = path.join(tmp, "releases");
@@ -532,7 +554,7 @@ async function runTests() {
         createMockRelease(releasesDir, "20260906010000");
         createMockRelease(releasesDir, "20260906020000");
         setSymlink(tmp, "releases/20260906020000");
-        const lockContext = setupMockLock(tmp, "setup");
+        const lockContext = setupRuntimeLock(tmp, "setup");
 
         assert.throws(() => {
             rollbackRuntimeRelease({
@@ -551,7 +573,7 @@ async function runTests() {
     }
 
     // Test Lock Context: Collector or unauthorized caller cannot prune
-    {
+    if (runCase()) {
         console.log("[Lock Enforcement] Collector role refused pruning...");
         const tmp = makeTempDir();
         const releasesDir = path.join(tmp, "releases");
@@ -576,6 +598,30 @@ async function runTests() {
         console.log("  ✔ Lock enforcement verified.");
     }
 
+    if (lockedRuntime) {
+        const index = Number(process.argv[3]);
+        assert(Number.isInteger(index) && index >= 0 && index < caseCount, "Child must execute a real case");
+        assert.strictEqual(verifyLockOwnership({ runtimeDir: lockedRuntime, lockContext: { role: "setup" } }), true);
+        return;
+    }
+    if (process.platform === "linux") {
+        for (let index = 0; index < caseCount; index++) {
+            const runtimeDir = makeTempDir();
+            const lockFile = path.join(runtimeDir, "runtime.lock");
+            try {
+                // Same inherited-FD mechanism as adversarial_lock_test and setup entrypoint.
+                const child = spawnSync("bash", ["-c",
+                    'exec 9>"$1"; flock -n 9 || exit $?; shift; exec "$@"',
+                    "retention-lock", lockFile, process.execPath, fileURLToPath(import.meta.url),
+                    "--locked-case", String(index), runtimeDir], { stdio: "inherit", timeout: 30000 });
+                assert.strictEqual(child.status, 0, `Retention case ${index} failed: ${child.error || child.signal || child.status}`);
+                assert.strictEqual(spawnSync("flock", ["-n", lockFile, "true"]).status, 0, "Child exit must release flock");
+            } finally {
+                fs.rmSync(runtimeDir, { recursive: true, force: true });
+            }
+        }
+        console.log(`  FIXTURE: ${caseCount} isolated Linux cases; lock release verified after every child.`);
+    }
     console.log("=== ALL RETENTION & ROLLBACK TESTS PASSED (100%) ===");
 }
 
