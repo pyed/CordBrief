@@ -15,12 +15,13 @@ import {
     rollbackRuntimeRelease,
     listRuntimeReleases
 } from "./runtime.mjs";
-import { getLatestAppDir, patchVencord } from "./supervisor.mjs";
+import { getSetupAppDir, patchVencord } from "./supervisor.mjs";
 
 export function stageRuntime({
     runtimeDir = process.env.CORDBRIEF_RUNTIME_DIR || "/var/cordbrief/runtime",
     vencordSourceDir = "/home/cordbrief/vencord",
     discordConfigDir = "/home/cordbrief/.config/discord",
+    discordAppSrcDir = getSetupAppDir(discordConfigDir),
     force = false
 } = {}) {
     const vencordDistSrc = path.join(vencordSourceDir, "dist");
@@ -28,7 +29,7 @@ export function stageRuntime({
         throw new Error(`Vencord dist source directory not found: ${vencordDistSrc}`);
     }
 
-    const appDir = getLatestAppDir(discordConfigDir);
+    const appDir = discordAppSrcDir;
     if (!appDir) {
         throw new Error(`No Discord app directory found in ${discordConfigDir}`);
     }

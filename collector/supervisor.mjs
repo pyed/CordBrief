@@ -10,7 +10,7 @@ import { spawn, execSync } from "child_process";
 import * as fs from "fs";
 import * as path from "path";
 import * as http from "http";
-import { acquireRuntimeLock, validateRuntimeManifest } from "./runtime.mjs";
+import { acquireRuntimeLock, validateRuntimeManifest, resolveManifestPath } from "./runtime.mjs";
 import { stageRuntime } from "./stage-runtime.mjs";
 
 export const MODES = {
@@ -49,6 +49,12 @@ export function getLatestAppDir(discordConfigDir) {
         .sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
     if (entries.length === 0) return null;
     return path.join(discordConfigDir, entries[entries.length - 1]);
+}
+
+export function getSetupAppDir(discordConfigDir) {
+    const profileBin = path.join(discordConfigDir, "Discord");
+    if (fs.existsSync(profileBin)) return path.dirname(fs.realpathSync(profileBin));
+    return getLatestAppDir(discordConfigDir);
 }
 
 export function isVencordPatched(appDir) {
@@ -519,12 +525,12 @@ export class CollectorSupervisor {
         if (this.role === "collector") {
             const val = validateRuntimeManifest(this.runtimeManifestFile);
             if (val.valid && val.manifest.paths?.vencord_dist) {
-                return val.manifest.paths.vencord_dist;
+                return resolveManifestPath(this.runtimeManifestFile, val.manifest.paths.vencord_dist);
             }
             if (fs.existsSync(this.legacyRuntimeManifestFile)) {
                 const legVal = validateRuntimeManifest(this.legacyRuntimeManifestFile);
                 if (legVal.valid && legVal.manifest.paths?.vencord_dist) {
-                    return legVal.manifest.paths.vencord_dist;
+                    return resolveManifestPath(this.legacyRuntimeManifestFile, legVal.manifest.paths.vencord_dist);
                 }
             }
         }
@@ -533,9 +539,18 @@ export class CollectorSupervisor {
         return this.vencordDir;
     }
 
+    getDiscordAppDir() {
+        // Patching, probing, launching, and staging must all use the same application.
+        const runtimeApp = path.join(this.runtimeDir, "current", "discord");
+        if (this.role === "collector") return runtimeApp;
+        if (this.role === "setup") return getSetupAppDir(this.discordConfigDir);
+        const profileBin = path.join(this.discordConfigDir, "Discord");
+        if (fs.existsSync(profileBin)) return path.dirname(fs.realpathSync(profileBin));
+        if (fs.existsSync(path.join(runtimeApp, "Discord"))) return runtimeApp;
+        return getLatestAppDir(this.discordConfigDir);
+    }
+
     hasProfileSessionFiles() {
-        const appDir = getLatestAppDir(this.discordConfigDir);
-        if (!appDir) return false;
         const storageDir = path.join(this.discordConfigDir, "Local Storage");
         const cookiesFile = path.join(this.discordConfigDir, "Cookies");
         return fs.existsSync(storageDir) || (fs.existsSync(cookiesFile) && fs.statSync(cookiesFile).size > 0);
@@ -751,7 +766,7 @@ export class CollectorSupervisor {
         this.publishStatus();
 
         await this.stopDiscordProcess();
-        const appDir = getLatestAppDir(this.discordConfigDir);
+        const appDir = this.getDiscordAppDir();
         if (appDir) {
             unpatchVencord(appDir);
         }
@@ -766,7 +781,7 @@ export class CollectorSupervisor {
         this.publishStatus();
 
         await this.stopDiscordProcess();
-        const appDir = getLatestAppDir(this.discordConfigDir);
+        const appDir = this.getDiscordAppDir();
 
         if (this.role === "setup") {
             console.log("[Supervisor] Setup role detected: staging runtime distribution release...");
@@ -776,6 +791,7 @@ export class CollectorSupervisor {
                     runtimeDir: this.runtimeDir,
                     vencordSourceDir: this.vencordDir,
                     discordConfigDir: this.discordConfigDir,
+                    discordAppSrcDir: appDir,
                     force: true
                 });
                 releaseId = staged.releaseId;
@@ -802,7 +818,7 @@ export class CollectorSupervisor {
             console.log(`[Setup] Runtime release staged and activated: ${releaseId}`);
             console.log("[Setup] Terminating setup environment and releasing runtime lock.");
             console.log("[Setup] You may now start the minimal collector daemon:");
-            console.log("  docker compose start cordbrief-collector");
+            console.log("  docker compose -f docker/compose.yml up -d");
             console.log("==================================================");
 
             if (this.lockHandle) {
@@ -847,18 +863,19 @@ export class CollectorSupervisor {
         this.sawUnauthenticated = false;
         this.discordProcessStartTime = Date.now();
 
-        let bin = "discord";
-        const runtimeBin = path.join(this.runtimeDir, "current", "discord", "Discord");
-        const profileBin = path.join(this.discordConfigDir, "Discord");
-
-        if (this.role === "collector" && fs.existsSync(runtimeBin)) {
-            bin = runtimeBin;
-        } else if (fs.existsSync(profileBin)) {
-            bin = profileBin;
-        } else if (fs.existsSync(runtimeBin)) {
-            bin = runtimeBin;
+        const appDir = this.getDiscordAppDir();
+        const bin = appDir ? path.join(appDir, "Discord") : "discord";
+        if (this.role === "collector" || this.role === "setup") {
+            // Prepared releases use local modules; host updates belong to clean Setup.
+            const settingsFile = path.join(this.discordConfigDir, "settings.json");
+            const settings = fs.existsSync(settingsFile) ? JSON.parse(fs.readFileSync(settingsFile, "utf8")) : {};
+            settings.SKIP_HOST_UPDATE = this.role === "collector";
+            const tmp = `${settingsFile}.${process.pid}.tmp`;
+            fs.writeFileSync(tmp, JSON.stringify(settings, null, 2));
+            fs.renameSync(tmp, settingsFile);
         }
 
+        if (!this.spawnDiscord) return;
         console.log(`[Supervisor] Launching Discord (${this.mode} mode): ${bin}`);
         const child = spawn(bin, ["--no-sandbox", `--user-data-dir=${this.discordConfigDir}`, `--remote-debugging-port=${this.cdpPort}`, "--enable-logging"], {
             stdio: "inherit",
@@ -945,7 +962,7 @@ export class CollectorSupervisor {
             return false;
         }
         // ONLY for clean Discord (never patched Vencord)
-        const appDir = getLatestAppDir(this.discordConfigDir);
+        const appDir = this.getDiscordAppDir();
         if (appDir && isVencordPatched(appDir)) {
             return false;
         }
@@ -1078,11 +1095,11 @@ export class CollectorSupervisor {
                 return false;
             }
             if (val.manifest.paths?.vencord_dist) {
-                this.vencordDir = val.manifest.paths.vencord_dist;
+                this.vencordDir = resolveManifestPath(manifestPath, val.manifest.paths.vencord_dist);
             }
         }
 
-        const appDir = getLatestAppDir(this.discordConfigDir);
+        const appDir = this.getDiscordAppDir();
         const hasSession = this.hasProfileSessionFiles();
 
         const initCmd = parseCommandFile(this.commandFile);
@@ -1136,12 +1153,14 @@ export class CollectorSupervisor {
                     console.log("[Supervisor] Authentication proven! Transitioning to NORMAL mode...");
                     this.discordAuthenticated = true;
                     await this.transitionToNormal();
-                } else {
-                    console.log(`[Supervisor] Profile unauthenticated or expired (${probe.url || "timeout"}). Keeping Discord clean in REAUTH mode.`);
+                } else if (probe.reason === "login_url" || probe.reason === "no_token_or_login") {
+                    console.log(`[Supervisor] Profile unauthenticated or expired (${probe.url}). Keeping Discord clean in REAUTH mode.`);
                     this.mode = MODES.REAUTH;
                     this.collectorState = "reauth_required";
                     this.discordAuthenticated = false;
                     this.publishStatus();
+                } else {
+                    console.log("[Supervisor] Authentication probe inconclusive; continuing to wait for clean Discord.");
                 }
             } else {
                 // In non-spawning mode (unit tests), inspect route via mock CDP

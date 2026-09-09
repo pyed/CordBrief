@@ -1084,6 +1084,11 @@ async function runTests() {
         fs.writeFileSync(path.join(resDir, "app.asar"), "CLEAN");
         fs.mkdirSync(path.join(discordDir, "Local Storage"), { recursive: true });
 
+        // Collector launches the prepared application, independently of the profile app.
+        const runtimeResources = path.join(currentDir, "discord", "resources");
+        fs.mkdirSync(runtimeResources, { recursive: true });
+        fs.writeFileSync(path.join(runtimeResources, "app.asar"), "CLEAN_RUNTIME");
+
         // Create mock CDP server with authenticated route
         const cdpServer = http.createServer((req, res) => {
             if (req.url === "/json") {

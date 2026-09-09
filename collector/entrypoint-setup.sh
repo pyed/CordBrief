@@ -58,13 +58,6 @@ mkdir -p "$DISCORD_CONFIG_DIR"
 touch "$DISCORD_CONFIG_DIR/domainMigrated"
 rm -f "$DISCORD_CONFIG_DIR"/Singleton* "$DISCORD_CONFIG_DIR"/DevToolsActivePort 2>/dev/null || true
 
-# Ensure symlink points to latest installed app version if updated
-LATEST_APP=$(ls -d "$DISCORD_CONFIG_DIR"/app-* 2>/dev/null | sort -V | tail -n 1 || true)
-if [ -n "$LATEST_APP" ] && [ -x "$LATEST_APP/Discord" ]; then
-    echo "[Setup] Pointing Discord symlink to latest version: $LATEST_APP"
-    ln -sf "$LATEST_APP/Discord" "$DISCORD_CONFIG_DIR/Discord"
-fi
-
 SETTINGS_FILE="$DISCORD_CONFIG_DIR/settings.json"
 if [ ! -f "$SETTINGS_FILE" ]; then
     echo "[Setup] Initializing official Discord settings.json..."
@@ -83,12 +76,6 @@ export DISCORD_WEBAPP_ENDPOINT="https://discord.com"
 if [ ! -f /home/cordbrief/vencord/dist/patcher.js ]; then
     echo "[Setup] Building Vencord from source..."
     (cd /home/cordbrief/vencord && pnpm build)
-fi
-
-# Stage runtime release if Discord app is already installed
-if [ -n "$LATEST_APP" ] && [ -d "$LATEST_APP" ]; then
-    echo "[Setup] Staging runtime distribution release into volume ($RUNTIME_DIR)..."
-    node /home/cordbrief/stage-runtime.mjs --force || true
 fi
 
 DISPLAY_NUM="${DISPLAY:-:100}"

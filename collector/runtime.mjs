@@ -301,9 +301,16 @@ export function copyDirSync(src, dest) {
     }
 }
 
-/**
- * Check if runtime should be staged or can be reused (for fast reauth).
- */
+// Installed Linux applications need not live in an app-<version> directory.
+export function getDiscordVersion(appDir) {
+    const buildInfo = path.join(appDir, "resources", "build_info.json");
+    if (fs.existsSync(buildInfo)) {
+        return JSON.parse(fs.readFileSync(buildInfo, "utf8")).version;
+    }
+    return path.basename(appDir).replace(/^app-/, "");
+}
+
+/** Check if runtime should be staged or can be reused (for fast reauth). */
 export function shouldStageRuntime({
     runtimeDir = "/var/cordbrief/runtime",
     discordAppSrcDir = null,
@@ -315,7 +322,7 @@ export function shouldStageRuntime({
     if (!val.valid) return true;
 
     if (discordAppSrcDir) {
-        const appVersion = path.basename(discordAppSrcDir).replace(/^app-/, "");
+        const appVersion = getDiscordVersion(discordAppSrcDir);
         if (val.manifest.discord_version && val.manifest.discord_version !== appVersion) {
             return true;
         }
@@ -446,7 +453,7 @@ export function createRuntimeRelease({
     // 7. Write runtime manifest with relative paths
     const manifestPath = path.join(tmpReleaseDir, "runtime-manifest.json");
     const manifest = writeRuntimeManifest(manifestPath, {
-        discord_version: path.basename(discordAppSrcDir).replace(/^app-/, ""),
+        discord_version: getDiscordVersion(discordAppSrcDir),
         vencord_version: "1.0.0",
         plugin_version: "1.0.0",
         paths: {
@@ -1057,4 +1064,3 @@ export function rollbackRuntimeRelease({
 export function listRuntimeReleases({ runtimeDir = "/var/cordbrief/runtime" } = {}) {
     return evaluateRetentionPlan({ runtimeDir });
 }
-
