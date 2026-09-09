@@ -34,24 +34,13 @@ export function stageRuntime({
         throw new Error(`No Discord app directory found in ${discordConfigDir}`);
     }
 
-    // Fast check: if compatible runtime already active, reuse it
-    if (!force && !shouldStageRuntime({ runtimeDir, discordAppSrcDir: appDir, force })) {
-        const manifestPath = path.join(runtimeDir, "current", "runtime-manifest.json");
-        const val = validateRuntimeManifest(manifestPath);
-        return {
-            reused: true,
-            manifest: val.manifest,
-            releaseId: "current",
-            vencordDistDest: path.join(runtimeDir, "current", "vencord", "dist"),
-            patcherEntry: path.join(runtimeDir, "current", "vencord", "dist", "patcher.js"),
-            discordBin: path.join(runtimeDir, "current", "discord", "Discord")
-        };
-    }
+    // Reusing an active runtime still needs retention (including earlier skipped prunes).
+    const reused = !force && !shouldStageRuntime({ runtimeDir, discordAppSrcDir: appDir, force });
 
     const pluginSrcDir = path.join(vencordSourceDir, "src", "userplugins", "cordbriefCollector");
 
     // Create immutable versioned release and atomically update 'current' symlink
-    const release = createRuntimeRelease({
+    const release = reused ? { releaseId: "current" } : createRuntimeRelease({
         runtimeDir,
         discordAppSrcDir: appDir,
         vencordDistSrcDir: vencordDistSrc,
@@ -78,8 +67,8 @@ export function stageRuntime({
     }
 
     return {
-        reused: false,
-        manifest: release.manifest,
+        reused,
+        manifest: validation.manifest,
         releaseId: release.releaseId,
         vencordDistDest: path.join(runtimeDir, "current", "vencord", "dist"),
         patcherEntry: path.join(runtimeDir, "current", "vencord", "dist", "patcher.js"),

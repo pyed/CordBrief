@@ -79,6 +79,7 @@ if [ ! -f /home/cordbrief/vencord/dist/patcher.js ]; then
 fi
 
 DISPLAY_NUM="${DISPLAY:-:100}"
+export DISPLAY="$DISPLAY_NUM"
 PORT="${XPRA_PORT:-28742}"
 
 # 6. Clean up stale X11 / Xpra socket and lock files
@@ -124,7 +125,7 @@ EOF
 echo "[Setup] Starting Xpra desktop on port $PORT hosting Openbox & Discord ($DISPLAY_NUM)..."
 
 # 10. Launch Xpra in desktop mode, forwarding all necessary environment variables to children
-exec xpra start-desktop \
+xpra start-desktop \
     --bind-tcp="0.0.0.0:${PORT}" \
     --html=on \
     --daemon=no \
@@ -144,5 +145,9 @@ exec xpra start-desktop \
     --env="CORDBRIEF_RUNTIME_DIR=${RUNTIME_DIR}" \
     --xvfb="Xvfb -screen 0 1280x800x24 +extension GLX +extension RANDR +extension RENDER +extension Composite -nolisten tcp -noreset" \
     --start-child="openbox" \
-    --start-child="node /home/cordbrief/supervisor.mjs" \
-    "${DISPLAY_NUM}"
+    "${DISPLAY_NUM}" 9>&- &
+
+# Xpra closes inherited descriptors in its children. Start the supervisor directly
+# from the lock-owning shell so FD 9 survives, just as in the runtime entrypoint.
+timeout 30 xpra wait-for-x11 "${DISPLAY_NUM}"
+exec node /home/cordbrief/supervisor.mjs
