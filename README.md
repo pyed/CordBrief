@@ -46,7 +46,8 @@ a digest. Keep the Web UI private and only collect conversations you have permis
 to process. Summaries can be wrong; the source links are there to check them.
 
 [Architecture](docs/ARCHITECTURE.md) · [Recovery](docs/RECOVERY_CONTRACT.md) ·
-[Retention](docs/RETENTION.md) · [Contributing](CONTRIBUTING.md)
+[Retention](docs/RETENTION.md) · [RPC probe research](docs/DISCORD_RPC_PROBE.md) ·
+[Contributing](CONTRIBUTING.md)
 
 [MIT licensed](LICENSE). Discord, Vencord, and other upstream components retain
 their own licenses and terms.
