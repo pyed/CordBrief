@@ -1,0 +1,114 @@
+# CordBrief Official Discord RPC Collector Dockerfile
+# Headless daemon running official, unmodified Discord desktop client + local RPC collector
+# Completely free of Vencord, client patching, app.asar modification, or CDP automation.
+
+FROM debian:bookworm-slim
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=en_US.UTF-8
+ENV LC_ALL=en_US.UTF-8
+ENV ELECTRON_DISABLE_SANDBOX=1
+ENV XDG_RUNTIME_DIR=/tmp/runtime-cordbrief
+
+# 1. Base certificates, gnupg, and curl
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates \
+    curl \
+    gnupg \
+    procps \
+    && rm -rf /var/lib/apt/lists/*
+
+# 2. Xpra official repository (for interactive HTML5 shadow viewing on demand)
+RUN mkdir -p /usr/share/keyrings /etc/apt/sources.list.d \
+    && curl -fsSL https://xpra.org/xpra.asc -o /usr/share/keyrings/xpra.asc \
+    && curl -fsSL https://raw.githubusercontent.com/Xpra-org/xpra/master/packaging/repos/bookworm/xpra.sources -o /etc/apt/sources.list.d/xpra.sources
+
+# 3. Node.js official repository (v22.x LTS)
+RUN mkdir -p /etc/apt/keyrings \
+    && curl -fsSL https://deb.nodesource.com/gpgkey/nodesource-repo.gpg.key | gpg --dearmor -o /etc/apt/keyrings/nodesource.gpg \
+    && echo "deb [signed-by=/etc/apt/keyrings/nodesource.gpg] https://deb.nodesource.com/node_22.x nodistro main" > /etc/apt/sources.list.d/nodesource.list
+
+# 4. Install display server, window manager, keyring, Node.js, and Electron runtime dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    xvfb \
+    xpra \
+    xpra-x11 \
+    xpra-html5 \
+    openbox \
+    dbus \
+    dbus-x11 \
+    gnome-keyring \
+    libsecret-1-0 \
+    libsecret-tools \
+    libasound2 \
+    libpulse0 \
+    libatk-bridge2.0-0 \
+    libatk1.0-0 \
+    libatspi2.0-0 \
+    libatomic1 \
+    libcairo2 \
+    libcups2 \
+    libdbus-1-3 \
+    libdrm2 \
+    libexpat1 \
+    libgbm1 \
+    libglib2.0-0 \
+    libgtk-3-0 \
+    libnotify4 \
+    libnspr4 \
+    libnss3 \
+    libpango-1.0-0 \
+    libstdc++6 \
+    libudev1 \
+    libx11-6 \
+    libx11-xcb1 \
+    libxcb1 \
+    libxcomposite1 \
+    libxdamage1 \
+    libxext6 \
+    libxfixes3 \
+    libxkbcommon0 \
+    libxrandr2 \
+    libxshmfence1 \
+    libxss1 \
+    libxtst6 \
+    xdg-utils \
+    nodejs \
+    x11-utils \
+    && mkdir -p /tmp/.X11-unix \
+    && chmod 1777 /tmp/.X11-unix \
+    && rm -rf /var/lib/apt/lists/*
+
+# 5. Download and install official unmodified Discord Linux .deb package
+RUN curl -fsSL "https://discord.com/api/download?platform=linux&format=deb" -o /tmp/discord.deb \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends /tmp/discord.deb \
+    && rm -f /tmp/discord.deb \
+    && rm -rf /var/lib/apt/lists/*
+
+# 6. Create unprivileged runtime user 'cordbrief'
+RUN useradd -u 1000 -m -s /bin/bash cordbrief \
+    && mkdir -p /home/cordbrief/.config/discord \
+    && mkdir -p /home/cordbrief/.local/share/keyrings \
+    && mkdir -p /home/cordbrief/.xpra \
+    && mkdir -p /var/cordbrief/exchange \
+    && mkdir -p /var/lib/cordbrief \
+    && mkdir -p /var/cordbrief/runtime \
+    && chown -R cordbrief:cordbrief /home/cordbrief /var/cordbrief /var/lib/cordbrief \
+    && chmod 0700 /var/lib/cordbrief
+
+# 7. Copy runtime collector code and entrypoint
+COPY entrypoint-rpc.sh /usr/local/bin/entrypoint-rpc.sh
+COPY --chown=cordbrief:cordbrief . /home/cordbrief/collector/
+
+RUN chmod +x /usr/local/bin/entrypoint-rpc.sh \
+    && chown -R cordbrief:cordbrief /home/cordbrief/collector
+
+USER cordbrief
+WORKDIR /home/cordbrief
+
+EXPOSE 28742
+
+VOLUME ["/home/cordbrief/.config/discord", "/home/cordbrief/.local/share/keyrings", "/var/cordbrief/exchange", "/var/lib/cordbrief", "/var/cordbrief/runtime"]
+
+ENTRYPOINT ["/usr/local/bin/entrypoint-rpc.sh"]

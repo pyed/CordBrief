@@ -32,7 +32,7 @@ export class DiscordRpcClient {
         };
         if (rpcToken) args.rpc_token = rpcToken;
 
-        const data = await this.transport.request("AUTHORIZE", args);
+        const data = await this.transport.request("AUTHORIZE", args, null, 120000);
         if (!data || !data.code) {
             throw new Error("Discord AUTHORIZE response did not contain an authorization code");
         }
@@ -74,6 +74,49 @@ export class DiscordRpcClient {
         const data = await res.json();
         if (!data.access_token) {
             throw new Error("OAuth token exchange response did not contain access_token");
+        }
+
+        return {
+            accessToken: data.access_token,
+            refreshToken: data.refresh_token,
+            expiresIn: data.expires_in,
+            scope: data.scope
+        };
+    }
+
+    /**
+     * Refresh OAuth2 access token using a refresh token.
+     * @param {object} params
+     * @param {string} params.clientId
+     * @param {string} params.clientSecret
+     * @param {string} params.refreshToken
+     * @param {string} [params.endpoint]
+     * @returns {Promise<{accessToken: string, refreshToken?: string, expiresIn: number, scope: string}>}
+     */
+    async refreshToken({ clientId, clientSecret, refreshToken, endpoint = DISCORD_TOKEN_ENDPOINT }) {
+        const bodyParams = new URLSearchParams({
+            client_id: String(clientId),
+            client_secret: String(clientSecret),
+            grant_type: "refresh_token",
+            refresh_token: String(refreshToken)
+        });
+
+        const res = await fetch(endpoint, {
+            method: "POST",
+            headers: {
+                "Content-Type": "application/x-www-form-urlencoded"
+            },
+            body: bodyParams.toString()
+        });
+
+        if (!res.ok) {
+            const errText = await res.text();
+            throw new Error(`OAuth token refresh failed (HTTP ${res.status}): ${errText}`);
+        }
+
+        const data = await res.json();
+        if (!data.access_token) {
+            throw new Error("OAuth token refresh response did not contain access_token");
         }
 
         return {

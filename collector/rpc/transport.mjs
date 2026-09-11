@@ -31,6 +31,7 @@ export function findDiscordIPCPath() {
     const candidates = [];
     if (process.env.XDG_RUNTIME_DIR) candidates.push(process.env.XDG_RUNTIME_DIR);
     if (process.env.TMPDIR) candidates.push(process.env.TMPDIR);
+    candidates.push("/tmp/runtime-cordbrief");
     candidates.push("/tmp");
     try {
         const uid = process.getuid ? process.getuid() : 1000;
@@ -72,7 +73,7 @@ export class RpcTransport extends EventEmitter {
      */
     async connect(clientId, options = {}) {
         const socketPath = this.socketPath || findDiscordIPCPath();
-        const timeoutMs = options.timeoutMs || 10000;
+        const timeoutMs = options.timeoutMs || 30000;
 
         return new Promise((resolve, reject) => {
             const connectTimer = setTimeout(() => {
@@ -104,13 +105,17 @@ export class RpcTransport extends EventEmitter {
                     this.handshakeDeferred = null;
                     reject(err);
                 }
-                this.emit("error", err);
+                if (this.listenerCount("error") > 0) {
+                    this.emit("error", err);
+                }
             });
 
             this.socket.on("close", hadError => {
                 this.connected = false;
                 this._rejectAllPending(new Error("Discord IPC connection closed"));
-                this.emit("close", hadError);
+                if (this.listenerCount("close") > 0) {
+                    this.emit("close", hadError);
+                }
             });
         });
     }

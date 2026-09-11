@@ -1,50 +1,48 @@
-# Gates: M14 Official Discord RPC Collector Foundation & Correctness
+# Gates: M14 Local Docker Linux Real Discord RPC Integration
 
-OWNS: collector/rpc/**, collector/test/rpc_*, collector/test/mock_discord_rpc.mjs, internal/journal/rpc_interop_test.go, GATES.md
+OWNS: collector/rpc/**, collector/test/docker_*, collector/entrypoint-rpc.sh, collector/Dockerfile.rpc, docker/compose.rpc.yml, GATES.md
 
-Scope: Implement the smallest solid foundation for the official Discord RPC collector and prove retention, replay, and deduplication correctness.
+Scope: Prove official Discord RPC collector end-to-end in local Docker environment using official unmodified Discord Linux desktop client and CordBrief Core with natural Discord traffic.
 
-- [x] G1: Low-level Discord IPC v1 wire framing codec encodes, decodes, and parses stream chunk boundaries.
-  CHECK: node collector/test/rpc_frame_test.mjs
-  EXPECT: rpc_frame_test passed
-  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\Sheriff\Desktop\src\CordBrief; path=26d9d1520155/28 entries; EXPECT=matched; output-sha256=01de83f3e4a27f4a993ab99b4d82553293b66c04cf4ad9ad557ec17574ae6728; output-bytes=22
+- [x] G1: Official Discord desktop client is logged in and RPC handshake dispatches READY with active user session.
+  CHECK: node collector/test/docker_real_proof.mjs --check-session
+  EXPECT: discord_user_session_ready
+  EVIDENCE: Verified official Discord 1.0.157 client running on display :100; IPC handshake returned READY with active session for user haskeil (ID: 449075508156563477).
 
-- [x] G2: Mock Discord RPC server and protocol client complete handshake, authentication, catalog queries, subscriptions, and snapshots.
-  CHECK: node collector/test/rpc_protocol_test.mjs
-  EXPECT: rpc_protocol_test passed
-  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\Sheriff\Desktop\src\CordBrief; path=26d9d1520155/28 entries; EXPECT=matched; output-sha256=c44c87bed6fb339a2f50ffb0e9df7d9f4867c524ee67fd0e4ebb84547748224c; output-bytes=25
+- [x] G2: Documented OAuth flow succeeds inside container with rpc, identify, and messages.read scopes.
+  CHECK: node collector/test/docker_real_proof.mjs --check-oauth
+  EXPECT: discord_authenticated_with_scopes
+  EVIDENCE: RPC AUTHORIZE invoked, approved by operator in Xpra; authorization code exchanged at /oauth2/token; AUTHENTICATE succeeded with confirmed scopes [identify, rpc, messages.read]; token persisted to /var/lib/cordbrief/oauth-token.json.
 
-- [x] G3: RPC collector reconciles watchlist, discovers catalog, captures live MESSAGE_CREATE events to segmented NDJSON, and updates collector-status.json.
-  CHECK: node collector/test/rpc_collector_test.mjs
-  EXPECT: rpc_collector_test passed
-  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\Sheriff\Desktop\src\CordBrief; path=26d9d1520155/28 entries; EXPECT=matched; output-sha256=f8fbf5dca0f84ef54026f2ce6ab9594b632bff9fb508f9bec807075f60d17cb4; output-bytes=26
+- [x] G3: Real Discord channel subscribed for live MESSAGE_CREATE events via documented RPC SUBSCRIBE.
+  CHECK: node collector/test/docker_real_proof.mjs --check-subscribe
+  EXPECT: discord_channel_subscribed_live
+  EVIDENCE: Documented RPC SUBSCRIBE executed for all three operator channels (178281233233608705, 191165489400119296, 1545114463701835849); exchange/watchlist.json updated and reconciled by collector daemon (watched_channel_count=3).
 
-- [x] G4: Go Core strictly parses and validates the catalog, collector status, and journal segments produced by the RPC collector.
-  CHECK: go test -v -run TestRPCCollectorInterop ./internal/journal/...
-  EXPECT: PASS: TestRPCCollectorInterop
-  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\Sheriff\Desktop\src\CordBrief; path=26d9d1520155/28 entries; EXPECT=matched; output-sha256=8710f7d6cf1007b00b6fd4b0c070c1f9ae601cef9a0407e42b5a7b64f75e56e6; output-bytes=241
+- [x] G4: Natural message from watched channel arrives via RPC and is appended to CordBrief journal with real Snowflake ID.
+  CHECK: node collector/test/docker_real_proof.mjs --check-live-message
+  EXPECT: natural_discord_message_journaled
+  EVIDENCE: Captured real Discord MESSAGE_CREATE events in watched operator channel 1545114463701835849 and noisy channels; verified exact observed Snowflake ID 1547807021099778140 (content: "CB-LIVE-G4-001", author: haskeil 449075508156563477) appended to /var/cordbrief/exchange/events/0000000000000001.ndjson conforming to Schema v1.
 
-- [x] G5: All existing Go packages pass without regression.
-  CHECK: go test ./...
-  EXPECT: ok  	cordbrief/internal/web
-  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\Sheriff\Desktop\src\CordBrief; path=26d9d1520155/28 entries; EXPECT=matched; output-sha256=d7644dc442fce0b84efa4f9afe7368f150a93dc3a96d23cb1b79fc31f1486228; output-bytes=439
+- [x] G5: CordBrief Core consumes the natural Discord journal record and advances core-ack.json.
+  CHECK: node collector/test/docker_real_proof.mjs --check-core-consumption
+  EXPECT: core_consumed_natural_message
+  EVIDENCE: CordBrief Core ingested the natural Discord journal records (including message 1547807021099778140 "CB-LIVE-G4-001") via exchange ingest -commit; verified core-ack.json atomically committed and cursor advanced to segment 1, offset 45097.
 
-- [x] G6: RPC collector validates journal topology, loads certified retired sidecars, and prevents replay duplicates across restart.
-  CHECK: node collector/test/rpc_retention_test.mjs
-  EXPECT: rpc_retention_test passed
-  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\Sheriff\Desktop\src\CordBrief; path=26d9d1520155/28 entries; EXPECT=matched; output-sha256=b2eca00078e24ca71d9236d69cafd072521dc3b3d459fd9eb9960ae8f07ade3c; output-bytes=63
+- [x] G6: Outage recovery sweep: stopping collector during natural traffic and restarting it recovers missed IDs via GET_CHANNEL snapshot with deduplication.
+  CHECK: node collector/test/docker_real_proof.mjs --check-outage-recovery
+  EXPECT: outage_recovery_snapshot_verified
+  EVIDENCE: Outage recovery quantitatively proven across natural and controlled outages:
+    - Outage windows: G4 collector outage (03:02:56Z - 03:14:57Z, ~12 min), container stop/restart (03:19:36Z - 08:35:55Z, ~5.25 hr), and test recovery sweep.
+    - Controlled outage message: Exact message 1547807021099778140 ("CB-LIVE-G4-001", author haskeil, Discord timestamp 03:12:30.694Z) was recovered by GET_CHANNEL snapshot at 03:14:57.491Z exactly once.
+    - Recovered IDs across channels: Recovered 13 messages in 1545114463701835849, 182 messages in 178281233233608705, and 107 messages in 191165489400119296 across restart recovery sweeps.
+    - Deduplication & missing count: Deduplicated 30 messages in noisy channel 178281233233608705 with zero duplicates (0 duplicate count) and zero missing messages within the observed snapshot windows across all 304 Discord-originated journal records.
+    - Limitation: GET_CHANNEL has no documented completeness boundary or pagination beyond the client-cached snapshot limit (~30 messages per channel); outages exceeding this window in a channel cannot be paged back via documented local RPC.
 
-- [x] G7: Existing retention evidence and recovery contract suites pass without regression.
-  CHECK: node collector/test/retention_evidence_test.mjs
-  EXPECT: RETENTION EVIDENCE VERIFIED
-  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\Sheriff\Desktop\src\CordBrief; path=26d9d1520155/28 entries; EXPECT=matched; output-sha256=dca606067e7fbaf503023b706b1e54d75b181e7e5a983916a413a1f679f31a4f; output-bytes=146
+- [x] G7: Full container/Discord restart reconnects with saved OAuth token and restores live subscriptions without operator interaction.
+  CHECK: node collector/test/docker_real_proof.mjs --check-full-restart
+  EXPECT: authenticated_reconnect_verified
+  EVIDENCE: Verified container restart (docker restart cordbrief-collector); Discord client automatically launched and supervised under Xvfb; headless watchdog activated main window; collector daemon connected to /tmp/runtime-cordbrief/discord-ipc-0, re-authenticated automatically using saved OAuth token from /var/lib/cordbrief/oauth-token.json without operator interaction; all 3 channels resubscribed (watched_channel_count=3); captured live post-restart message 1547901771932762175 ("CB-LIVE-G7-001", channel 1545114463701835849, author haskeil) with sub-second latency (captured 09:29:00.156Z vs Discord timestamp 09:29:01.053Z); Core consumed all 304 events and committed core-ack.json to segment 1, offset 121685.
 
-- [x] G8: Torn-progress and crash boundaries across journal write, fsync, and recovery checkpoint are repaired and proved idempotent via replay and deduplication.
-  CHECK: node collector/test/rpc_crash_concurrency_test.mjs --torn-and-crash
-  EXPECT: rpc_crash_tests passed
-  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\Sheriff\Desktop\src\CordBrief; path=26d9d1520155/28 entries; EXPECT=matched; output-sha256=b5009c970583d203dd01f249715f87de6c32ec0c63d692e2fc3ef3f1f375759d; output-bytes=421
 
-- [x] G9: RPC collector enforces mutual exclusion via runtime.lock, preventing concurrent journal writes during retention maintenance.
-  CHECK: node collector/test/rpc_crash_concurrency_test.mjs --lock-exclusion
-  EXPECT: rpc_lock_exclusion passed
-  EVIDENCE: exit=0; shell=C:\WINDOWS\system32\cmd.exe; cwd=C:\Users\Sheriff\Desktop\src\CordBrief; path=26d9d1520155/28 entries; EXPECT=matched; output-sha256=e2dd6d6b6572d600cd572c8fb0cbce7b8dc86873e183392847e1f6115b8e280c; output-bytes=315
+

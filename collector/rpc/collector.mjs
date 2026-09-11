@@ -49,8 +49,9 @@ export function safeReplaceJSON(destinationPath, data, mode = 0o644) {
     syncDirectory(dir);
 }
 
-export function normalizeDiscordMessage(message, explicitGuildId = "") {
+export function normalizeDiscordMessage(message, explicitGuildId = "", explicitChannelId = "") {
     const guildId = explicitGuildId || String(message.guild_id || "");
+    const channelId = explicitChannelId || String(message.channel_id || "");
     const attachments = (message.attachments || []).map(a => ({
         id: String(a.id),
         filename: String(a.filename || "unnamed"),
@@ -70,7 +71,7 @@ export function normalizeDiscordMessage(message, explicitGuildId = "") {
         event: "message_create",
         message_id: String(message.id),
         guild_id: guildId,
-        channel_id: String(message.channel_id),
+        channel_id: channelId,
         timestamp: String(message.timestamp || new Date().toISOString()),
         captured_at: new Date().toISOString(),
         author: {
@@ -133,6 +134,8 @@ export class DiscordRpcCollector {
 
         this.lastWatchlistMtime = 0;
         this.cachedWatchlist = { valid: false, generation: -1, channel_ids: [] };
+        this.heartbeatTimer = null;
+        this.stopping = false;
     }
 
     /**
@@ -579,7 +582,7 @@ export class DiscordRpcCollector {
             const eligibleMessages = messages.filter(m => BigInt(m.id) > watchAfterBig);
 
             const guildId = this.channelGuildMap.get(channelId) || ch.guild_id || "";
-            const normalized = eligibleMessages.map(m => normalizeDiscordMessage(m, guildId));
+            const normalized = eligibleMessages.map(m => normalizeDiscordMessage(m, guildId, channelId));
 
             const appended = this.appendEvents(normalized);
 
@@ -622,9 +625,12 @@ export class DiscordRpcCollector {
      * @param {object} dispatchData
      */
     handleMessageCreate(dispatchData) {
-        if (!dispatchData || !dispatchData.message) return;
-        const msg = dispatchData.message;
-        const chId = String(dispatchData.channel_id || msg.channel_id);
+        if (!dispatchData) return;
+        const msg = dispatchData.message || dispatchData;
+        if (!msg || !msg.id) return;
+        const chId = String(dispatchData.channel_id || msg.channel_id || "");
+
+        console.log(`[RPC Collector] handleMessageCreate: msgId=${msg.id} chId=${chId} activeSub=${this.activeSubscriptions.has(chId)}`);
 
         // Fail-closed: only record if channel is currently in active subscriptions
         if (!this.activeSubscriptions.has(chId)) {
@@ -634,13 +640,14 @@ export class DiscordRpcCollector {
         const state = this.loadRecoveryState();
         const chState = state.channels[chId];
         if (chState?.watch_after && BigInt(msg.id) <= BigInt(chState.watch_after)) {
-            // Drop pre-watch message
+            console.log(`[RPC Collector] Dropping pre-watch message: ${msg.id} <= ${chState.watch_after}`);
             return;
         }
 
         const guildId = this.channelGuildMap.get(chId) || msg.guild_id || "";
-        const evt = normalizeDiscordMessage(msg, guildId);
+        const evt = normalizeDiscordMessage(msg, guildId, chId);
         const appended = this.appendEvents([evt]);
+        console.log(`[RPC Collector] Appended ${appended} live event(s) to journal (message ID: ${msg.id})`);
 
         if (appended > 0 && chState) {
             if (BigInt(msg.id) > BigInt(chState.checkpoint_message_id || "0")) {
@@ -713,6 +720,7 @@ export class DiscordRpcCollector {
 
             // 3. Attach live event dispatch listener
             this.transport.on("dispatch", event => {
+                console.log(`[RPC Collector] Dispatch event received: evt=${event.evt}`);
                 if (event.evt === "MESSAGE_CREATE") {
                     this.handleMessageCreate(event.data);
                 }
@@ -737,6 +745,10 @@ export class DiscordRpcCollector {
             } catch {}
 
             this.writeStatus("running");
+            this.heartbeatTimer = setInterval(() => {
+                if (this.stopping) return;
+                this.writeStatus("running");
+            }, 10000);
         } catch (err) {
             if (this.lockHandle) {
                 this.lockHandle.release();
@@ -750,6 +762,12 @@ export class DiscordRpcCollector {
      * Stops the collector cleanly.
      */
     async stop() {
+        this.stopping = true;
+        if (this.heartbeatTimer) {
+            clearInterval(this.heartbeatTimer);
+            this.heartbeatTimer = null;
+        }
+
         const watchlistFile = path.join(this.exchangeDir, "watchlist.json");
         try {
             fs.unwatchFile(watchlistFile);
