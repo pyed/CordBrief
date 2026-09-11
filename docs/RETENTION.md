@@ -36,7 +36,7 @@ to copy literally. Do not advance Core's cursor or force a rotation to make it f
 
 ```sh
 docker compose -f docker/compose.yml stop cordbrief-core cordbrief-collector
-docker compose -f docker/compose.yml -f docker/compose.retention.yml --profile setup run --rm --no-deps cordbrief-setup bash /home/cordbrief/retention-publish.sh N
+docker compose -f docker/compose.yml -f docker/compose.retention.yml run --rm cordbrief-collector bash /home/cordbrief/collector/retention-publish.sh N
 ```
 
 The default command publishes durable evidence only. It validates recovery state,
@@ -47,7 +47,7 @@ history, even while its files still exist. This is not a dry run.
 Physical deletion is a separate, explicit invocation for that exact certified prefix:
 
 ```sh
-docker compose -f docker/compose.yml -f docker/compose.retention.yml --profile setup run --rm --no-deps cordbrief-setup bash /home/cordbrief/retention-publish.sh N --delete-certified
+docker compose -f docker/compose.yml -f docker/compose.retention.yml run --rm cordbrief-collector bash /home/cordbrief/collector/retention-publish.sh N --delete-certified
 docker compose -f docker/compose.yml up -d
 ```
 

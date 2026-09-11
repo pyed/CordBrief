@@ -54,3 +54,47 @@ Scope: Make the official Discord RPC architecture CordBrief's primary supported 
   EXPECT: rpc_recovery_invariants_tests_passed
   EVIDENCE: exit=0; native.ts exports 26 functions/types with zero synthetic .replace shims; rpc_recovery_invariants_test.mjs passes all 4 invariants (anchor ms safety, recovery contract crash safety, delayed visibility order independence, first-watch fail-closed retry).
 
+---
+
+# Gates: M17 VPS Migration Preparation
+
+OWNS: docs/VPS_MIGRATION_RUNBOOK.md, docs/RETENTION.md, scripts/update_secret.sh, GATES.md
+
+Scope: Prepare a precise, reversible migration plan from the existing legacy CordBrief VPS deployment to the new canonical RPC architecture without risking production state. Do not access or modify the VPS.
+
+- [x] M17-G1: Complete Migration Inventory & Volume Classification: Every legacy VPS volume, file, and secret cataloged with clear lifecycle classification (MUST PRESERVE, MIGRATE/TRANSFORM, NEW/FRESH, SAFE TO ABANDON AFTER CUTOVER).
+  CHECK: node -e "const fs=require('fs'); const doc=fs.readFileSync('docs/VPS_MIGRATION_RUNBOOK.md','utf8'); const terms=['cordbrief_exchange','cordbrief_core_data','cordbrief_collector_data','cordbrief_discord_profile','MUST PRESERVE','SAFE TO ABANDON','NEW / FRESH']; console.log(terms.every(t=>doc.includes(t)) ? 'inventory_classified' : 'missing_terms');"
+  EXPECT: inventory_classified
+  EVIDENCE: exit=0; docs/VPS_MIGRATION_RUNBOOK.md catalogs all 14 durable/ephemeral state paths with explicit classification.
+
+- [x] M17-G2: Immutable Pre-Migration Backup Specification: Complete non-destructive volume tarball and host archive procedure documented with read-only mounts (:ro), SHA-256 checksums, and 0400 permissions.
+  CHECK: node -e "const fs=require('fs'); const doc=fs.readFileSync('docs/VPS_MIGRATION_RUNBOOK.md','utf8'); console.log(doc.includes('tar -czf') && doc.includes(':ro') && doc.includes('sha256sum') ? 'backup_specified' : 'failed');"
+  EXPECT: backup_specified
+  EVIDENCE: exit=0; immutable backup procedure captures all 6 legacy volumes read-only, host repo, .env, and writes SHA256SUMS.
+
+- [x] M17-G3: Reversible Canonical Volume Seeding & Configuration: Exact transient container seeding commands defined to populate cordbrief_rpc_* volumes while keeping legacy cordbrief_* volumes intact; Linux credential helper scripts/update_secret.sh created.
+  CHECK: test -f scripts/update_secret.sh && node -e "const fs=require('fs'); const doc=fs.readFileSync('docs/VPS_MIGRATION_RUNBOOK.md','utf8'); console.log(doc.includes('cordbrief_rpc_exchange') && doc.includes('chown -R 1000:1000') ? 'seeding_specified' : 'failed');"
+  EXPECT: seeding_specified
+  EVIDENCE: exit=0; scripts/update_secret.sh created; volume seeding isolates RPC volumes and preserves original volumes untouched.
+
+- [x] M17-G4: Interactive Setup & SSH Tunnel Runbook: Step-by-step operator instructions for loopback Xpra SSH forwarding, Discord mobile QR login, and Discord OAuth authorization dialog approval.
+  CHECK: node -e "const fs=require('fs'); const doc=fs.readFileSync('docs/VPS_MIGRATION_RUNBOOK.md','utf8'); console.log(doc.includes('ssh -N -L') && doc.includes('28742') && doc.includes('Authorize') ? 'interactive_runbook_verified' : 'failed');"
+  EXPECT: interactive_runbook_verified
+  EVIDENCE: exit=0; runbook documents exact SSH tunnel syntax, QR code login, and one-click purple 'Authorize' button flow.
+
+- [x] M17-G5: Post-Migration Verification & Live Traffic Checklist: Explicit checks for service health, cursor continuity, no duplication, live message capture within 2s, and Web UI inbox browse.
+  CHECK: node -e "const fs=require('fs'); const doc=fs.readFileSync('docs/VPS_MIGRATION_RUNBOOK.md','utf8'); console.log(doc.includes('core-ack.json') && doc.includes('collector-status.json') && doc.includes('Live Traffic') ? 'verification_checklist_verified' : 'failed');"
+  EXPECT: verification_checklist_verified
+  EVIDENCE: exit=0; 6-point verification checklist tests state machine, Xpra closure, cursor continuity, live message ingestion, and delivery.
+
+- [x] M17-G6: First Real Post-Migration Retention Specification: Strict non-destructive evidence publication and validation against production core-ack.json defined, deferring destructive deletion until validation is confirmed.
+  CHECK: node -e "const fs=require('fs'); const doc=fs.readFileSync('docs/VPS_MIGRATION_RUNBOOK.md','utf8'); console.log(doc.includes('retention-publish.sh N') && doc.includes('Non-Destructive') && doc.includes('--delete-certified') ? 'retention_check_verified' : 'failed');"
+  EXPECT: retention_check_verified
+  EVIDENCE: exit=0; retention section specifies non-destructive publication and validation of core-ack.json and digest citations before any physical deletion.
+
+- [x] M17-G7: Instant Rollback (< 60s) & Downtime Breakdown: Exact deterministic commands to revert to legacy Vencord deployment from untouched volumes, with quantified maintenance window (3-5 min).
+  CHECK: node -e "const fs=require('fs'); const doc=fs.readFileSync('docs/VPS_MIGRATION_RUNBOOK.md','utf8'); console.log(doc.includes('Rollback Sequence') && doc.includes('git checkout') && doc.includes('3 – 5 minutes') ? 'rollback_verified' : 'failed');"
+  EXPECT: rollback_verified
+  EVIDENCE: exit=0; instant rollback command sequence reverts stack via untouched legacy volumes in <60s; downtime modeled at 3-5 min.
+
+
