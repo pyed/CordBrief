@@ -21,32 +21,30 @@ CordBrief connects to your local Discord desktop client via official local Disco
 4. Copy your **Client ID**.
 5. Under **Client Secret**, click **Reset Secret** (or copy existing) to get your secret.
 
+> [!IMPORTANT]
+> **Discord Application Permissions**:
+> - CordBrief requests strictly three OAuth2 scopes: `rpc`, `identify`, and `messages.read`.
+> - Because your Developer Application is private/unverified, the Discord account you sign into must be the application owner or listed under **Teams / Collaborators** in the Developer Portal to authorize local RPC access.
+
 ### Configure Credentials
 
-Copy `.env.example` to `.env`:
+1. Copy `.env.example` to `.env`:
+   ```sh
+   cp .env.example .env
+   ```
+2. Set your public Client ID in `.env`:
+   ```env
+   DISCORD_CLIENT_ID=your_client_id_here
+   ```
+3. Seed the Client Secret securely into private container storage (mode `0600`):
+   ```sh
+   # Linux / macOS
+   ./scripts/update_secret.sh
 
-```sh
-cp .env.example .env
-```
-
-Set your Client ID in `.env`:
-```env
-DISCORD_CLIENT_ID=your_client_id_here
-```
-
-For the **Client Secret**, choose one of two methods:
-- **Recommended (Secure In-Volume Storage)**: Store the secret directly in private container volume storage (`0600`) without saving it in plaintext `.env` on disk:
-  ```sh
-  # Linux / macOS
-  ./scripts/update_secret.sh cordbrief_rpc_collector_data
-
-  # Windows PowerShell
-  .\scripts\update_secret.ps1
-  ```
-- **Direct Environment**: Set `DISCORD_CLIENT_SECRET=your_client_secret` in `.env`.
-
-> [!NOTE]
-> CordBrief requests strictly the following OAuth2 scopes: `rpc`, `identify`, `messages.read`.
+   # Windows PowerShell
+   .\scripts\update_secret.ps1
+   ```
+   The script prompts for the secret with masked input and writes it directly to the designated Docker volume (`cordbrief_rpc_collector_data`) with ownership `1000:1000`. The secret is never stored in plaintext on the host filesystem or in `.env`.
 
 ## 2. First Start & Setup Flow
 

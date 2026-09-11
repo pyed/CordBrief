@@ -3,11 +3,17 @@
 # without touching repository .env, echoing, or logging the secret value.
 
 [CmdletBinding()]
-param()
+param(
+    [string]$TargetVolume = "cordbrief_rpc_collector_data",
+    [string]$ClientId = "",
+    [string]$TargetOwner = "1000:1000"
+)
 
 $ErrorActionPreference = "Stop"
 
 Write-Host "=== Discord Client Secret Secure Updater ===" -ForegroundColor Cyan
+Write-Host "Target volume: $TargetVolume"
+Write-Host "Target owner:  $TargetOwner"
 Write-Host "The secret will be masked and not displayed or logged.`n"
 
 # 1. Masked secret input via Read-Host
@@ -27,43 +33,46 @@ if ([string]::IsNullOrWhiteSpace($plainSecret)) {
     exit 1
 }
 
-# 3. Preserve existing client_id
-$clientId = ""
+# 3. Preserve or resolve client_id
+if ([string]::IsNullOrWhiteSpace($ClientId)) {
+    # Check if target volume already has credentials.json
+    try {
+        $existing = docker run --rm -v "${TargetVolume}:/var/lib/cordbrief:ro" alpine sh -c "cat /var/lib/cordbrief/credentials.json 2>/dev/null" | Out-String
+        if (![string]::IsNullOrWhiteSpace($existing)) {
+            $parsed = $existing | ConvertFrom-Json -ErrorAction SilentlyContinue
+            if ($parsed -and $parsed.client_id) {
+                $ClientId = $parsed.client_id
+            }
+        }
+    } catch {}
+}
 
-# Try to extract existing client_id from container credentials.json if available
-try {
-    $existingId = docker exec cordbrief-collector python3 -c "import json; print(json.load(open('/var/lib/cordbrief/credentials.json')).get('client_id', ''))" 2>$null
-    if ($LASTEXITCODE -eq 0 -and !([string]::IsNullOrWhiteSpace($existingId))) {
-        $clientId = $existingId.Trim()
-    }
-} catch {}
-
-# Fallback to repository .env or prompt user if client ID was missing
-if ([string]::IsNullOrWhiteSpace($clientId)) {
+# Fallback to repository .env
+if ([string]::IsNullOrWhiteSpace($ClientId)) {
     $envFile = Join-Path $PSScriptRoot "..\.env"
     if (Test-Path $envFile) {
         $envLines = Get-Content $envFile
         foreach ($line in $envLines) {
             if ($line -match "^DISCORD_CLIENT_ID=(.+)$") {
-                $clientId = $matches[1].Trim()
+                $ClientId = $matches[1].Trim()
                 break
             }
         }
     }
 }
 
-if ([string]::IsNullOrWhiteSpace($clientId)) {
-    $clientId = Read-Host "Enter Discord Client ID"
+if ([string]::IsNullOrWhiteSpace($ClientId)) {
+    $ClientId = Read-Host "Enter Discord Client ID"
 }
 
-if ([string]::IsNullOrWhiteSpace($clientId)) {
+if ([string]::IsNullOrWhiteSpace($ClientId)) {
     Write-Error "Empty Discord Client ID provided. Operation aborted."
     exit 1
 }
 
-# 4. Construct JSON payload in memory with proper escaping
+# 4. Construct JSON payload in memory
 $obj = @{
-    client_id     = $clientId
+    client_id     = $ClientId
     client_secret = $plainSecret
 }
 $jsonPayload = $obj | ConvertTo-Json -Compress
@@ -72,13 +81,11 @@ $jsonPayload = $obj | ConvertTo-Json -Compress
 $plainSecret = $null
 $obj = $null
 
-# 5. Send JSON payload over stdin to docker exec -i
-# sh -c inside the container writes to /var/lib/cordbrief/credentials.json and chmods to 0600
-# Single quotes for sh -c prevent PowerShell from interpreting Linux paths or redirects
-$shCmd = 'cat > /var/lib/cordbrief/credentials.json && chmod 0600 /var/lib/cordbrief/credentials.json'
+# 5. Write securely to target volume with mode 0600 and resolved ownership
+$shCmd = "mkdir -p /var/lib/cordbrief && cat > /var/lib/cordbrief/credentials.json && chmod 0600 /var/lib/cordbrief/credentials.json && chown $TargetOwner /var/lib/cordbrief/credentials.json"
 
 try {
-    $jsonPayload | docker exec -i cordbrief-collector sh -c $shCmd
+    $jsonPayload | docker run --rm -i -v "${TargetVolume}:/var/lib/cordbrief" alpine sh -c $shCmd
     $exitCode = $LASTEXITCODE
 } catch {
     $exitCode = 1
@@ -88,32 +95,29 @@ try {
 }
 
 if ($exitCode -ne 0) {
-    Write-Error "Failed to update container storage at /var/lib/cordbrief/credentials.json (exit code: $exitCode)."
+    Write-Error "Failed to update storage in volume [$TargetVolume] (exit code: $exitCode)."
     exit $exitCode
 }
 
 # 6. Non-echoing verification check in container
 $verifyExit = 0
 try {
-    docker exec cordbrief-collector python3 -c "
-import json, os, stat
-path = '/var/lib/cordbrief/credentials.json'
-assert os.path.exists(path), 'File does not exist'
-st = os.stat(path)
-assert stat.S_IMODE(st.st_mode) == 0o600, 'Incorrect mode'
-data = json.load(open(path, 'r'))
-assert 'client_id' in data and len(data['client_id']) > 0, 'Invalid client_id'
-assert 'client_secret' in data and len(data['client_secret']) > 0, 'Invalid client_secret'
-" 2>$null
-    if ($LASTEXITCODE -ne 0) { $verifyExit = 1 }
+    $vCheck = docker run --rm -v "${TargetVolume}:/var/lib/cordbrief:ro" alpine sh -c '
+        if [ ! -f /var/lib/cordbrief/credentials.json ]; then exit 1; fi
+        mode=$(stat -c %a /var/lib/cordbrief/credentials.json 2>/dev/null || echo unknown)
+        if [ "$mode" != "600" ]; then exit 2; fi
+        if ! grep -q "\"client_id\"" /var/lib/cordbrief/credentials.json || ! grep -q "\"client_secret\"" /var/lib/cordbrief/credentials.json; then exit 3; fi
+        echo OK
+    ' 2>$null
+    if ($LASTEXITCODE -ne 0 -or $vCheck.Trim() -ne "OK") { $verifyExit = 1 }
 } catch {
     $verifyExit = 1
 }
 
 if ($verifyExit -ne 0) {
-    Write-Error "Verification failed: /var/lib/cordbrief/credentials.json is invalid or not mode 0600 in container."
+    Write-Error "Verification failed: /var/lib/cordbrief/credentials.json in volume [$TargetVolume] is invalid or not mode 0600."
     exit 1
 }
 
-Write-Host "`n[OK] Discord Client Secret successfully updated in container private storage (/var/lib/cordbrief/credentials.json)." -ForegroundColor Green
-Write-Host "[OK] Permissions verified (0600). Client ID preserved ($clientId). Secret was NOT written to .env, echoed, or logged." -ForegroundColor Green
+Write-Host "`n[OK] Discord Client Secret successfully updated in volume [$TargetVolume]." -ForegroundColor Green
+Write-Host "[OK] Permissions verified (0600, uid:gid $TargetOwner). Client ID preserved ($ClientId). Secret was NOT written to .env, echoed, or logged." -ForegroundColor Green

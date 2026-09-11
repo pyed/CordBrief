@@ -29,7 +29,7 @@ lifecycle states:
 
 ### Quickstart
 
-1. **Configure Discord Application**: Create an app in the [Discord Developer Portal](https://discord.com/developers/applications) with redirect URI `http://127.0.0.1:32145/callback`. Copy `.env.example` to `.env` and set your `DISCORD_CLIENT_ID` (see [full setup guide](docs/SETUP.md)).
+1. **Configure Discord Application**: Create an app in the [Discord Developer Portal](https://discord.com/developers/applications) with redirect URI `http://127.0.0.1:32145/callback`. Copy `.env.example` to `.env`, set `DISCORD_CLIENT_ID`, and seed your Client Secret via `./scripts/update_secret.sh` (Linux/macOS) or `.\scripts\update_secret.ps1` (Windows). (See [Setup Guide](docs/SETUP.md)).
 2. **Start Services**:
    ```sh
    docker compose -f docker/compose.yml up -d
