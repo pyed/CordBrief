@@ -13,7 +13,8 @@
 
 set -eo pipefail
 
-TARGET_VOLUME="${1:-${TARGET_VOLUME:-cordbrief_rpc_collector_data}}"
+DEFAULT_PROJECT="${COMPOSE_PROJECT_NAME:-cordbrief}"
+TARGET_VOLUME="${1:-${TARGET_VOLUME:-${DEFAULT_PROJECT}_collector_data}}"
 TARGET_UID="${TARGET_UID:-1000}"
 TARGET_GID="${TARGET_GID:-1000}"
 TARGET_OWNER="${TARGET_UID}:${TARGET_GID}"

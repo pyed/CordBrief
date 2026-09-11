@@ -4,12 +4,27 @@
 
 [CmdletBinding()]
 param(
-    [string]$TargetVolume = "cordbrief_rpc_collector_data",
+    [string]$TargetVolume = "",
     [string]$ClientId = "",
     [string]$TargetOwner = "1000:1000"
 )
 
 $ErrorActionPreference = "Stop"
+
+if ([string]::IsNullOrWhiteSpace($TargetVolume)) {
+    $defaultProject = if ($env:COMPOSE_PROJECT_NAME) { $env:COMPOSE_PROJECT_NAME } else { "cordbrief" }
+    $envFile = Join-Path $PSScriptRoot "..\.env"
+    if (Test-Path $envFile) {
+        $envLines = Get-Content $envFile
+        foreach ($line in $envLines) {
+            if ($line -match "^COMPOSE_PROJECT_NAME=(.+)$") {
+                $defaultProject = $matches[1].Trim()
+                break
+            }
+        }
+    }
+    $TargetVolume = "${defaultProject}_collector_data"
+}
 
 Write-Host "=== Discord Client Secret Secure Updater ===" -ForegroundColor Cyan
 Write-Host "Target volume: $TargetVolume"

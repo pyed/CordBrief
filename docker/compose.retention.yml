@@ -9,4 +9,7 @@ services:
     environment:
       - CORDBRIEF_CORE_DATA_DIR=/var/cordbrief/data
     volumes:
-      - cordbrief_rpc_core_data:/var/cordbrief/data
+      - core_data:/var/cordbrief/data
+
+volumes:
+  core_data:

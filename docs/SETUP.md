@@ -44,7 +44,7 @@ CordBrief connects to your local Discord desktop client via official local Disco
    # Windows PowerShell
    .\scripts\update_secret.ps1
    ```
-   The script prompts for the secret with masked input and writes it directly to the designated Docker volume (`cordbrief_rpc_collector_data`) with ownership `1000:1000`. The secret is never stored in plaintext on the host filesystem or in `.env`.
+   The script prompts for the secret with masked input and writes it directly to the designated Docker volume (`cordbrief_collector_data`) with ownership `1000:1000`. The secret is never stored in plaintext on the host filesystem or in `.env`.
 
 ## 2. First Start & Setup Flow
 
