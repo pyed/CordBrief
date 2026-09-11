@@ -445,6 +445,12 @@ func makePageTemplate(name, contentHTML string) *template.Template {
 // 1. OVERVIEW TEMPLATE
 // -------------------------------------------------------------
 const overviewTemplateHTML = `
+  {{if .ActionRequired}}
+    <div style="background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.4); border-left: 4px solid #f59e0b; padding: 14px 18px; border-radius: 6px; margin-bottom: 24px;">
+      <div style="font-weight: 600; color: #f59e0b; margin-bottom: 4px; font-size: 0.95rem;">Operator Action Required</div>
+      <div style="color: #d1d5db; font-size: 0.9rem;">{{.ActionRequired}}</div>
+    </div>
+  {{end}}
   <div class="overview-grid">
     <!-- 1. Collector Status -->
     <div class="overview-card">
@@ -1179,6 +1185,13 @@ const systemTemplateHTML = `
         <div class="status-value"><span class="badge badge-ok">0 (Hardened)</span></div>
       </div>
     </div>
+
+    {{if .ActionRequired}}
+      <div style="background: rgba(245, 158, 11, 0.15); border: 1px solid rgba(245, 158, 11, 0.4); border-left: 4px solid #f59e0b; padding: 12px 16px; border-radius: 6px; margin-top: 16px;">
+        <div style="font-weight: 600; color: #f59e0b; font-size: 0.9rem; margin-bottom: 2px;">Operator Action Required</div>
+        <div style="color: #d1d5db; font-size: 0.85rem;">{{.ActionRequired}}</div>
+      </div>
+    {{end}}
 
     <div class="btn-group" style="margin-top: 16px;">
       {{if eq .CollectorMode "normal"}}

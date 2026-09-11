@@ -180,6 +180,8 @@ type overviewViewModel struct {
 	DiscordAuth         bool
 	SetupRequired       bool
 	ReauthRequired      bool
+	PromptState         string
+	ActionRequired      string
 	CatalogState        string
 	CatalogGuildCount   int
 	CatalogChannelCount int
@@ -270,6 +272,8 @@ type systemViewModel struct {
 	CollectorMode           string
 	CollectorStateStr       string
 	DiscordAuth             bool
+	PromptState             string
+	ActionRequired          string
 	CatalogState            string
 	CatalogUpdatedFormatted string
 	RecoveryState           string
@@ -327,6 +331,12 @@ func (s *Server) handleOverview(w http.ResponseWriter, r *http.Request) {
 			vm.DiscordAuth = (stat.DiscordAuthenticated != nil && *stat.DiscordAuthenticated)
 			vm.SetupRequired = (stat.CollectorState == "setup_required" || stat.Mode == "setup")
 			vm.ReauthRequired = (stat.CollectorState == "reauth_required" || stat.Mode == "reauth")
+			if stat.PromptState != nil {
+				vm.PromptState = *stat.PromptState
+			}
+			if stat.ActionRequired != nil {
+				vm.ActionRequired = *stat.ActionRequired
+			}
 			vm.CatalogState = stat.CatalogState
 			vm.WatchedGeneration = int(stat.WatchedGeneration)
 			vm.WatchedChannelCount = stat.WatchedChannelCount
@@ -624,6 +634,12 @@ func (s *Server) handleSystemPage(w http.ResponseWriter, r *http.Request) {
 		if isFresh {
 			vm.CollectorRunning = (stat.CollectorState == "running")
 			vm.DiscordAuth = (stat.DiscordAuthenticated != nil && *stat.DiscordAuthenticated)
+			if stat.PromptState != nil {
+				vm.PromptState = *stat.PromptState
+			}
+			if stat.ActionRequired != nil {
+				vm.ActionRequired = *stat.ActionRequired
+			}
 			vm.WatchedGeneration = int(stat.WatchedGeneration)
 			vm.WatchedChannelCount = stat.WatchedChannelCount
 			vm.ActiveSegment = int(stat.ActiveSegment)

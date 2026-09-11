@@ -84,12 +84,8 @@ EOF
 openbox &
 OPENBOX_PID=$!
 
-# 9. Start Xpra shadow on port 28742 for interactive approval viewing
-XPRA_PORT="${XPRA_PORT:-28742}"
-if command -v xpra >/dev/null 2>&1; then
-    echo "[Runtime] Starting Xpra shadow viewer on 0.0.0.0:$XPRA_PORT..."
-    xpra shadow "$DISPLAY_NUM" --bind-tcp="0.0.0.0:$XPRA_PORT" --html=on --daemon=yes --notifications=no --bell=no 2>/dev/null || true
-fi
+# 9. Clean up any stale Xpra sockets
+rm -rf /home/cordbrief/.xpra 2>/dev/null || true
 
 # 10. Start official, unmodified Discord desktop client with auto-relaunch for updates
 echo "[Runtime] Launching official unmodified Discord desktop client supervisor..."
@@ -116,32 +112,8 @@ run_discord() {
 run_discord &
 DISCORD_PID=$!
 
-# Watchdog to ensure headless Discord window receives initial focus/activation in Xvfb
-run_window_activator() {
-    local count=0
-    while true; do
-        sleep 3
-        if [ ! -S "$XDG_RUNTIME_DIR/discord-ipc-0" ]; then
-            count=$((count + 1))
-            if [ "$count" -ge 3 ]; then
-                WID=$(xdotool search --class discord 2>/dev/null | tail -n 1)
-                if [ -n "$WID" ]; then
-                    xdotool windowactivate "$WID" key --window "$WID" ctrl+r 2>/dev/null || true
-                fi
-                count=0
-            fi
-        else
-            count=0
-            sleep 30
-        fi
-    done
-}
-run_window_activator &
-ACTIVATOR_PID=$!
-
 cleanup() {
     echo "[Runtime] Cleaning up background processes..."
-    kill "$ACTIVATOR_PID" 2>/dev/null || true
     kill "$DAEMON_PID" 2>/dev/null || true
     kill "$DISCORD_PID" 2>/dev/null || true
     pkill -u cordbrief -f "Discord" 2>/dev/null || true

@@ -87,6 +87,8 @@ type CollectorStatus struct {
 	ActiveSegment           uint64     `json:"active_segment"`
 	LastEventAt             *time.Time `json:"last_event_at,omitempty"`
 	LastError               *string    `json:"last_error,omitempty"`
+	PromptState             *string    `json:"prompt_state,omitempty"`
+	ActionRequired          *string    `json:"action_required,omitempty"`
 	RecoveryState           string     `json:"recovery_state,omitempty"`
 	RecoveryLastAt          *time.Time `json:"recovery_last_at,omitempty"`
 	RecoveryPendingChannels int        `json:"recovery_pending_channels,omitempty"`

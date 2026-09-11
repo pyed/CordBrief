@@ -955,6 +955,48 @@ func TestServer_StaleCollectorStatus(t *testing.T) {
 	}
 }
 
+func TestServer_ActionRequiredAndPromptState(t *testing.T) {
+	srv, exchangeDir, _ := setupTestEnv(t)
+	statPath := filepath.Join(exchangeDir, "collector-status.json")
+	nowStr := time.Now().UTC().Format(time.RFC3339)
+
+	// 1. discord_login_required with ActionRequired
+	statusLogin := `{"version":1,"updated_at":"` + nowStr + `","mode":"setup","collector_state":"discord_login_required","discord_authenticated":false,"action_required":"Discord login required. Open http://127.0.0.1:28742/ to log into Discord."}`
+	_ = os.WriteFile(statPath, []byte(statusLogin), 0644)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	rec := httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+
+	body := rec.Body.String()
+	if !strings.Contains(body, "Discord login required") {
+		t.Errorf("expected 'Discord login required' in overview body, got: %s", body)
+	}
+	if !strings.Contains(body, "127.0.0.1:28742") {
+		t.Errorf("expected Xpra port '127.0.0.1:28742' in overview body, got: %s", body)
+	}
+
+	// Check /system page as well
+	reqSys := httptest.NewRequest(http.MethodGet, "/system", nil)
+	recSys := httptest.NewRecorder()
+	srv.ServeHTTP(recSys, reqSys)
+	bodySys := recSys.Body.String()
+	if !strings.Contains(bodySys, "Discord login required") {
+		t.Errorf("expected 'Discord login required' in system body, got: %s", bodySys)
+	}
+
+	// 2. cordbrief_authorization_required with PromptState
+	statusAuth := `{"version":1,"updated_at":"` + nowStr + `","mode":"setup","collector_state":"cordbrief_authorization_required","discord_authenticated":true,"prompt_state":"waiting_operator_approval","action_required":"Approve the CordBrief authorization prompt inside Discord (http://127.0.0.1:28742/)."}`
+	_ = os.WriteFile(statPath, []byte(statusAuth), 0644)
+
+	rec = httptest.NewRecorder()
+	srv.ServeHTTP(rec, req)
+	body = rec.Body.String()
+	if !strings.Contains(body, "Approve the CordBrief authorization prompt") {
+		t.Errorf("expected 'Approve the CordBrief authorization prompt' in overview body, got: %s", body)
+	}
+}
+
 func TestServer_CollectorCommand(t *testing.T) {
 	srv, exchangeDir, _ := setupTestEnv(t)
 
