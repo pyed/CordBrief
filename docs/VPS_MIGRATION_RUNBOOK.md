@@ -1,95 +1,126 @@
 # CordBrief M17: VPS Migration Runbook
 ## Legacy Vencord to Canonical Official Discord RPC Architecture
 
-**Target Baseline:** `dd2e1221d04c0b1082194ef378fb227d9bf26697`  
-**Execution Mode:** Reversible, non-destructive, zero-data-loss cutover.  
-**Estimated Downtime:** 3 – 5 minutes (including operator interactive Discord sign-in).
+> [!WARNING]
+> **DO NOT EXECUTE ON THE LIVE VPS YET.**  
+> This runbook is the approved operational blueprint. Execution occurs only after review and explicit operator authorization.
 
 ---
 
-## 1. Migration Inventory & Classification
+## Executive Summary & Core Invariants
 
-All persistent state on the legacy deployment is cataloged and classified below:
+1. **Zero Legacy Reactivation**: Under NO circumstances will the legacy Vencord collector, CDP collector, patched Discord client, or user-token/private-endpoint collectors ever be restarted. If the RPC cutover fails, collection remains stopped while diagnosing.
+2. **Application-Consistent Backups**: Writers (`cordbrief-collector` and `cordbrief-core`) are cleanly stopped and verified stopped before any backup tarballs or volume seeds are created.
+3. **Hypothesis-Driven Preflight**: Deployment paths (e.g. `/opt/cordbrief`) and volume names (`cordbrief_core_data`, `cordbrief_exchange`) are hypotheses until confirmed by the read-only preflight audit.
+4. **Code Delivery Precondition**: The canonical migration commit is not yet on origin; it must be delivered to the VPS (via authorized push or git bundle) and verified before any services are stopped.
+5. **Deterministic Credential Seeding**: Discord OAuth credentials are seeded directly into the private volume `cordbrief_rpc_collector_data` using `scripts/update_secret.sh` with mode `0600` and ownership `1000:1000`, without printing secrets or touching `.env`.
+6. **Best-Effort Outage Recovery**: `GET_CHANNEL` has undocumented, client-state-dependent snapshot depth with no pagination or completeness boundary. Recovery is best-effort; any outage creates a potential message coverage gap. Therefore, preparation is performed online to minimize the writer-offline window to ~2–3 minutes.
+7. **Documented OAuth Scopes**: CordBrief requests strictly `rpc identify messages.read`.
+8. **Non-Destructive First Retention Check**: Proves the maintenance container inspects the real production `core-ack.json` and consumed boundary before publishing evidence; physical unlinking (`--delete-certified`) is strictly deferred.
+9. **Explicit Divergence Window**: If rollback occurs after the new stack has accepted writes, restoring pre-cutover snapshots discards those post-cutover events. This divergence window is explicitly acknowledged.
 
-| Legacy VPS Volume / Path | Host / Container Location | Contents & Purpose | Migration Classification | Target RPC Stack Destination |
+---
+
+## 1. Read-Only VPS Preflight Audit (Ground Truth Discovery)
+
+Before touching or mutating any service, run the read-only preflight script to establish ground truth:
+
+```bash
+chmod +x scripts/vps_preflight.sh
+./scripts/vps_preflight.sh
+```
+
+### Discovery Checklist & Output Verification
+The script inspects and outputs:
+- **Repository Location & State**: `pwd`, `git rev-parse --show-toplevel`, `git rev-parse HEAD`, dirty files.
+- **System Resources**: Available RAM (`free -m`) and disk capacity (`df -h . /var/lib/docker`).
+- **Docker & Compose Environment**: Docker engine version, compose plugin version.
+- **Container Inventory**: Exact names, status, image IDs, and port bindings of existing containers.
+- **Volume Inventory**: Exact volume names for exchange, core data, and collector data.
+- **Volume Mounts & Ownership**: UID/GID ownership of volume directories (`1000:1000`).
+- **Journal & Core Cursor Status**:
+  - Exchange events directory entries (`/var/cordbrief/exchange/events/`).
+  - Active Core committed cursor (`/var/cordbrief/exchange/core-ack.json`).
+  - Integrity of `core.db`, `secrets.json` (mode `0600`), and digest files.
+  - Verification that the legacy collector is currently running or stopped.
+
+> [!NOTE]
+> If preflight reveals volume names or paths differing from the defaults, substitute the discovered names in subsequent commands.
+
+---
+
+## 2. Complete Inventory & Classification Matrix
+
+| Path / Volume | Host / Container Location | Contents & Responsibilities | Classification | Migration Action |
 |---|---|---|---|---|
-| **`cordbrief_exchange`** | `/var/cordbrief/exchange/events/` | Physical journal segments (`*.ndjson`) containing immutable raw event logs | **MUST PRESERVE** | `cordbrief_rpc_exchange:/var/cordbrief/exchange/events/` |
-| **`cordbrief_exchange`** | `/var/cordbrief/exchange/retention/` | Phase 3D certified sidecars (`*.ids.json`) for retired segments | **MUST PRESERVE** | `cordbrief_rpc_exchange:/var/cordbrief/exchange/retention/` |
-| **`cordbrief_exchange`** | `/var/cordbrief/exchange/retention-manifest.json` | Authoritative manifest of certified/retired segment boundaries and SHA-256 hashes | **MUST PRESERVE** | `cordbrief_rpc_exchange:/var/cordbrief/exchange/retention-manifest.json` |
-| **`cordbrief_exchange`** | `/var/cordbrief/exchange/core-ack.json` | Core's committed journal cursor (`segment`, `offset`) | **MUST PRESERVE** | `cordbrief_rpc_exchange:/var/cordbrief/exchange/core-ack.json` |
-| **`cordbrief_exchange`** | `/var/cordbrief/exchange/watchlist.json` | Watched channel IDs and generation counter | **MUST PRESERVE** | `cordbrief_rpc_exchange:/var/cordbrief/exchange/watchlist.json` |
-| **`cordbrief_exchange`** | `/var/cordbrief/exchange/catalog.json` | Guild & channel catalog metadata | **MUST PRESERVE** | `cordbrief_rpc_exchange:/var/cordbrief/exchange/catalog.json` |
-| **`cordbrief_exchange`** | `/var/cordbrief/exchange/collector-status.json` | Ephemeral runtime status | **SAFE TO ABANDON** | Regenerated dynamically on startup by RPC daemon |
-| **`cordbrief_exchange`** | `/var/cordbrief/exchange/collector-command*.json` | Ephemeral IPC commands between Core and Collector | **SAFE TO ABANDON** | Generated on-demand |
-| **`cordbrief_core_data`** | `/var/cordbrief/data/digests/` | Historical digest artifacts (`<batch_id>.json`) for Web UI Inbox | **MUST PRESERVE** | `cordbrief_rpc_core_data:/var/cordbrief/data/digests/` |
-| **`cordbrief_core_data`** | `/var/cordbrief/data/config.json` | Application configuration (scheduler time/timezone, LLM provider, Telegram settings) | **MUST PRESERVE** | `cordbrief_rpc_core_data:/var/cordbrief/data/config.json` |
-| **`cordbrief_core_data`** | `/var/cordbrief/data/secrets.json` | Gemini API key and Telegram bot token (mode `0600`) | **MUST PRESERVE** | `cordbrief_rpc_core_data:/var/cordbrief/data/secrets.json` |
-| **`cordbrief_core_data`** | `/var/cordbrief/data/scheduler-state.json` | Scheduler execution state (prevents duplicate daily summaries) | **MUST PRESERVE** | `cordbrief_rpc_core_data:/var/cordbrief/data/scheduler-state.json` |
-| **`cordbrief_core_data`** | `/var/cordbrief/data/commit.lock` | Core commit / retention publication advisory lockfile | **MUST PRESERVE** | `cordbrief_rpc_core_data:/var/cordbrief/data/commit.lock` |
-| **`cordbrief_collector_data`** | `/var/lib/cordbrief/recovery-state.json` | Channel checkpoint mapping (`last_recovered_message_id`, `checkpoint_journal_boundary`) | **MUST PRESERVE** | `cordbrief_rpc_collector_data:/var/lib/cordbrief/recovery-state.json` |
-| **`cordbrief_collector_data`** | `/var/lib/cordbrief/credentials.json` | Discord Developer Application Client ID & Secret (`mode 0600`) | **NEW / CONFIGURE FRESH** | `cordbrief_rpc_collector_data:/var/lib/cordbrief/credentials.json` |
-| **`cordbrief_collector_data`** | `/var/lib/cordbrief/oauth-token.json` | Persisted OAuth2 access & refresh tokens (`mode 0600`) | **NEW / FRESH** | Generated upon operator OAuth consent |
-| **`cordbrief_discord_profile`** | `/home/cordbrief/.config/discord/` | Old Vencord / Electron profile, cache, and patched scripts | **SAFE TO ABANDON** | Replaced by clean official profile `cordbrief_rpc_discord_profile` |
-| **`cordbrief_discord_keyring`** | `/home/cordbrief/.local/share/keyrings/` | Old GNOME Keyring database | **SAFE TO ABANDON** | Replaced by clean official keyring `cordbrief_rpc_discord_keyring` |
-| **`cordbrief_discord_runtime`** | `/var/cordbrief/runtime/` | Old Vencord multi-release staging directory (`releases/`, `current/`) | **SAFE TO ABANDON** | Replaced by clean runtime lock volume `cordbrief_rpc_discord_runtime` |
-| **Host `.env`** | `/opt/cordbrief/.env` | Environment secrets (`GEMINI_API_KEY`, `TELEGRAM_BOT_TOKEN`, `DISCORD_CLIENT_ID`, `DISCORD_CLIENT_SECRET`) | **MUST PRESERVE / ENRICH** | Updated in place with Discord Application credentials |
-
-### Architectural Decision: Fresh Discord Profile & OAuth
-The legacy profile volume (`cordbrief_discord_profile`) was patched by Vencord, modified across Electron upgrades, and contains legacy cache artifacts. Reusing it risks client crashes or state contamination in the unmodified official Linux Discord client. 
-
-Therefore, **we start with a clean official Discord profile and keyring**. The operator will perform an official one-time Discord sign-in (via QR code) and approve the CordBrief OAuth consent prompt over loopback Xpra via an SSH tunnel.
+| **`cordbrief_exchange`** | `/var/cordbrief/exchange/events/` | Physical immutable journal segments (`0*.ndjson`) | **MUST PRESERVE** | Seeded byte-for-byte into `cordbrief_rpc_exchange` |
+| **`cordbrief_exchange`** | `/var/cordbrief/exchange/retention/` | Phase 3D certified sidecars (`*.ids.json`) | **MUST PRESERVE** | Seeded byte-for-byte into `cordbrief_rpc_exchange` |
+| **`cordbrief_exchange`** | `/var/cordbrief/exchange/retention-manifest.json` | Certified segment boundaries and hashes | **MUST PRESERVE** | Seeded byte-for-byte into `cordbrief_rpc_exchange` |
+| **`cordbrief_exchange`** | `/var/cordbrief/exchange/core-ack.json` | Core committed journal cursor (`segment`, `offset`) | **MUST PRESERVE** | Seeded byte-for-byte into `cordbrief_rpc_exchange` |
+| **`cordbrief_exchange`** | `/var/cordbrief/exchange/watchlist.json` | Watched channel IDs and generation counter | **MUST PRESERVE** | Seeded byte-for-byte into `cordbrief_rpc_exchange` |
+| **`cordbrief_exchange`** | `/var/cordbrief/exchange/catalog.json` | Guild & channel metadata | **MUST PRESERVE** | Seeded byte-for-byte into `cordbrief_rpc_exchange` |
+| **`cordbrief_core_data`** | `/var/cordbrief/data/core.db` | SQLite database (ingest state, catalogs, inbox) | **MUST PRESERVE** | Seeded byte-for-byte into `cordbrief_rpc_core_data` |
+| **`cordbrief_core_data`** | `/var/cordbrief/data/digests/` | Historical digest records for Web UI Inbox | **MUST PRESERVE** | Seeded byte-for-byte into `cordbrief_rpc_core_data` |
+| **`cordbrief_core_data`** | `/var/cordbrief/data/config.json` | Application config (scheduler, Telegram settings) | **MUST PRESERVE** | Seeded byte-for-byte into `cordbrief_rpc_core_data` |
+| **`cordbrief_core_data`** | `/var/cordbrief/data/secrets.json` | Gemini API key and Telegram bot token (mode `0600`) | **MUST PRESERVE** | Seeded byte-for-byte into `cordbrief_rpc_core_data` |
+| **`cordbrief_core_data`** | `/var/cordbrief/data/scheduler-state.json` | Scheduler execution state | **MUST PRESERVE** | Seeded byte-for-byte into `cordbrief_rpc_core_data` |
+| **`credentials.json`** | `/var/lib/cordbrief/credentials.json` | Discord OAuth Client ID & Secret (mode `0600`) | **MIGRATE / TRANSFORM** | Seeded into `cordbrief_rpc_collector_data` via `scripts/update_secret.sh` |
+| **`oauth-token.json`** | `/var/lib/cordbrief/oauth-token.json` | Persisted OAuth2 access & refresh tokens (mode `0600`) | **NEW / FRESH** | Generated upon operator OAuth consent |
+| **`cordbrief_rpc_discord_profile`** | `/home/cordbrief/.config/discord/` | Clean official unmodified Discord Linux config | **NEW / FRESH** | Fresh official client session; legacy Vencord profile abandoned |
+| **`cordbrief_rpc_discord_keyring`** | `/home/cordbrief/.local/share/keyrings/` | Clean GNOME Keyring storage | **NEW / FRESH** | Fresh keyring storage; legacy keyring abandoned |
+| **`cordbrief_discord_profile`** | Legacy Docker Volume | Old Vencord profile & Electron patches | **SAFE TO ABANDON** | Kept untouched for rollback; pruned only after 7-day burn-in |
+| **`cordbrief_collector_data`** | Legacy Docker Volume | Old Vencord collector state | **SAFE TO ABANDON** | Kept untouched for rollback; pruned only after 7-day burn-in |
 
 ---
 
-## 2. Pre-Migration Immutable Backup
+## 3. Code Delivery Precondition (Before Any Downtime)
 
-Before any mutation occurs, all existing Docker volumes and host files must be captured in an immutable, read-only snapshot.
+The approved migration commit is not on `origin/main` until explicitly authorized. Do NOT stop writers or run `git checkout` until the code is verified present on the VPS.
 
-### Step 2.1: Cleanly Stop Legacy Containers
-On the VPS host:
+### Delivery Method A: Authorized Push to Origin
+When the operator authorizes pushing to origin:
 ```bash
+# On workstation:
+git tag -a v2.0-rpc -m "M17 canonical RPC architecture"
+git push origin v2.0-rpc
+
+# On VPS:
 cd /opt/cordbrief
-docker compose -f docker/compose.yml stop
+git fetch origin --tags
+git checkout v2.0-rpc
 ```
 
-### Step 2.2: Capture Compressed Volume Snapshot
-Mount all legacy volumes **read-only (`:ro`)** into a disposable helper container:
+### Delivery Method B: Secure Git Bundle Transfer (No Remote Push)
+If deploying without pushing to a public remote:
 ```bash
-BACKUP_DIR="/var/backups/cordbrief-$(date +%Y%m%d_%H%M%S)"
-mkdir -p "$BACKUP_DIR"
+# On workstation:
+git bundle create /tmp/cordbrief-m17.bundle origin/main..HEAD
+scp /tmp/cordbrief-m17.bundle user@<VPS_IP>:/tmp/
 
-docker run --rm \
-  -v cordbrief_exchange:/src/exchange:ro \
-  -v cordbrief_core_data:/src/core_data:ro \
-  -v cordbrief_collector_data:/src/collector_data:ro \
-  -v cordbrief_discord_profile:/src/discord_profile:ro \
-  -v cordbrief_discord_keyring:/src/discord_keyring:ro \
-  -v cordbrief_discord_runtime:/src/discord_runtime:ro \
-  -v "$BACKUP_DIR":/backup \
-  debian:bookworm-slim \
-  tar -czf /backup/cordbrief_legacy_volumes_complete.tar.gz -C /src .
+# On VPS:
+cd /opt/cordbrief
+git fetch /tmp/cordbrief-m17.bundle 'refs/heads/*:refs/remotes/bundle/*'
+git checkout bundle/main
 ```
 
-### Step 2.3: Capture Host Repo & Environment Backup
+### Pre-Cutover Verification
+Confirm the exact commit hash matches the reviewed checkpoint:
 ```bash
-tar -czf "$BACKUP_DIR/cordbrief_repo_and_env.tar.gz" -C /opt/cordbrief .env docker/compose.yml
-```
-
-### Step 2.4: Generate SHA-256 Checksums and Lock Permissions
-```bash
-sha256sum "$BACKUP_DIR"/*.tar.gz > "$BACKUP_DIR/SHA256SUMS"
-chmod 0400 "$BACKUP_DIR"/*
-echo "[OK] Immutable pre-migration backup completed at $BACKUP_DIR"
-cat "$BACKUP_DIR/SHA256SUMS"
+test "$(git rev-parse HEAD)" = "<APPROVED_COMMIT_HASH>" && echo "[OK] Commit verified"
 ```
 
 ---
 
-## 3. Reversible Volume Seeding & Code Cutover
+## 4. Phase A — Online Pre-Cutover Preparation (Zero Downtime)
 
-The new canonical Compose file utilizes isolated volumes with the `cordbrief_rpc_*` prefix. The legacy `cordbrief_*` volumes remain untouched as an immediate rollback guarantee.
+*The legacy stack remains running and actively ingesting traffic during Phase A.*
 
-### Step 3.1: Create New Canonical Volumes
+### Step 4.1: Pre-Build Canonical Docker Images
+```bash
+docker compose -f docker/compose.yml build
+```
+
+### Step 4.2: Pre-Create Target Volumes
 ```bash
 docker volume create cordbrief_rpc_exchange
 docker volume create cordbrief_rpc_core_data
@@ -99,132 +130,131 @@ docker volume create cordbrief_rpc_discord_keyring
 docker volume create cordbrief_rpc_discord_runtime
 ```
 
-### Step 3.2: Seed Data from Legacy Volumes to RPC Volumes
-Run a transient helper container to copy only the durable, classified state into the new volumes with strict ownership and permission preservation:
+---
 
+## 5. Phase B — Application-Consistent Cutover (Outage Window)
+
+*The writer-offline interval begins here (~2–3 minutes total).*
+
+### Step 5.1: Clean Stop of Writers
+Stop both containers cleanly to flush SQLite WAL and journal segments:
+```bash
+docker compose stop cordbrief-collector cordbrief-core
+```
+
+### Step 5.2: Verify Writers Are Confirmed Stopped
+```bash
+docker compose ps
+# Ensure both containers show "Exited (0)" and no processes hold database locks:
+test -z "$(docker ps -q --filter name=cordbrief)" && echo "[OK] Writers cleanly stopped"
+```
+
+### Step 5.3: Application-Consistent Checksummed Backup
+Capture stopped volumes read-only (`:ro`):
+```bash
+BACKUP_DIR="/var/backups/cordbrief/pre-m17-$(date +%Y%m%d_%H%M%S)"
+mkdir -p "$BACKUP_DIR"
+
+# 1. Archive legacy volumes
+for vol in cordbrief_exchange cordbrief_core_data cordbrief_collector_data; do
+  docker run --rm -v ${vol}:/source:ro -v "$BACKUP_DIR":/backup alpine \
+    tar -czf "/backup/${vol}.tar.gz" -C /source .
+done
+
+# 2. Archive host repository and .env
+tar -czf "$BACKUP_DIR/cordbrief_repo.tar.gz" -C /opt/cordbrief .
+cp /opt/cordbrief/.env "$BACKUP_DIR/.env.bak" 2>/dev/null || true
+
+# 3. Checksums and read-only lockdown
+cd "$BACKUP_DIR"
+sha256sum *.tar.gz > SHA256SUMS
+chmod -R 0400 "$BACKUP_DIR"/*
+chmod 0500 "$BACKUP_DIR"
+echo "[OK] Application-consistent backup completed at $BACKUP_DIR"
+cat SHA256SUMS
+```
+
+### Step 5.4: Seed Canonical Volumes from Stopped Snapshot
+Copy data directly into the isolated RPC volumes with correct permissions:
 ```bash
 docker run --rm \
-  -v cordbrief_exchange:/old_exchange:ro \
-  -v cordbrief_core_data:/old_core:ro \
-  -v cordbrief_collector_data:/old_collector:ro \
-  -v cordbrief_rpc_exchange:/new_exchange \
-  -v cordbrief_rpc_core_data:/new_core \
-  -v cordbrief_rpc_collector_data:/new_collector \
-  debian:bookworm-slim bash -c "
-    set -eo pipefail
+  -v cordbrief_exchange:/src_exchange:ro \
+  -v cordbrief_core_data:/src_core:ro \
+  -v cordbrief_rpc_exchange:/dst_exchange \
+  -v cordbrief_rpc_core_data:/dst_core \
+  alpine sh -c '
+    set -e
+    echo "Seeding exchange..."
+    cp -a /src_exchange/. /dst_exchange/
+    chown -R 1000:1000 /dst_exchange
     
-    echo 'Seeding exchange volume...'
-    mkdir -p /new_exchange/events /new_exchange/retention
-    cp -a /old_exchange/events/* /new_exchange/events/ 2>/dev/null || true
-    cp -a /old_exchange/retention/* /new_exchange/retention/ 2>/dev/null || true
-    [ -f /old_exchange/retention-manifest.json ] && cp -p /old_exchange/retention-manifest.json /new_exchange/
-    [ -f /old_exchange/core-ack.json ] && cp -p /old_exchange/core-ack.json /new_exchange/
-    [ -f /old_exchange/watchlist.json ] && cp -p /old_exchange/watchlist.json /new_exchange/
-    [ -f /old_exchange/catalog.json ] && cp -p /old_exchange/catalog.json /new_exchange/
-    chown -R 1000:1000 /new_exchange
+    echo "Seeding core data..."
+    cp -a /src_core/. /dst_core/
+    chown -R 1000:1000 /dst_core
     
-    echo 'Seeding core_data volume...'
-    mkdir -p /new_core/digests
-    [ -d /old_core/digests ] && cp -a /old_core/digests/* /new_core/digests/ 2>/dev/null || true
-    [ -f /old_core/config.json ] && cp -p /old_core/config.json /new_core/
-    [ -f /old_core/secrets.json ] && cp -p /old_core/secrets.json /new_core/
-    [ -f /old_core/scheduler-state.json ] && cp -p /old_core/scheduler-state.json /new_core/
-    touch /new_core/commit.lock
-    chown -R 1000:1000 /new_core
-    [ -f /new_core/secrets.json ] && chmod 0600 /new_core/secrets.json || true
-    
-    echo 'Seeding collector_data volume...'
-    mkdir -p -m 0700 /new_collector
-    [ -f /old_collector/recovery-state.json ] && cp -p /old_collector/recovery-state.json /new_collector/
-    chown -R 1000:1000 /new_collector
-    chmod 0700 /new_collector
-    
-    echo 'Volume seeding complete.'
-  "
+    echo "Seeding complete."
+  '
 ```
 
-### Step 3.3: Verify Seeded Volume Contents
+### Step 5.5: Seed Discord OAuth Credentials Deterministically
+Run the standalone credentials updater, specifying the destination volume explicitly:
 ```bash
-docker run --rm \
-  -v cordbrief_rpc_exchange:/ex:ro \
-  -v cordbrief_rpc_core_data:/core:ro \
-  -v cordbrief_rpc_collector_data:/col:ro \
-  debian:bookworm-slim bash -c "
-    echo '--- Exchange Files ---' && ls -la /ex /ex/events
-    echo '--- Core Files ---' && ls -la /core
-    echo '--- Collector Files ---' && ls -la /col
-  "
+chmod +x scripts/update_secret.sh
+./scripts/update_secret.sh cordbrief_rpc_collector_data
 ```
+- Prompts for `DISCORD_CLIENT_SECRET` silently (`read -s`).
+- Writes `/var/lib/cordbrief/credentials.json` directly into `cordbrief_rpc_collector_data`.
+- Enforces permissions `0600` and ownership `1000:1000`.
+- Secret is never echoed, logged, or written to host disk.
 
-### Step 3.4: Switch Code to Canonical Baseline & Configure Credentials
-Fetch the canonical baseline and update `.env` with the Discord Application Client ID & Secret:
+### Step 5.6: Launch Canonical RPC Stack
 ```bash
-cd /opt/cordbrief
-git fetch origin
-git checkout dd2e1221d04c0b1082194ef378fb227d9bf26697
-
-# Ensure Discord Developer Application credentials are configured in .env:
-# (Replace values with your registered Discord Developer Application)
-cat << 'EOF' >> .env
-DISCORD_CLIENT_ID=1547744191122247772
-DISCORD_CLIENT_SECRET=YOUR_DISCORD_CLIENT_SECRET
-EOF
-chmod 0600 .env
-```
-
-### Step 3.5: Build and Start Canonical Stack
-```bash
-docker compose -f docker/compose.yml build
 docker compose -f docker/compose.yml up -d
 ```
 
 ---
 
-## 4. Interactive Operator Sign-In & Authorization
+## 6. Interactive Operator Sign-In & Authorization
 
-Both the Web UI (`28741`) and Xpra shadow viewer (`28742`) bind strictly to `127.0.0.1` on the VPS.
+Both the Web UI (`28741`) and temporary Xpra shadow viewer (`28742`) bind strictly to `127.0.0.1` on the VPS.
 
-### Step 4.1: Establish Secure SSH Tunnel
+### Step 6.1: Establish Secure SSH Loopback Tunnel
 From the **local workstation terminal**, forward both loopback ports:
 ```bash
-ssh -N -L 28741:127.0.0.1:28741 -L 28742:127.0.0.1:28742 user@vps-ip
+ssh -N -L 28741:127.0.0.1:28741 -L 28742:127.0.0.1:28742 user@<VPS_IP>
 ```
-*(Leave this terminal window running.)*
+*(Keep this terminal running during setup).*
 
-### Step 4.2: Perform Discord Sign-In (Interactive)
-1. Open local browser at: **<http://127.0.0.1:28742/>**
-2. The Xpra HTML5 viewer displays the official unmodified Discord desktop client login screen.
-3. Use the Discord mobile app to scan the QR code (or enter email/password + 2FA).
-4. Discord loads into its main client interface.
+### Step 6.2: Discord Mobile QR Sign-In
+1. Open local browser to **`http://127.0.0.1:28742/`**.
+2. The Xpra HTML5 viewer displays official unmodified Linux Discord.
+3. Use the Discord mobile app to scan the displayed QR code (User Settings → Scan QR Code).
+4. Discord authenticates and loads into the client interface.
 
-### Step 4.3: Approve CordBrief OAuth Authorization (Interactive)
-1. Within 2–5 seconds of Discord loading, the CordBrief daemon connects via local IPC.
-2. An OAuth consent dialog pops up inside the Discord window:  
-   *"CordBrief wants to access your Discord account"*
-3. Click the purple **"Authorize"** button.
-4. **Automatic Handoff**:
-   - The daemon captures the authorization code, exchanges it for access & refresh tokens, and saves `/var/lib/cordbrief/oauth-token.json` (`mode 0600`).
-   - The daemon immediately terminates the on-demand Xpra shadow viewer.
-   - The browser at `127.0.0.1:28742` will show connection closed/disconnected.
-   - Collector transitions to `collector_state: "running"`, `mode: "normal"`.
+### Step 6.3: Approve CordBrief OAuth Consent Dialog
+1. Within 2–5 seconds of Discord loading, the CordBrief daemon detects IPC and triggers the authorization prompt.
+2. The Discord client presents the authorization window requesting scopes:
+   - `rpc`
+   - `identify`
+   - `messages.read`
+3. Click the purple **Authorize** button.
+4. **Automatic Headless Transition**:
+   - Daemon exchanges authorization code for tokens and persists `oauth-token.json` (`mode 0600`).
+   - Daemon shuts down the Xpra process and closes port `28742`.
+   - Browser on `http://127.0.0.1:28742/` disconnects (expected).
+   - Daemon enters unattended normal operation (`collector_state: "running"`, `mode: "normal"`).
 
 ---
 
-## 5. Post-Migration Verification Checklist
+## 7. Post-Migration Verification Checklist
 
-Execute these checks on the VPS host to confirm full operational integrity:
+Execute these checks to verify end-to-end operational integrity:
 
-### 1. Container & Process Status
-```bash
-docker compose -f docker/compose.yml ps
-```
-- **Expect:** Both `cordbrief-collector` and `cordbrief-core` are `Up` and `(healthy)`.
-
-### 2. Collector State Machine & Xpra Port Closure
+### 1. Collector State Machine
 ```bash
 docker exec cordbrief-collector cat /var/cordbrief/exchange/collector-status.json
 ```
-- **Expect:**
+- **Expect**:
   ```json
   {
     "mode": "normal",
@@ -234,120 +264,135 @@ docker exec cordbrief-collector cat /var/cordbrief/exchange/collector-status.jso
     "action_required": null
   }
   ```
-- Verify Xpra is shut down on loopback:
-  ```bash
-  curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:28742/ || echo "Port closed (expected)"
-  ```
-  - **Expect:** Connection refused / failure.
 
-### 3. Core Health & Inbox History Continuity
-Open **<http://127.0.0.1:28741/>** in the local browser via the SSH tunnel:
-- **Inbox:** All historical digests generated prior to migration are visible, browsable, and formatted correctly.
-- **Watchlist:** Active watched channels match the pre-migration watchlist.
-- **Settings:** LLM configuration, schedule time, and Telegram chat destination match pre-migration values.
+### 2. Attack Surface Hardening (Port 28742 Closed)
+```bash
+curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:28742/ || echo "Port 28742 safely closed"
+```
+- **Expect**: Connection refused (`Port 28742 safely closed`).
 
-### 4. Journal Cursor & No-Duplication Check
-Inspect Core cursor and active segment:
+### 3. Cursor Continuity & Zero Duplication
 ```bash
 docker exec cordbrief-core cat /var/cordbrief/exchange/core-ack.json
 ```
-- **Expect:** The `segment` and `offset` match the pre-migration values, proving Core did not reset to `0` and did not re-ingest past messages.
+- **Expect**: `segment` and `offset` match the pre-migration cursor, proving Core did not reset and did not re-ingest past messages.
 
-### 5. Live Traffic End-to-End Ingestion Check
-1. Send a controlled live message (e.g., `"M17 VPS cutover live probe"`) in one of the watched Discord channels.
+### 4. Live Message Capture
+1. Post a test message in a watched channel (e.g. `#cb-test`).
 2. Inspect the latest journal events:
    ```bash
    docker exec cordbrief-collector tail -n 5 /var/cordbrief/exchange/events/$(ls -t /var/cordbrief/exchange/events | head -1)
    ```
-   - **Expect:** The message appears as a valid schema v1 `message_create` event within 1–2 seconds.
-3. Verify Core advances its cursor:
+   - **Expect**: Message appears as a valid schema v1 `message_create` event within < 2 seconds.
+3. Verify Core advances cursor:
    ```bash
    docker exec cordbrief-core cat /var/cordbrief/exchange/core-ack.json
    ```
-   - **Expect:** `offset` increases to encompass the new live record.
+   - **Expect**: `offset` increases to encompass the live event.
 
-### 6. Outbound Delivery Check
-In the Web UI (<http://127.0.0.1:28741/>), click **"Send Test Message"** under Telegram Settings (if Telegram is enabled) to verify outbound delivery connectivity.
+### 5. Web UI & Inbox Integrity
+Open **`http://127.0.0.1:28741/`** in local browser:
+- Historical digests are visible and formatted correctly.
+- Watched channels match pre-migration watchlist.
+
+### 6. Unattended Restart Test
+```bash
+docker restart cordbrief-collector
+sleep 15
+docker exec cordbrief-collector cat /var/cordbrief/exchange/collector-status.json
+```
+- **Expect**: `collector_state: "running"`, `last_error: null`, zero operator intervention required.
 
 ---
 
-## 6. First Real Post-Migration Retention Check
+## 8. First Real Post-Migration Retention Check
 
-Do not run garbage collection immediately following migration. Wait until Core has naturally progressed past at least one closed journal segment.
+> [!IMPORTANT]
+> **Strict Non-Destructive Policy**: Never run `--delete-certified` during initial cutover validation.
 
-### Step 6.1: Verify Core Has Consumed Past Segment N
-Check `core-ack.json`:
-```bash
-cat /var/cordbrief/exchange/core-ack.json
-```
-Ensure `segment > N` (e.g., `segment == 2`, allowing retirement of segment `1`).
-
-### Step 6.2: Non-Destructive Certification Run (NO GC)
-Stop the running services to release kernel locks:
-```bash
-cd /opt/cordbrief
-docker compose -f docker/compose.yml stop
-```
-
-Execute the maintenance container to certify segment `N` without deletion:
-```bash
-docker compose -f docker/compose.yml -f docker/compose.retention.yml run --rm cordbrief-collector \
-  bash /home/cordbrief/collector/retention-publish.sh N
-```
-- **Verified Invariants:**
-  - Maintenance container mounts `cordbrief_rpc_core_data` and inspects `core-ack.json`.
-  - Confirms Core has consumed past segment `N`.
-  - Validates digest citations in `/var/cordbrief/data/digests/`.
-  - Publishes sidecar `/var/cordbrief/exchange/retention/000000000000000N.ids.json`.
-  - Publishes updated `/var/cordbrief/exchange/retention-manifest.json` with `retired_through: N`.
-  - **No segments are unlinked or deleted.**
-
-### Step 6.3: Inspect Published Evidence & Resume Services
-```bash
-cat /var/cordbrief/exchange/retention-manifest.json
-docker compose -f docker/compose.yml start
-```
-Confirm the stack returns to `collector_state: "running"` and Core continues operating normally with the published manifest.
-
-### Step 6.4: Subsequent Certified Deletion (Optional)
-Only after observing stable operation across an additional digest cycle may physical unlinking be performed:
-```bash
-docker compose -f docker/compose.yml stop
-docker compose -f docker/compose.yml -f docker/compose.retention.yml run --rm cordbrief-collector \
-  bash /home/cordbrief/collector/retention-publish.sh N --delete-certified
-docker compose -f docker/compose.yml start
-```
+1. Allow the canonical stack to operate until Core naturally consumes past at least one closed journal segment ($N$).
+2. Verify `core-ack.json` has advanced past segment $N$:
+   ```bash
+   docker exec cordbrief-core cat /var/cordbrief/exchange/core-ack.json
+   # Must show segment > N
+   ```
+3. Stop services cleanly for maintenance:
+   ```bash
+   docker compose -f docker/compose.yml stop cordbrief-core cordbrief-collector
+   ```
+4. Run non-destructive certification:
+   ```bash
+   docker compose -f docker/compose.yml -f docker/compose.retention.yml run --rm cordbrief-collector \
+     bash /home/cordbrief/collector/retention-publish.sh N
+   ```
+   - Invariant: Maintenance container mounts `cordbrief_rpc_core_data`, verifies the actual production `core-ack.json`, validates digest citations, and publishes sidecars and manifests.
+   - **Zero segments are deleted or unlinked.**
+5. Restart canonical stack:
+   ```bash
+   docker compose -f docker/compose.yml up -d
+   ```
 
 ---
 
-## 7. Rollback Sequence (< 60 Seconds)
+## 9. Compliant Rollback Policy & Divergence Window
 
-If any unrecoverable issue arises during cutover (e.g. operator unable to authenticate Discord, network failure, or client incompatibility), rollback is instantaneous because the legacy `cordbrief_*` volumes were never mutated.
+> [!CAUTION]
+> **The legacy Vencord collector, CDP collector, patched Discord, or user-token/private-endpoint collector MUST NEVER be restarted.**
 
-```bash
-cd /opt/cordbrief
-
-# 1. Stop the canonical RPC stack
-docker compose -f docker/compose.yml down
-
-# 2. Revert working tree to pre-migration baseline
-git checkout 244f4a47f9c322cae0c8355f93ee4f39d28a6995
-
-# 3. Start legacy Vencord services using untouched original volumes
-docker compose -f docker/compose.yml up -d
-
-# 4. Confirm legacy stack restored
-docker compose -f docker/compose.yml ps
-docker logs --tail 20 cordbrief-core
-```
+### Permitted Rollback Actions
+1. Stop and remove the failed canonical RPC stack:
+   ```bash
+   docker compose -f docker/compose.yml down
+   ```
+2. **State Divergence Analysis**:
+   - **Pre-Ingest Rollback** (failure occurred before new stack accepted writes or before Core ingested new events):
+     Pre-cutover data in legacy volumes is completely untouched. Restoring backup snapshots leaves zero data loss.
+   - **Post-Ingest Rollback** (failure occurred after new stack was running and accepted live messages):
+     New messages exist only in `cordbrief_rpc_exchange`. Reverting Core/exchange to pre-cutover backups creates an explicit divergence window: any messages ingested between cutover and rollback will be discarded. The operator must inspect `/var/cordbrief/exchange/events/` and note the highest message ID before deciding to overwrite with the pre-cutover snapshot.
+3. **Restore Pre-Cutover State (If Necessary)**:
+   ```bash
+   # Restore exact pre-migration state into RPC volumes:
+   docker run --rm -v cordbrief_rpc_exchange:/dst -v "$BACKUP_DIR":/backup:ro alpine \
+     sh -c "rm -rf /dst/* && tar -xzf /backup/cordbrief_exchange.tar.gz -C /dst && chown -R 1000:1000 /dst"
+   docker run --rm -v cordbrief_rpc_core_data:/dst -v "$BACKUP_DIR":/backup:ro alpine \
+     sh -c "rm -rf /dst/* && tar -xzf /backup/cordbrief_core_data.tar.gz -C /dst && chown -R 1000:1000 /dst"
+   ```
+4. **Safe Component Standalone Operation**:
+   - Collection remains **STOPPED** while the team diagnoses the RPC failure.
+   - Core may be started standalone for read-only Web UI browsing:
+     ```bash
+     docker compose -f docker/compose.yml up -d cordbrief-core
+     ```
+   - Legacy Vencord collector remains permanently offline.
 
 ---
 
-## 8. Post-Cutover Volume Cleanup (Deferred)
+## 10. Downtime Minimization & Best-Effort Recovery
 
-Only after the RPC architecture has operated reliably in production for at least 48 hours without issue:
+### Best-Effort Outage Recovery Contract
+- `GET_CHANNEL` recovery is **best-effort**.
+- `GET_CHANNEL` has undocumented, client-state-dependent snapshot depth with no documented pagination or completeness boundary.
+- **No completeness guarantee exists** for messages posted during an outage window.
+- Any cutover downtime creates a potential message coverage gap.
+
+### Optimized Maintenance Window
+By moving all code transfer, docker image pre-building, and target volume preparation into Phase A (while legacy stack is running), the writer-offline window in Phase B is strictly minimized:
+
+| Phase Step | Action | Offline Impact | Expected Duration |
+|---|---|---|---|
+| **Step 5.1 – 5.2** | Clean writer stop & verification | Writers stopped | 10 – 15 s |
+| **Step 5.3** | Application-consistent backup & SHA-256 | Writers stopped | 20 – 30 s |
+| **Step 5.4 – 5.5** | Volume seeding & secret write | Writers stopped | 15 – 25 s |
+| **Step 5.6** | Canonical stack container launch | Discord starting | 10 – 15 s |
+| **Step 6.1 – 6.3** | Operator QR scan & OAuth click | Waiting on operator | 45 – 90 s |
+| **Total Writer-Offline Window** | | | **~2 – 3 minutes** |
+
+---
+
+## 11. Post-Cutover Volume Cleanup (Deferred)
+
+Only after the RPC architecture has operated reliably in production for at least 7 days without issue:
 ```bash
-# Remove obsolete legacy volumes after verified cutover
 docker volume rm cordbrief_discord_runtime
 docker volume rm cordbrief_discord_profile
 docker volume rm cordbrief_discord_keyring
@@ -355,4 +400,4 @@ docker volume rm cordbrief_collector_data
 docker volume rm cordbrief_exchange
 docker volume rm cordbrief_core_data
 ```
-*(Keep the immutable backup in `/var/backups/` according to your retention policy.)*
+*(The immutable backup in `/var/backups/` is retained according to backup policy).*

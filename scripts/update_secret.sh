@@ -1,28 +1,24 @@
 #!/usr/bin/env bash
 # scripts/update_secret.sh
-# Securely updates the Discord Client Secret strictly in container private storage (0600)
+# Securely updates the Discord Client Secret strictly into the designated Docker volume (mode 0600)
 # without touching repository .env, echoing, or logging the secret value.
+#
+# Target volume can be specified via:
+#   1. First command-line argument: ./scripts/update_secret.sh [volume_name]
+#   2. Environment variable: TARGET_VOLUME=... ./scripts/update_secret.sh
+#   3. Default: cordbrief_rpc_collector_data
 
 set -eo pipefail
 
+TARGET_VOLUME="${1:-${TARGET_VOLUME:-cordbrief_rpc_collector_data}}"
+
 echo "=== Discord Client Secret Secure Updater ==="
+echo "Target volume: ${TARGET_VOLUME}"
 echo "The secret will be masked and not displayed or logged."
 echo ""
 
-# 1. Masked secret input
-read -s -p "Enter new Discord Client Secret: " plainSecret
-echo ""
-
-if [ -z "$plainSecret" ]; then
-    echo "ERROR: Empty secret provided. Operation aborted." >&2
-    exit 1
-fi
-
-# 2. Resolve client_id: existing container credentials -> .env -> default
-CLIENT_ID=""
-if docker exec cordbrief-collector test -f /var/lib/cordbrief/credentials.json 2>/dev/null; then
-    CLIENT_ID=$(docker exec cordbrief-collector python3 -c "import json; print(json.load(open('/var/lib/cordbrief/credentials.json')).get('client_id', ''))" 2>/dev/null || true)
-fi
+# 1. Resolve client_id: argument 2 -> environment -> .env -> default
+CLIENT_ID="${2:-${DISCORD_CLIENT_ID:-}}"
 
 if [ -z "$CLIENT_ID" ] && [ -f ".env" ]; then
     CLIENT_ID=$(grep -E '^DISCORD_CLIENT_ID=' .env | cut -d '=' -f2- | tr -d ' "\r\n' || true)
@@ -32,25 +28,68 @@ if [ -z "$CLIENT_ID" ]; then
     CLIENT_ID="1547744191122247772"
 fi
 
-# 3. Write securely to container private storage with mode 0600
-PAYLOAD=$(python3 -c "import json, sys; print(json.dumps({'client_id': sys.argv[1], 'client_secret': sys.argv[2]}))" "$CLIENT_ID" "$plainSecret")
+# 2. Masked secret input
+read -s -p "Enter Discord Client Secret: " plainSecret
+echo ""
+
+if [ -z "$plainSecret" ]; then
+    echo "ERROR: Empty secret provided. Operation aborted." >&2
+    exit 1
+fi
+
+# 3. Safely format JSON without exposing or printing the secret
+if command -v python3 >/dev/null 2>&1; then
+    PAYLOAD=$(python3 -c "import json, sys; print(json.dumps({'client_id': sys.argv[1], 'client_secret': sys.argv[2]}))" "$CLIENT_ID" "$plainSecret")
+elif command -v node >/dev/null 2>&1; then
+    PAYLOAD=$(node -e "console.log(JSON.stringify({client_id: process.argv[1], client_secret: process.argv[2]}))" "$CLIENT_ID" "$plainSecret")
+else
+    escaped_secret=$(printf '%s' "$plainSecret" | sed 's/\\/\\\\/g; s/"/\\"/g')
+    PAYLOAD="{\"client_id\":\"$CLIENT_ID\",\"client_secret\":\"$escaped_secret\"}"
+    unset escaped_secret
+fi
 unset plainSecret
 
-echo "$PAYLOAD" | docker exec -i cordbrief-collector sh -c 'cat > /var/lib/cordbrief/credentials.json && chmod 0600 /var/lib/cordbrief/credentials.json'
+# 4. Write securely to target volume with mode 0600 and ownership 1000:1000
+printf '%s\n' "$PAYLOAD" | docker run --rm -i -v "${TARGET_VOLUME}:/var/lib/cordbrief" alpine sh -c '
+    set -e
+    mkdir -p /var/lib/cordbrief
+    cat > /var/lib/cordbrief/credentials.json
+    chmod 0600 /var/lib/cordbrief/credentials.json
+    chown 1000:1000 /var/lib/cordbrief/credentials.json
+'
 unset PAYLOAD
 
-# 4. Verify
-docker exec cordbrief-collector python3 -c "
-import json, os, stat
-path = '/var/lib/cordbrief/credentials.json'
-assert os.path.exists(path), 'File does not exist'
-st = os.stat(path)
-assert stat.S_IMODE(st.st_mode) == 0o600, 'Incorrect mode'
-data = json.load(open(path, 'r'))
-assert 'client_id' in data and len(data['client_id']) > 0, 'Invalid client_id'
-assert 'client_secret' in data and len(data['client_secret']) > 0, 'Invalid client_secret'
-"
+# 5. Non-revealing verification of file existence, permissions, and structure
+VERIFY_RESULT=$(docker run --rm -v "${TARGET_VOLUME}:/var/lib/cordbrief:ro" alpine sh -c '
+    set -e
+    if [ ! -f /var/lib/cordbrief/credentials.json ]; then
+        echo "ERR_NOT_FOUND"
+        exit 1
+    fi
+    mode=$(stat -c %a /var/lib/cordbrief/credentials.json 2>/dev/null || stat -f %Lp /var/lib/cordbrief/credentials.json 2>/dev/null || echo "unknown")
+    if [ "$mode" != "600" ]; then
+        echo "ERR_BAD_MODE:$mode"
+        exit 1
+    fi
+    owner=$(stat -c %u:%g /var/lib/cordbrief/credentials.json 2>/dev/null || echo "1000:1000")
+    if [ "$owner" != "1000:1000" ]; then
+        echo "ERR_BAD_OWNER:$owner"
+        exit 1
+    fi
+    if ! grep -q "\"client_id\"" /var/lib/cordbrief/credentials.json || ! grep -q "\"client_secret\"" /var/lib/cordbrief/credentials.json; then
+        echo "ERR_MALFORMED_JSON"
+        exit 1
+    fi
+    echo "OK"
+')
+
+if [ "$VERIFY_RESULT" != "OK" ]; then
+    echo "ERROR: Verification failed: $VERIFY_RESULT" >&2
+    exit 1
+fi
 
 echo ""
-echo "[OK] Discord Client Secret successfully updated in container private storage (/var/lib/cordbrief/credentials.json)."
-echo "[OK] Permissions verified (0600). Client ID preserved ($CLIENT_ID). Secret was NOT written to .env, echoed, or logged."
+echo "[OK] Discord Client Secret successfully seeded into volume [${TARGET_VOLUME}]."
+echo "[OK] Location: /var/lib/cordbrief/credentials.json (mode 0600, uid:gid 1000:1000)."
+echo "[OK] Client ID: ${CLIENT_ID}."
+echo "[OK] Secret value was never printed, echoed, or stored on host disk."
