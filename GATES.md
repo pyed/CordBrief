@@ -62,15 +62,15 @@ OWNS: docs/VPS_MIGRATION_RUNBOOK.md, docs/RETENTION.md, scripts/update_secret.sh
 
 Scope: Prepare a precise, reversible migration plan from the existing legacy CordBrief VPS deployment to the new canonical RPC architecture without risking production state. Do not access or modify the VPS.
 
-- [x] M17-G1: Complete Migration Inventory & Volume Classification: Every legacy VPS volume, file, and secret cataloged with clear lifecycle classification (MUST PRESERVE, MIGRATE / TRANSFORM, NEW / FRESH, SAFE TO ABANDON).
+- [x] M17-G1: Complete Migration Inventory & Volume Classification: Every legacy VPS volume, file, and secret cataloged with clear lifecycle classification (MUST PRESERVE, MIGRATE / TRANSFORM, NEW / FRESH, SAFE TO ABANDON); proven UID/GID 1000:1000 invariant verified.
   CHECK: node collector/test/vps_migration_test.mjs --test 1
   EXPECT: m17_g1_passed
-  EVIDENCE: exit=0; parsed 17 inventory items in runbook; verified all entries map strictly to MUST PRESERVE, MIGRATE / TRANSFORM, NEW / FRESH, or SAFE TO ABANDON; canonical volume destinations verified.
+  EVIDENCE: exit=0; parsed 17 inventory items in runbook; verified all entries map strictly to allowed classifications; proven UID/GID 1000:1000 invariant verified across collector/Dockerfile, docker/Dockerfile.core, and docker/compose.yml.
 
-- [x] M17-G2: Application-Consistent Backup Sequence: Writers cleanly stopped and verified stopped before backup tarball creation; read-only mounts (:ro), SHA-256 checksums, and 0400 permissions verified.
+- [x] M17-G2: Application-Consistent Backup & Safe Restore Cleanup: Writers cleanly stopped and verified stopped before backup tarball creation; read-only mounts (:ro), SHA-256 checksums, and 0400 permissions verified; safe dotfile-inclusive restore cleanup using find verified (rm -rf /dst/* prohibited).
   CHECK: node collector/test/vps_migration_test.mjs --test 2
   EXPECT: m17_g2_passed
-  EVIDENCE: exit=0; verified application-consistent ordering (stop writers -> verify stopped -> backup :ro with sha256sum and 0400 -> seed canonical volumes); hot/live backup prohibited.
+  EVIDENCE: exit=0; verified application-consistent ordering (stop writers -> verify stopped -> backup :ro with sha256sum and 0400 -> seed canonical volumes); hot/live backup prohibited; safe restore cleanup using find verified.
 
 - [x] M17-G3: Deterministic Credential Seeding: Standalone Linux credential helper scripts/update_secret.sh created and verified on isolated Docker volume; zero secret leakage, mode 0600, uid:gid 1000:1000.
   CHECK: node collector/test/vps_migration_test.mjs --test 3
@@ -92,10 +92,10 @@ Scope: Prepare a precise, reversible migration plan from the existing legacy Cor
   EXPECT: m17_g6_passed
   EVIDENCE: exit=0; verified runbook mandates inspecting production core-ack.json and verifying cursor > N before publishing evidence; physical unlinking (--delete-certified) is strictly deferred.
 
-- [x] M17-G7: Compliant Rollback Specification & Divergence Window Model: Rollback strictly forbids restarting legacy Vencord/CDP/patched collector; models pre-ingest vs post-ingest divergence window; allows standalone Core restart while collection remains stopped.
+- [x] M17-G7: Compliant Rollback Specification & Divergence Window Model: Rollback strictly forbids restarting legacy Vencord/CDP/patched collector; models pre-ingest vs post-ingest divergence window; defaults to leaving Core stopped; safe non-mutating read-only inspection verified.
   CHECK: node collector/test/vps_migration_test.mjs --test 7
   EXPECT: m17_g7_passed
-  EVIDENCE: exit=0; verified rollback strictly forbids restarting legacy Vencord/CDP/patched collector; models pre-ingest vs post-ingest divergence window; allows standalone Core restart while collection remains stopped.
+  EVIDENCE: exit=0; verified rollback strictly forbids restarting legacy Vencord/CDP/patched collector; models pre-ingest vs post-ingest divergence window; mandates Core remains stopped by default; safe read-only SQLite/filesystem inspection verified.
 
 
 

@@ -9,7 +9,7 @@
 
 ## Executive Summary & Core Invariants
 
-1. **Zero Legacy Reactivation**: Under NO circumstances will the legacy Vencord collector, CDP collector, patched Discord client, or user-token/private-endpoint collectors ever be restarted. If the RPC cutover fails, collection remains stopped while diagnosing.
+1. **Zero Legacy Reactivation & Safe Rollback**: Under NO circumstances will the legacy Vencord collector, CDP collector, patched Discord client, or user-token/private-endpoint collectors ever be restarted. During rollback, both Collection and Core remain stopped by default. Normal Core startup is not read-only and is prohibited; state is inspected using non-mutating read-only tooling.
 2. **Application-Consistent Backups**: Writers (`cordbrief-collector` and `cordbrief-core`) are cleanly stopped and verified stopped before any backup tarballs or volume seeds are created.
 3. **Hypothesis-Driven Preflight**: Deployment paths (e.g. `/opt/cordbrief`) and volume names (`cordbrief_core_data`, `cordbrief_exchange`) are hypotheses until confirmed by the read-only preflight audit.
 4. **Code Delivery Precondition**: The canonical migration commit is not yet on origin; it must be delivered to the VPS (via authorized push or git bundle) and verified before any services are stopped.
@@ -18,6 +18,7 @@
 7. **Documented OAuth Scopes**: CordBrief requests strictly `rpc identify messages.read`.
 8. **Non-Destructive First Retention Check**: Proves the maintenance container inspects the real production `core-ack.json` and consumed boundary before publishing evidence; physical unlinking (`--delete-certified`) is strictly deferred.
 9. **Explicit Divergence Window**: If rollback occurs after the new stack has accepted writes, restoring pre-cutover snapshots discards those post-cutover events. This divergence window is explicitly acknowledged.
+10. **Proven UID/GID Invariant (1000:1000)**: Both canonical production images deliberately run unprivileged as UID/GID `1000:1000` (`cordbrief:cordbrief`), verified by Dockerfiles, compose definitions, and preflight audit.
 
 ---
 
@@ -35,9 +36,8 @@ The script inspects and outputs:
 - **Repository Location & State**: `pwd`, `git rev-parse --show-toplevel`, `git rev-parse HEAD`, dirty files.
 - **System Resources**: Available RAM (`free -m`) and disk capacity (`df -h . /var/lib/docker`).
 - **Docker & Compose Environment**: Docker engine version, compose plugin version.
-- **Container Inventory**: Exact names, status, image IDs, and port bindings of existing containers.
-- **Volume Inventory**: Exact volume names for exchange, core data, and collector data.
-- **Volume Mounts & Ownership**: UID/GID ownership of volume directories (`1000:1000`).
+- **Container Inventory & User Config**: Exact names, status, image IDs, and configured user (`1000:1000`).
+- **Volume Inventory & Ownership**: Discovered volume names and filesystem root ownership (`stat -c %u:%g`).
 - **Journal & Core Cursor Status**:
   - Exchange events directory entries (`/var/cordbrief/exchange/events/`).
   - Active Core committed cursor (`/var/cordbrief/exchange/core-ack.json`).
@@ -70,6 +70,16 @@ The script inspects and outputs:
 | **`cordbrief_rpc_discord_keyring`** | `/home/cordbrief/.local/share/keyrings/` | Clean GNOME Keyring storage | **NEW / FRESH** | Fresh keyring storage; legacy keyring abandoned |
 | **`cordbrief_discord_profile`** | Legacy Docker Volume | Old Vencord profile & Electron patches | **SAFE TO ABANDON** | Kept untouched for rollback; pruned only after 7-day burn-in |
 | **`cordbrief_collector_data`** | Legacy Docker Volume | Old Vencord collector state | **SAFE TO ABANDON** | Kept untouched for rollback; pruned only after 7-day burn-in |
+
+### Production User & Group Invariant (UID/GID 1000:1000)
+
+The canonical CordBrief architecture strictly enforces non-root unprivileged execution under UID/GID `1000:1000`:
+- **`collector/Dockerfile`**: creates unprivileged user `cordbrief` via `RUN useradd -u 1000 -m -s /bin/bash cordbrief` and sets `USER cordbrief`.
+- **`docker/Dockerfile.core`**: creates unprivileged user `cordbrief` via `RUN adduser -D -u 1000 -s /bin/sh cordbrief` and sets `USER cordbrief`.
+- **`docker/compose.yml`**: specifies `user: "1000:1000"` for both `cordbrief-collector` and `cordbrief-core`.
+- **`docker/compose.retention.yml`**: runs offline maintenance under the same canonical collector user configuration.
+
+Because both containers run as unprivileged UID/GID `1000:1000`, all files in shared volumes (`cordbrief_rpc_exchange`, `cordbrief_rpc_core_data`, `cordbrief_rpc_collector_data`) must be owned by `1000:1000` to allow uninterrupted read/write access. All volume seeding and restore commands explicitly enforce `chown -R 1000:1000` (configurable via `TARGET_UID:TARGET_GID` if resolved differently by preflight).
 
 ---
 
@@ -352,18 +362,30 @@ docker exec cordbrief-collector cat /var/cordbrief/exchange/collector-status.jso
 3. **Restore Pre-Cutover State (If Necessary)**:
    ```bash
    # Restore exact pre-migration state into RPC volumes:
+   # Uses find to safely remove all existing entries (including hidden dotfiles) without unmounting /dst:
    docker run --rm -v cordbrief_rpc_exchange:/dst -v "$BACKUP_DIR":/backup:ro alpine \
-     sh -c "rm -rf /dst/* && tar -xzf /backup/cordbrief_exchange.tar.gz -C /dst && chown -R 1000:1000 /dst"
+     sh -c "find /dst -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + && tar -xzf /backup/cordbrief_exchange.tar.gz -C /dst && chown -R 1000:1000 /dst"
    docker run --rm -v cordbrief_rpc_core_data:/dst -v "$BACKUP_DIR":/backup:ro alpine \
-     sh -c "rm -rf /dst/* && tar -xzf /backup/cordbrief_core_data.tar.gz -C /dst && chown -R 1000:1000 /dst"
+     sh -c "find /dst -mindepth 1 -maxdepth 1 -exec rm -rf -- {} + && tar -xzf /backup/cordbrief_core_data.tar.gz -C /dst && chown -R 1000:1000 /dst"
    ```
-4. **Safe Component Standalone Operation**:
-   - Collection remains **STOPPED** while the team diagnoses the RPC failure.
-   - Core may be started standalone for read-only Web UI browsing:
+4. **Safe Component Standalone Operation & Non-Mutating State Inspection**:
+   - **Both Collection and Core remain STOPPED by default while diagnosing.**
+   - Normal Core startup (`docker compose up -d cordbrief-core`) is **NOT read-only**: it initializes SQLite write connections, executes schema migrations, starts the cron scheduler, and risks sending automated Telegram digests. Normal Core startup is strictly prohibited during rollback unless an explicitly proven no-write/read-only mode exists.
+   - **Safe Non-Mutating State Inspection**: Inspect SQLite database and journal state using read-only tooling:
      ```bash
-     docker compose -f docker/compose.yml up -d cordbrief-core
+     # Inspect Core database read-only (zero mutation risk)
+     docker run --rm -v cordbrief_rpc_core_data:/data:ro alpine sh -c '
+       apk add --no-cache sqlite >/dev/null 2>&1
+       sqlite3 file:/data/core.db?mode=ro ".tables" "SELECT count(*) FROM digests;"
+     '
+
+     # Inspect exchange journal segments and cursor read-only
+     docker run --rm -v cordbrief_rpc_exchange:/ex:ro alpine sh -c '
+       ls -la /ex/events /ex/retention
+       cat /ex/core-ack.json 2>/dev/null || true
+     '
      ```
-   - Legacy Vencord collector remains permanently offline.
+   - Legacy Vencord collector and failed RPC collector remain permanently offline.
 
 ---
 

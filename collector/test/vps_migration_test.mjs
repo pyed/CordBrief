@@ -1,6 +1,6 @@
 // collector/test/vps_migration_test.mjs
 // Rigorous automated validation of Milestone M17 VPS migration runbook, preflight discovery,
-// credential helper determinism, and rollback invariants.
+// credential helper determinism, safe restore cleanup, and rollback invariants.
 
 import { readFileSync } from "node:fs";
 import { execSync } from "node:child_process";
@@ -16,7 +16,7 @@ function test1() {
   console.log("[Test 1] Validating migration inventory table and volume classifications...");
   const tableMatch = runbook.match(/\| Path \/ Volume \|[\s\S]*?(?=\n---)/);
   assert(tableMatch, "Inventory table must be present in runbook");
-  const tableLines = tableMatch[0].trim().split("\n").slice(2);
+  const tableLines = tableMatch[0].trim().split("\n").filter(l => l.trim().startsWith("|")).slice(2);
   const allowedClassifications = ["MUST PRESERVE", "MIGRATE / TRANSFORM", "NEW / FRESH", "SAFE TO ABANDON"];
 
   const inventory = tableLines.map(line => {
@@ -47,15 +47,24 @@ function test1() {
   assert(abandonItems.some(i => i.pathOrVolume.includes("cordbrief_discord_profile")), "cordbrief_discord_profile must be SAFE TO ABANDON");
   assert(abandonItems.some(i => i.pathOrVolume.includes("cordbrief_collector_data")), "cordbrief_collector_data must be SAFE TO ABANDON");
 
-  console.log(`  ✔ Verified ${inventory.length} inventory items against allowed lifecycle classifications.`);
+  // Verify UID/GID 1000:1000 production invariant proof
+  const collectorDocker = readFileSync("collector/Dockerfile", "utf8");
+  assert(collectorDocker.includes("useradd -u 1000") && collectorDocker.includes("USER cordbrief"), "collector/Dockerfile must run as UID 1000 cordbrief");
+  const coreDocker = readFileSync("docker/Dockerfile.core", "utf8");
+  assert(coreDocker.includes("adduser -D -u 1000") && coreDocker.includes("USER cordbrief"), "docker/Dockerfile.core must run as UID 1000 cordbrief");
+  const compose = readFileSync("docker/compose.yml", "utf8");
+  assert(compose.includes('user: "1000:1000"'), "docker/compose.yml must specify user: 1000:1000");
+  assert(runbook.includes("UID/GID 1000:1000"), "Runbook must document proven UID/GID 1000:1000 invariant");
+
+  console.log(`  ✔ Verified ${inventory.length} inventory items and proven UID/GID 1000:1000 architecture invariant.`);
   console.log("m17_g1_passed");
 }
 
 // -----------------------------------------------------------------------------
-// Test 2: Application-Consistent Pre-Migration Backup Sequence (M17-G2)
+// Test 2: Application-Consistent Pre-Migration Backup & Safe Restore (M17-G2)
 // -----------------------------------------------------------------------------
 function test2() {
-  console.log("[Test 2] Validating application-consistent backup sequence and ordering...");
+  console.log("[Test 2] Validating application-consistent backup sequence and safe restore cleanup...");
   const s5Idx = runbook.indexOf("## 5. Phase B — Application-Consistent Cutover");
   const s6Idx = runbook.indexOf("## 6. Interactive Operator Sign-In");
   assert(s5Idx !== -1 && s6Idx !== -1, "Phase B cutover section must exist");
@@ -79,7 +88,15 @@ function test2() {
   assert(phaseB.includes("sha256sum"), "Backup procedure must compute SHA-256 checksums");
   assert(phaseB.includes("chmod -R 0400"), "Backup directory must be locked down read-only (0400)");
 
-  console.log("  ✔ Verified application-consistent backup ordering: stop -> verify stopped -> backup -> seed.");
+  // Verify safe restore cleanup: must NOT use 'rm -rf /dst/*' (leaves dotfiles behind)
+  // Must use 'find /dst -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +'
+  assert(!runbook.includes("rm -rf /dst/*"), "Must not use flawed 'rm -rf /dst/*' which leaves dotfiles behind");
+  assert(
+    runbook.includes("find /dst -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +"),
+    "Must use safe restore cleanup removing dotfiles: find /dst -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +"
+  );
+
+  console.log("  ✔ Verified application-consistent backup ordering and safe dotfile-inclusive restore cleanup.");
   console.log("m17_g2_passed");
 }
 
@@ -156,7 +173,7 @@ function test5() {
   assert(preflightOutput.includes("[2/6] System Resources"), "Step 2 expected");
   assert(preflightOutput.includes("[3/6] Docker & Compose Runtime"), "Step 3 expected");
   assert(preflightOutput.includes("[4/6] Containers & Compose Projects"), "Step 4 expected");
-  assert(preflightOutput.includes("[5/6] Volume Inventory"), "Step 5 expected");
+  assert(preflightOutput.includes("[5/6] Volume Inventory & Ownership"), "Step 5 expected");
   assert(preflightOutput.includes("[6/6] Journal & Core Cursor Status"), "Step 6 expected");
   assert(preflightOutput.includes("Zero mutations performed"), "Read-only non-mutation guarantee expected");
 
@@ -188,7 +205,7 @@ function test6() {
 // Test 7: Compliant Rollback Model & Divergence Window (M17-G7)
 // -----------------------------------------------------------------------------
 function test7() {
-  console.log("[Test 7] Validating compliant rollback model and state divergence window...");
+  console.log("[Test 7] Validating compliant rollback model, stopped Core default, and state divergence window...");
   const s9Idx = runbook.indexOf("## 9. Compliant Rollback Policy");
   const s9End = runbook.indexOf("## 10. Downtime Minimization");
   assert(s9Idx !== -1 && s9End !== -1, "Section 9 (Rollback) must exist");
@@ -201,9 +218,22 @@ function test7() {
   assert(!rollbackSec.includes("compose.legacy.yml"), "Must not reference non-existent compose.legacy.yml");
   assert(rollbackSec.includes("docker compose -f docker/compose.yml down"), "Must stop failed stack");
   assert(rollbackSec.includes("Divergence") || rollbackSec.includes("divergence"), "Must explain state divergence window");
-  assert(rollbackSec.includes("cordbrief-core"), "Permits starting standalone safe components (Core)");
 
-  console.log("  ✔ Verified compliant rollback model: zero legacy collector reactivation, explicit divergence window.");
+  // Core must remain STOPPED by default; normal startup must NOT be called read-only
+  assert(
+    rollbackSec.includes("STOPPED by default") || rollbackSec.includes("stopped by default"),
+    "Rollback must mandate Core remains stopped by default"
+  );
+  assert(
+    rollbackSec.includes("NOT read-only") || rollbackSec.includes("not read-only"),
+    "Rollback must recognize that normal Core startup is NOT read-only"
+  );
+  assert(
+    rollbackSec.includes("mode=ro") || rollbackSec.includes("sqlite3"),
+    "Rollback must specify safe non-mutating state inspection using read-only tooling"
+  );
+
+  console.log("  ✔ Verified compliant rollback model: zero legacy collector reactivation, stopped Core default, explicit divergence window.");
   console.log("m17_g7_passed");
 }
 

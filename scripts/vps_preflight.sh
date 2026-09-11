@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # scripts/vps_preflight.sh
 # Read-only VPS preflight discovery script for CordBrief M17 migration.
-# Collects host, container, volume, cursor, and resource state without any mutations.
+# Collects host, container, volume, cursor, ownership, and resource state without any mutations.
 
 set -eo pipefail
 
@@ -50,14 +50,22 @@ else
 fi
 echo ""
 
-# 4. Container Inventory
+# 4. Container Inventory & Image User Configuration
 echo "--- [4/6] Containers & Compose Projects ---"
 echo "Active & Stopped Containers:"
 docker ps -a --format "table {{.Names}}\t{{.Status}}\t{{.Image}}\t{{.Ports}}"
 echo ""
+echo "Canonical Image Target User: 1000:1000 (cordbrief:cordbrief in Dockerfile & compose.yml)"
+for c in cordbrief-collector cordbrief-core; do
+    if docker inspect "$c" >/dev/null 2>&1; then
+        c_user=$(docker inspect --format '{{.Config.User}}' "$c" 2>/dev/null || true)
+        echo "  ${c} container config user: '${c_user:-<default root>}'"
+    fi
+done
+echo ""
 
-# 5. Volume Inventory
-echo "--- [5/6] Volume Inventory ---"
+# 5. Volume Inventory & Discovered Ownership
+echo "--- [5/6] Volume Inventory & Ownership Audit ---"
 VOLUMES=$(docker volume ls --format "{{.Name}}")
 echo "Discovered Volumes:"
 echo "$VOLUMES" | grep -E "cordbrief" || echo "No cordbrief volumes discovered"
@@ -77,6 +85,8 @@ done
 if [ -n "$EXCHANGE_VOL" ]; then
     echo "Inspecting exchange volume: [${EXCHANGE_VOL}]"
     docker run --rm -v "${EXCHANGE_VOL}:/ex:ro" alpine sh -c '
+        ex_owner=$(stat -c %u:%g /ex 2>/dev/null || stat -f %u:%g /ex 2>/dev/null || echo "unknown")
+        echo "  Volume root ownership (UID:GID): ${ex_owner}"
         echo "  Events directory entries:"
         ls -la /ex/events 2>/dev/null || echo "  No /ex/events directory"
         if [ -f /ex/core-ack.json ]; then
@@ -108,6 +118,8 @@ done
 if [ -n "$CORE_VOL" ]; then
     echo "Inspecting core_data volume: [${CORE_VOL}]"
     docker run --rm -v "${CORE_VOL}:/core:ro" alpine sh -c '
+        core_owner=$(stat -c %u:%g /core 2>/dev/null || stat -f %u:%g /core 2>/dev/null || echo "unknown")
+        echo "  Volume root ownership (UID:GID): ${core_owner}"
         if [ -f /core/core.db ]; then
             echo "  core.db: PRESENT ($(stat -c %s /core/core.db 2>/dev/null || stat -f %z /core/core.db) bytes)"
         else

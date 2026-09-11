@@ -7,13 +7,20 @@
 #   1. First command-line argument: ./scripts/update_secret.sh [volume_name]
 #   2. Environment variable: TARGET_VOLUME=... ./scripts/update_secret.sh
 #   3. Default: cordbrief_rpc_collector_data
+#
+# Target ownership defaults to canonical UID:GID 1000:1000 (proven by Dockerfiles and compose.yml),
+# but can be overridden via TARGET_UID and TARGET_GID.
 
 set -eo pipefail
 
 TARGET_VOLUME="${1:-${TARGET_VOLUME:-cordbrief_rpc_collector_data}}"
+TARGET_UID="${TARGET_UID:-1000}"
+TARGET_GID="${TARGET_GID:-1000}"
+TARGET_OWNER="${TARGET_UID}:${TARGET_GID}"
 
 echo "=== Discord Client Secret Secure Updater ==="
 echo "Target volume: ${TARGET_VOLUME}"
+echo "Target owner:  ${TARGET_OWNER}"
 echo "The secret will be masked and not displayed or logged."
 echo ""
 
@@ -49,39 +56,39 @@ else
 fi
 unset plainSecret
 
-# 4. Write securely to target volume with mode 0600 and ownership 1000:1000
-printf '%s\n' "$PAYLOAD" | docker run --rm -i -v "${TARGET_VOLUME}:/var/lib/cordbrief" alpine sh -c '
+# 4. Write securely to target volume with mode 0600 and resolved ownership
+printf '%s\n' "$PAYLOAD" | docker run --rm -i -v "${TARGET_VOLUME}:/var/lib/cordbrief" alpine sh -c "
     set -e
     mkdir -p /var/lib/cordbrief
     cat > /var/lib/cordbrief/credentials.json
     chmod 0600 /var/lib/cordbrief/credentials.json
-    chown 1000:1000 /var/lib/cordbrief/credentials.json
-'
+    chown ${TARGET_OWNER} /var/lib/cordbrief/credentials.json
+"
 unset PAYLOAD
 
 # 5. Non-revealing verification of file existence, permissions, and structure
-VERIFY_RESULT=$(docker run --rm -v "${TARGET_VOLUME}:/var/lib/cordbrief:ro" alpine sh -c '
+VERIFY_RESULT=$(docker run --rm -v "${TARGET_VOLUME}:/var/lib/cordbrief:ro" alpine sh -c "
     set -e
     if [ ! -f /var/lib/cordbrief/credentials.json ]; then
-        echo "ERR_NOT_FOUND"
+        echo \"ERR_NOT_FOUND\"
         exit 1
     fi
-    mode=$(stat -c %a /var/lib/cordbrief/credentials.json 2>/dev/null || stat -f %Lp /var/lib/cordbrief/credentials.json 2>/dev/null || echo "unknown")
-    if [ "$mode" != "600" ]; then
-        echo "ERR_BAD_MODE:$mode"
+    mode=\$(stat -c %a /var/lib/cordbrief/credentials.json 2>/dev/null || stat -f %Lp /var/lib/cordbrief/credentials.json 2>/dev/null || echo \"unknown\")
+    if [ \"\$mode\" != \"600\" ]; then
+        echo \"ERR_BAD_MODE:\$mode\"
         exit 1
     fi
-    owner=$(stat -c %u:%g /var/lib/cordbrief/credentials.json 2>/dev/null || echo "1000:1000")
-    if [ "$owner" != "1000:1000" ]; then
-        echo "ERR_BAD_OWNER:$owner"
+    owner=\$(stat -c %u:%g /var/lib/cordbrief/credentials.json 2>/dev/null || echo \"${TARGET_OWNER}\")
+    if [ \"\$owner\" != \"${TARGET_OWNER}\" ]; then
+        echo \"ERR_BAD_OWNER:\$owner\"
         exit 1
     fi
-    if ! grep -q "\"client_id\"" /var/lib/cordbrief/credentials.json || ! grep -q "\"client_secret\"" /var/lib/cordbrief/credentials.json; then
-        echo "ERR_MALFORMED_JSON"
+    if ! grep -q '\"client_id\"' /var/lib/cordbrief/credentials.json || ! grep -q '\"client_secret\"' /var/lib/cordbrief/credentials.json; then
+        echo \"ERR_MALFORMED_JSON\"
         exit 1
     fi
-    echo "OK"
-')
+    echo \"OK\"
+")
 
 if [ "$VERIFY_RESULT" != "OK" ]; then
     echo "ERROR: Verification failed: $VERIFY_RESULT" >&2
@@ -90,6 +97,6 @@ fi
 
 echo ""
 echo "[OK] Discord Client Secret successfully seeded into volume [${TARGET_VOLUME}]."
-echo "[OK] Location: /var/lib/cordbrief/credentials.json (mode 0600, uid:gid 1000:1000)."
+echo "[OK] Location: /var/lib/cordbrief/credentials.json (mode 0600, uid:gid ${TARGET_OWNER})."
 echo "[OK] Client ID: ${CLIENT_ID}."
 echo "[OK] Secret value was never printed, echoed, or stored on host disk."
