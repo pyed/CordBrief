@@ -64,14 +64,14 @@ async function waitForState(targetStates, maxWaitSeconds = 60, intervalMs = 1000
 
 export async function resetToFreshState() {
     console.log("[Proof] Stopping cordbrief-collector...");
-    try { exec("docker compose -f docker/compose.rpc.yml stop cordbrief-collector"); } catch {}
+    try { exec("docker compose -f docker/compose.yml stop cordbrief-collector"); } catch {}
 
     console.log("[Proof] Resetting volumes to fresh state...");
     const cleanupCmd = 'docker run --rm -v cordbrief_rpc_collector_data:/collector -v cordbrief_rpc_discord_profile:/discord -v cordbrief_rpc_discord_keyring:/keyrings -v cordbrief_rpc_exchange:/exchange debian:bookworm-slim sh -c "rm -f /collector/oauth-token* /collector/recovery-state*; rm -rf /keyrings/*; rm -rf \\"/discord/Local Storage\\" \\"/discord/Session Storage\\" /discord/Cookies* \\"/discord/Network Persistent State\\" /discord/SharedStorage* /discord/WebStorage /discord/Preferences \\"/discord/Local State\\" /discord/blob_storage /discord/Cache \\"/discord/Code Cache\\" /discord/GPUCache /discord/Dawn* /discord/DIPS* /discord/Trust* /discord/Singleton* /discord/logs/*; rm -rf /exchange/events/* /exchange/collector-status.json /exchange/collector-command*"';
     exec(cleanupCmd);
 
     console.log("[Proof] Starting cordbrief-collector with fresh state...");
-    exec("docker compose -f docker/compose.rpc.yml start cordbrief-collector");
+    exec("docker compose -f docker/compose.yml start cordbrief-collector");
 }
 
 export async function step1_freshStartup() {

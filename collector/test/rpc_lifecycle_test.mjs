@@ -424,24 +424,46 @@ async function testAll() {
     const resProtocol = child_process.spawnSync("node collector/test/rpc_protocol_test.mjs", { stdio: "inherit", shell: true });
     assert.strictEqual(resProtocol.status, 0, "rpc_protocol_test.mjs must pass");
 
-    // Inventory check: Legacy Vencord components remain intact for rollback safety
-    const legacyFiles = [
+    // M16 Verification: Obsolete Vencord-era files decommissioned and deleted
+    const decommissionedFiles = [
         "collector/Dockerfile.setup",
         "collector/Dockerfile.runtime",
+        "collector/Dockerfile.rpc",
         "collector/entrypoint-setup.sh",
         "collector/entrypoint-runtime.sh",
         "collector/stage-runtime.mjs",
         "collector/supervisor.mjs",
-        "collector/runtime.mjs",
         "collector/plugin/index.ts",
-        "docker/compose.yml"
+        "collector/plugin/package.json",
+        "docker/compose.rpc.yml",
+        "collector/test/operational_test.mjs",
+        "collector/test/setup_failure_test.mjs",
+        "collector/test/setup_handoff_test.mjs",
+        "collector/test/staging_retention_test.mjs"
     ];
 
-    for (const file of legacyFiles) {
-        assert.ok(fs.existsSync(file), `Legacy component ${file} must remain intact for rollback safety`);
+    for (const file of decommissionedFiles) {
+        assert.ok(!fs.existsSync(file), `Decommissioned file ${file} must be removed from working tree`);
+    }
+    assert.ok(!fs.existsSync("collector/plugin"), "collector/plugin directory must be removed");
+
+    // M16 Verification: Preserved retention machinery & promoted official RPC architecture
+    const preservedFiles = [
+        "collector/Dockerfile",
+        "collector/entrypoint-rpc.sh",
+        "collector/runtime.mjs",
+        "collector/native.ts",
+        "collector/retention-publish.mjs",
+        "collector/retention-publish.sh",
+        "docker/compose.yml",
+        "docker/compose.retention.yml"
+    ];
+
+    for (const file of preservedFiles) {
+        assert.ok(fs.existsSync(file), `Preserved/promoted component ${file} must exist`);
     }
 
-    console.log(`  ✔ Verified all ${legacyFiles.length} legacy components are preserved for rollback`);
+    console.log(`  ✔ Verified ${decommissionedFiles.length} obsolete components decommissioned and ${preservedFiles.length} primary/retention components preserved`);
     console.log("rpc_all_lifecycle_checks_passed");
 }
 

@@ -1,79 +1,44 @@
-# CordBrief Architecture v2: Split Setup/Runtime Architecture
+# CordBrief Official Discord RPC Architecture
 #
-# Security & Process Boundary:
-# - cordbrief-collector: Lightweight headless daemon running official Discord + Vencord dist under Xvfb.
-#   Stripped of Xpra, Python, compilers, git, and build tools. No published ports.
-# - cordbrief-setup: Ephemeral setup and reauthentication tool with Xpra HTML5 viewer on 127.0.0.1:28742.
-#   Builds Vencord with CordBrief userplugin, stages runtime volume releases, and yields.
-#   Runs on-demand via: docker compose --profile setup up cordbrief-setup
-# - cordbrief-core: Runs Go core application. Reads journal events and manages watchlist.
-# - Inter-service boundaries:
-#   - cordbrief_discord_runtime: shared prepared application binaries and runtime releases
-#   - cordbrief_exchange: filesystem events, status, watchlist, and command exchange
-#   - Single-writer / single-ownership enforced by Linux kernel flock(2) on runtime.lock
+# Services:
+# - cordbrief-collector: Official unmodified Discord desktop client + local RPC collector daemon
+#   Exposes Xpra shadow viewer on 127.0.0.1:28742 exclusively for interactive setup/OAuth authorization.
+# - cordbrief-core: Go core service reading journal events, updating watchlist, serving web UI on 127.0.0.1:28741.
 
 services:
-  # 1. Minimal Production Ingestion Daemon: Headless Discord + Vencord
   cordbrief-collector:
     image: docker-cordbrief-collector:latest
     build:
       context: ../collector
-      dockerfile: Dockerfile.runtime
+      dockerfile: Dockerfile
     container_name: cordbrief-collector
     restart: unless-stopped
     shm_size: "1gb"
     user: "1000:1000"
+    ports:
+      - "127.0.0.1:28742:28742"
+    env_file:
+      - path: ../.env
+        required: false
     environment:
       - CORDBRIEF_EXCHANGE_DIR=/var/cordbrief/exchange
       - CORDBRIEF_COLLECTOR_DATA_DIR=/var/lib/cordbrief
       - CORDBRIEF_RUNTIME_DIR=/var/cordbrief/runtime
+      - XDG_RUNTIME_DIR=/tmp/runtime-cordbrief
       - DISPLAY=:100
     volumes:
-      # Prepared Discord application binaries and active release
-      - cordbrief_discord_runtime:/var/cordbrief/runtime
-      # Persistent Discord user session (cookies, LocalStorage - no application binaries)
-      - cordbrief_discord_profile:/home/cordbrief/.config/discord
-      # Persistent GNOME Keyring for Discord secret token storage
-      - cordbrief_discord_keyring:/home/cordbrief/.local/share/keyrings
-      # Shared filesystem exchange (events, status, watchlist, catalog)
-      - cordbrief_exchange:/var/cordbrief/exchange
-      # Collector-private CordBrief application data (recovery state, internal metadata)
-      - cordbrief_collector_data:/var/lib/cordbrief
+      - cordbrief_rpc_discord_runtime:/var/cordbrief/runtime
+      - cordbrief_rpc_discord_profile:/home/cordbrief/.config/discord
+      - cordbrief_rpc_discord_keyring:/home/cordbrief/.local/share/keyrings
+      - cordbrief_rpc_exchange:/var/cordbrief/exchange
+      - cordbrief_rpc_collector_data:/var/lib/cordbrief
     healthcheck:
       test: ["CMD-SHELL", "node -e 'const fs=require(\"fs\"); const s=JSON.parse(fs.readFileSync(\"/var/cordbrief/exchange/collector-status.json\")); if(Date.now()-new Date(s.updated_at).getTime()>30000) process.exit(1);' || exit 1"]
       interval: 15s
       timeout: 5s
       retries: 3
-      start_period: 15s
+      start_period: 30s
 
-  # 2. Ephemeral Setup & Reauthentication Tool (Interactive Xpra HTML5 Viewer)
-  cordbrief-setup:
-    image: docker-cordbrief-setup:latest
-    build:
-      context: ../collector
-      dockerfile: Dockerfile.setup
-    container_name: cordbrief-setup
-    profiles:
-      - setup
-    shm_size: "1gb"
-    user: "1000:1000"
-    ports:
-      # Expose Xpra HTML5 client exclusively to localhost for first-time login / reauth
-      - "127.0.0.1:28742:28742"
-    environment:
-      - CORDBRIEF_EXCHANGE_DIR=/var/cordbrief/exchange
-      - CORDBRIEF_COLLECTOR_DATA_DIR=/var/lib/cordbrief
-      - CORDBRIEF_RUNTIME_DIR=/var/cordbrief/runtime
-      - XPRA_PORT=28742
-      - DISPLAY=:100
-    volumes:
-      - cordbrief_discord_runtime:/var/cordbrief/runtime
-      - cordbrief_discord_profile:/home/cordbrief/.config/discord
-      - cordbrief_discord_keyring:/home/cordbrief/.local/share/keyrings
-      - cordbrief_exchange:/var/cordbrief/exchange
-      - cordbrief_collector_data:/var/lib/cordbrief
-
-  # 3. Core Service: Journal consumer, watchlist manager, and summarization/delivery
   cordbrief-core:
     build:
       context: ..
@@ -93,12 +58,9 @@ services:
       - CORDBRIEF_EXCHANGE_DIR=/var/cordbrief/exchange
       - CORDBRIEF_DATA_DIR=/var/cordbrief/data
       - CORDBRIEF_WEB_PORT=28741
-      # Credentials come from env_file; bare entries here would override it.
     volumes:
-      # Shared filesystem exchange (reads events/status/catalog, writes watchlist/core-ack)
-      - cordbrief_exchange:/var/cordbrief/exchange
-      # Core internal data and state
-      - cordbrief_core_data:/var/cordbrief/data
+      - cordbrief_rpc_exchange:/var/cordbrief/exchange
+      - cordbrief_rpc_core_data:/var/cordbrief/data
     healthcheck:
       test: ["CMD-SHELL", "wget -q -O - http://127.0.0.1:28741/ > /dev/null || exit 1"]
       interval: 15s
@@ -107,20 +69,15 @@ services:
       start_period: 10s
 
 volumes:
-  # Shared prepared Discord runtime volume (releases, current symlink, runtime.lock)
-  cordbrief_discord_runtime:
-    name: cordbrief_discord_runtime
-  # Shared exchange volume (inter-service boundary)
-  cordbrief_exchange:
-    name: cordbrief_exchange
-  # Collector-private Discord profile & keyring
-  cordbrief_discord_profile:
-    name: cordbrief_discord_profile
-  cordbrief_discord_keyring:
-    name: cordbrief_discord_keyring
-  # Collector-private application data
-  cordbrief_collector_data:
-    name: cordbrief_collector_data
-  # Core-private application data
-  cordbrief_core_data:
-    name: cordbrief_core_data
+  cordbrief_rpc_discord_runtime:
+    name: cordbrief_rpc_discord_runtime
+  cordbrief_rpc_exchange:
+    name: cordbrief_rpc_exchange
+  cordbrief_rpc_discord_profile:
+    name: cordbrief_rpc_discord_profile
+  cordbrief_rpc_discord_keyring:
+    name: cordbrief_rpc_discord_keyring
+  cordbrief_rpc_collector_data:
+    name: cordbrief_rpc_collector_data
+  cordbrief_rpc_core_data:
+    name: cordbrief_rpc_core_data

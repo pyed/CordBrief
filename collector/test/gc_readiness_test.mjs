@@ -49,7 +49,7 @@ if (process.argv[2] === "--child") {
         if (request.partial && journalFDs.has(fd)) process.exit(76);
     };
     syncBuiltinESMExports();
-    const source = fs.readFileSync(new URL("../plugin/native.ts", import.meta.url), "utf8")
+    const source = fs.readFileSync(new URL("../native.ts", import.meta.url), "utf8")
         .replace('import { IpcMainInvokeEvent } from "electron";', "");
     const native = await import(`data:text/javascript;base64,${Buffer.from(stripTypeScriptTypes(source)).toString("base64")}`);
     fs.unwatchFile(path.join(root, "exchange", "watchlist.json"));
@@ -153,8 +153,11 @@ if (process.argv[2] === "--child") {
                     content: "REST fixture", timestamp: "2026-01-01T00:00:00Z" })) };
             } } }
         } } };
-        fs.writeFileSync(path.join(root, "exchange", "watchlist.json"), JSON.stringify({ version: 1, generation: 1, channel_ids: [channel] }));
-        const renderer = fs.readFileSync(new URL("../plugin/index.ts", import.meta.url), "utf8")
+        const indexPath = new URL("../plugin/index.ts", import.meta.url);
+        if (!fs.existsSync(indexPath)) {
+            throw new Error("Vencord renderer decommissioned in M16");
+        }
+        const renderer = fs.readFileSync(indexPath, "utf8")
             .replace(/^import .*;$/gm, "");
         const js = stripTypeScriptTypes(renderer + "\nexport { runGapRecovery }; ");
         const module = await import(`data:text/javascript;base64,${Buffer.from('const definePlugin = x => x; const Devs = { Vendicated: {} };\n' + js).toString("base64")}`);

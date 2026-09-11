@@ -17,23 +17,23 @@ Use Go 1.26+ and Node 22.13+ (native tests use TypeScript stripping).
 go test -count=1 -timeout=60s ./...
 go vet ./...
 go list -m all
-node collector/test/setup_failure_test.mjs
-node collector/test/gc_readiness_test.mjs --require-safe
-node collector/test/retention_evidence_test.mjs
+node collector/test/rpc_lifecycle_test.mjs --test-all
+node collector/test/retention_test.mjs
+node collector/test/rpc_retention_test.mjs
+node collector/test/rpc_crash_concurrency_test.mjs
 ```
 
-The module listing should contain only `cordbrief`. These Node tests load actual
-native/renderer code with synthetic inputs and disposable files; they do not log
-into Discord. See [recovery](docs/RECOVERY_CONTRACT.md) for the contract they test.
+The module listing should contain only `cordbrief`. These Node tests exercise
+the RPC daemon, lifecycle states, journal appending, and crash recovery with
+synthetic inputs and disposable files.
 
-Run lock and destructive-retention tests on Linux. One option after building the
-setup image is the following (POSIX shell, repository root):
+Run lock and destructive-retention tests on Linux:
 
 ```sh
-docker run --rm --network none --mount "type=bind,source=$PWD/collector,target=/collector,readonly" --entrypoint node docker-cordbrief-setup:latest /collector/test/retention_gc_test.mjs
+docker compose -f docker/compose.yml -f docker/compose.retention.yml run --rm cordbrief-collector node collector/test/retention_gc_test.mjs
 ```
 
-Use the same container command for `retention_publish_test.mjs` and
+Use the same container execution for `retention_publish_test.mjs` and
 `adversarial_lock_test.mjs`. Never mount production volumes into a test container.
 The GC test deletes only disposable journals it creates. Test the affected path;
 documentation changes do not need a live Discord session.

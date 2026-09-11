@@ -305,24 +305,23 @@ func TestComposeConfigurationInvariants(t *testing.T) {
 		t.Errorf("docker/compose.yml missing env_file forwarding for ../.env")
 	}
 
-	// 3. Port hardening: Core web port
+	// 2. Port hardening: Core web port strictly loopback
 	if !strings.Contains(content, `"127.0.0.1:28741:28741"`) {
 		t.Errorf("docker/compose.yml missing hardened Core port binding 127.0.0.1:28741:28741")
 	}
 
-	// 4. Port hardening: Setup port
+	// 3. Port hardening: Collector Xpra shadow port strictly loopback
 	if !strings.Contains(content, `"127.0.0.1:28742:28742"`) {
-		t.Errorf("docker/compose.yml missing hardened Setup port binding 127.0.0.1:28742:28742")
+		t.Errorf("docker/compose.yml missing hardened Collector Xpra port binding 127.0.0.1:28742:28742")
 	}
 
-	// 5. Port hardening: Collector has zero published host ports
-	collectorBlockIdx := strings.Index(content, "cordbrief-collector:")
-	setupBlockIdx := strings.Index(content, "cordbrief-setup:")
-	if collectorBlockIdx == -1 || setupBlockIdx == -1 || setupBlockIdx <= collectorBlockIdx {
-		t.Fatalf("unexpected compose structure: cordbrief-collector / cordbrief-setup blocks")
-	}
-	collectorBlock := content[collectorBlockIdx:setupBlockIdx]
-	if strings.Contains(collectorBlock, "ports:") {
-		t.Errorf("POLICY VIOLATION: cordbrief-collector must have zero published host ports, found 'ports:' in block")
+	// 4. Port hardening: All published ports must bind strictly to 127.0.0.1
+	for _, line := range strings.Split(content, "\n") {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "- \"") && strings.Contains(trimmed, ":") {
+			if !strings.HasPrefix(trimmed, "- \"127.0.0.1:") {
+				t.Errorf("POLICY VIOLATION: all published ports must bind strictly to 127.0.0.1, found: %s", trimmed)
+			}
+		}
 	}
 }
