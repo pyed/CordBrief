@@ -16,15 +16,14 @@ const COLLECTOR_DATA_DIR = process.env.CORDBRIEF_COLLECTOR_DATA_DIR || "/var/lib
 const TOKEN_PATH = path.join(COLLECTOR_DATA_DIR, "oauth-token.json");
 const CREDS_PATH = path.join(COLLECTOR_DATA_DIR, "credentials.json");
 
-// Default channels from operator links:
-// 1. Clash Royale general-chat (noisy)
-// 2. Clash Royale off-topic (noisy)
-// 3. Haskell's server general (operator private server)
-const DEFAULT_WATCHED_CHANNELS = [
-    "178281233233608705",
-    "191165489400119296",
-    "1545114463701835849"
-];
+// Default test channels (can be overridden via CORDBRIEF_PROOF_CHANNELS)
+const DEFAULT_WATCHED_CHANNELS = process.env.CORDBRIEF_PROOF_CHANNELS
+    ? process.env.CORDBRIEF_PROOF_CHANNELS.split(",").map(s => s.trim()).filter(Boolean)
+    : [
+        "100000000000000001",
+        "100000000000000002",
+        "100000000000000003"
+    ];
 
 function getActiveSegmentPath() {
     const eventsDir = path.join(EXCHANGE_DIR, "events");

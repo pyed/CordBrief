@@ -108,7 +108,7 @@ function test3() {
   const testVolName = "m17_test_cred_vol_" + Date.now();
   try {
     execSync(`docker volume create ${testVolName}`, { stdio: "pipe" });
-    const mockClientId = "1547744191122247772";
+    const mockClientId = "123456789012345678";
     const mockSecret = "super_secret_discord_token_xyz987";
 
     const cmd = `bash scripts/update_secret.sh ${testVolName} ${mockClientId}`;

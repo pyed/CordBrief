@@ -40,6 +40,8 @@ GPUCache/
 Cookies*
 
 # Keep local runtime secrets and snapshots out of source control.
+credentials.json
+oauth-token*.json
 secrets.json
 core-ack.json
 recovery-state.json

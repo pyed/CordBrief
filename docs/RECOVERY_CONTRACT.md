@@ -1,58 +1,60 @@
 # Recovery contract
 
-CordBrief preserves durably accepted message identities and recovers eligible
-messages that remain available through Discord's paginated history long enough
-for a successful replay sweep. Recovery needs successful requests, intact local
-evidence, and resolution of any interrupted page. A message lost before local
-persistence and unavailable from Discord cannot be reconstructed.
+CordBrief preserves durably accepted message identities and captures eligible
+messages via official Discord local RPC. Under the official RPC architecture,
+the collector connects to the running Discord client via a local IPC socket,
+subscribing to live `MESSAGE_CREATE` events for watched channels and performing
+bounded snapshot recovery (`GET_CHANNEL`). Recovery depends on successful RPC
+responses, intact local evidence, and resolution of any interrupted transaction.
+A message lost before local persistence and unavailable in Discord's local client
+cache cannot be reconstructed.
 
 Eligibility depends on the immutable `watch_after` boundary, not the largest ID
-seen or the local clock. A returned page proves which messages were visible in
-that response; it does not prove that all lower IDs will remain absent forever.
+seen or the local clock.
 
-## First watch
+## First watch and snapshot recovery
 
-Native durably records initialization before awaiting REST. Gateway capture starts
-as soon as the watchlist allows it, with direct native persistence and no renderer
-buffer. Live messages do not advance REST high-water or the replay cursor.
+The collector durably records initialization before processing messages. Local RPC
+event capture starts as soon as the watchlist allows it, streaming `MESSAGE_CREATE`
+dispatches directly into native journal persistence.
 
-For a successful initial latest-message response H, the exclusion boundary is:
+For a successful initial channel discovery with latest visible message H, the
+exclusion boundary is:
 
 ```text
 watch_after = max(0, ((H >> 22) << 22) - 1)
 ```
 
 This includes H's entire Discord timestamp millisecond. Messages in earlier
-milliseconds are normally excluded, while already-persisted live messages remain
-accepted. Same-millisecond IDs below H remain eligible. The initial REST lookup
-writes no transcript; a subsequent replay captures eligible visible messages.
+milliseconds are excluded from replay, while already-persisted live messages remain
+accepted. Same-millisecond IDs below H remain eligible.
 
 An empty or failed lookup establishes no exclusion ID. An interrupted or retried
-initialization keeps `watch_after=0` instead of selecting a newer cutoff. Later
-visibility can therefore bring in pre-watch history. Recoverability takes priority
-over guessing an exclusion boundary when no trustworthy anchor exists.
+initialization keeps `watch_after=0` instead of selecting an unverified cutoff.
+Later visibility can therefore bring in pre-watch history. Recoverability takes
+priority over guessing an exclusion boundary when no trustworthy anchor exists.
 
-## Replay and dedupe
+## Local RPC snapshot bounds and dedupe
 
-Each finite sweep starts at `watch_after` and snapshots a latest visible ID as
-`scan_until`. A run handles at most ten pages of 100 messages; durable `scan_after`
-lets a capped run continue later. Reaching the upper bound or receiving an empty
-page ends that visibility sweep. Errors preserve retry state. The next sweep can
-again revisit the entire watched range, including IDs below high-water.
+Unlike arbitrary REST scraping, official Discord RPC exposes a bounded snapshot of
+messages cached in the desktop client via `GET_CHANNEL`. Bounded snapshots have no
+guarantee of arbitrary historical depth or pagination into deep history; recovery
+is best-effort across the client's visible window.
 
-REST overlap and pending reconciliation use exact durable identities. Native
-also scans identity evidence at startup; its bounded recent cache is an
+Snapshot overlap and live event reconciliation use exact durable identities. The
+collector scans identity evidence at startup; its bounded recent cache is an
 optimization. An exact maximum can prove an ID is new, but older cache misses
-need a durable scan. Clearing the cache does not change correctness. An ID
-belonging to another channel is refused rather than counted as a duplicate.
+need a durable scan against journal segments or certified retention sidecars.
+Clearing the cache does not change correctness. An ID belonging to another channel
+is refused rather than counted as a duplicate.
 
 [Retention](RETENTION.md) substitutes certified identity/position sidecars for
 retired transcript segments. This preserves original positions for dedupe floors
 and state witnesses. Arbitrary missing segments are never silently skipped.
 
-Watch removal prevents a later in-flight REST page from committing. Already
+Watch removal prevents in-flight recovery transactions from committing. Already
 accepted native writes can finish. Removal does not erase durable recovery state;
-re-adding a channel keeps its watch boundary and recovery progress.
+re-adding a channel preserves its watch boundary and recovery progress.
 
 ## Durable state: version 2
 

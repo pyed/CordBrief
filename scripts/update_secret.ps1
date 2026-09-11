@@ -38,7 +38,7 @@ try {
     }
 } catch {}
 
-# Fallback to repository .env or default ID if container file was missing
+# Fallback to repository .env or prompt user if client ID was missing
 if ([string]::IsNullOrWhiteSpace($clientId)) {
     $envFile = Join-Path $PSScriptRoot "..\.env"
     if (Test-Path $envFile) {
@@ -53,7 +53,12 @@ if ([string]::IsNullOrWhiteSpace($clientId)) {
 }
 
 if ([string]::IsNullOrWhiteSpace($clientId)) {
-    $clientId = "1547744191122247772"
+    $clientId = Read-Host "Enter Discord Client ID"
+}
+
+if ([string]::IsNullOrWhiteSpace($clientId)) {
+    Write-Error "Empty Discord Client ID provided. Operation aborted."
+    exit 1
 }
 
 # 4. Construct JSON payload in memory with proper escaping

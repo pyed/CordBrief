@@ -887,9 +887,9 @@ async function runTests() {
         timestamp: "2026-09-04T00:25:00.000Z",
         content: "Recovered message testing complete schema with attachments and reply",
         author: {
-            id: "449075508156563477",
-            username: "haskell_user",
-            global_name: "Haskell",
+            id: "100000000000000001",
+            username: "test_user",
+            global_name: "TestUser",
             bot: false
         },
         message_reference: {
@@ -936,8 +936,8 @@ async function runTests() {
     assert.strictEqual(normalizedEvent.guild_id, resolvedGuildId);
     assert.strictEqual(normalizedEvent.channel_id, chan1);
     assert.strictEqual(normalizedEvent.message_id, rawRestMsg.id);
-    assert.strictEqual(normalizedEvent.author.name, "haskell_user");
-    assert.strictEqual(normalizedEvent.author.display_name, "Haskell");
+    assert.strictEqual(normalizedEvent.author.name, "test_user");
+    assert.strictEqual(normalizedEvent.author.display_name, "TestUser");
     assert.strictEqual(normalizedEvent.author.bot, false);
     assert.strictEqual(normalizedEvent.reply_to_message_id, "1545225090000000001");
     assert.strictEqual(normalizedEvent.attachments.length, 1);

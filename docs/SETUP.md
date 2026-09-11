@@ -1,10 +1,54 @@
 # Running CordBrief
 
-## First Start & Setup Flow
+## Prerequisites & Requirements
 
-Use an x86-64 host with Docker's Linux engine and Docker Compose v2.24 or newer.
-The collector runs the official, unmodified Linux Discord desktop client with an
-RPC collector daemon under headless Xvfb.
+- x86-64 host with Docker's Linux engine and Docker Compose v2.24 or newer.
+- 1 vCPU and 2 GB RAM minimum.
+- A Discord account.
+
+## 1. Discord Developer Application Setup
+
+CordBrief connects to your local Discord desktop client via official local Discord RPC over a Unix domain socket. To enable local RPC authorization:
+
+1. Open the [Discord Developer Portal](https://discord.com/developers/applications) and sign in.
+2. Click **New Application**, enter a name (e.g., `CordBrief`), and create the application.
+3. In the left navigation, click **OAuth2**:
+   - Under **Redirects**, click **Add Redirect** and add:
+     ```text
+     http://127.0.0.1:32145/callback
+     ```
+   - Click **Save Changes**.
+4. Copy your **Client ID**.
+5. Under **Client Secret**, click **Reset Secret** (or copy existing) to get your secret.
+
+### Configure Credentials
+
+Copy `.env.example` to `.env`:
+
+```sh
+cp .env.example .env
+```
+
+Set your Client ID in `.env`:
+```env
+DISCORD_CLIENT_ID=your_client_id_here
+```
+
+For the **Client Secret**, choose one of two methods:
+- **Recommended (Secure In-Volume Storage)**: Store the secret directly in private container volume storage (`0600`) without saving it in plaintext `.env` on disk:
+  ```sh
+  # Linux / macOS
+  ./scripts/update_secret.sh cordbrief_rpc_collector_data
+
+  # Windows PowerShell
+  .\scripts\update_secret.ps1
+  ```
+- **Direct Environment**: Set `DISCORD_CLIENT_SECRET=your_client_secret` in `.env`.
+
+> [!NOTE]
+> CordBrief requests strictly the following OAuth2 scopes: `rpc`, `identify`, `messages.read`.
+
+## 2. First Start & Setup Flow
 
 Run from the repository root:
 
@@ -16,7 +60,7 @@ docker compose -f docker/compose.yml up -d
 
 CordBrief enforces a clean, discrete setup sequence:
 
-1. **Discord Login**: If not already logged into Discord, the collector opens an on-demand Xpra shadow viewer at <http://127.0.0.1:28742>. Open that URL to sign in via QR code or credentials.
+1. **Discord Login**: If not already logged into Discord, the collector opens an on-demand Xpra shadow viewer at <http://127.0.0.1:28742>. Open that URL in your browser to sign in via QR code or credentials.
 2. **CordBrief Authorization**: Once Discord authenticates, CordBrief requests local RPC permissions. A consent prompt appears inside Discord. Approve the prompt.
 3. **Running**: Upon authorization, CordBrief saves credentials privately (`0600`), shuts down Xpra to eliminate background resource usage, and transitions to headless collection.
 

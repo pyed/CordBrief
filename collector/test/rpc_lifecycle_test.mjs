@@ -30,8 +30,8 @@ class MockTransport extends EventEmitter {
         return {
             v: 1,
             user: {
-                id: "449075508156563477",
-                username: "haskeil",
+                id: "100000000000000001",
+                username: "test_user",
                 discriminator: "0"
             }
         };
@@ -91,7 +91,7 @@ class MockRpcClient {
         if (accessToken === "expired_token") {
             throw new Error("RPC error 4006: Invalid access token");
         }
-        this.authenticatedUser = { id: "449075508156563477", username: "haskeil" };
+        this.authenticatedUser = { id: "100000000000000001", username: "test_user" };
         return { user: this.authenticatedUser };
     }
 }

@@ -183,9 +183,9 @@ func TestChatDiscovery(t *testing.T) {
 						"chat": map[string]any{
 							"id":         111222,
 							"type":       "private",
-							"first_name": "Sheriff",
+							"first_name": "Test",
 							"last_name":  "User",
-							"username":   "sheriff_u",
+							"username":   "testuser",
 						},
 					},
 				},
@@ -196,9 +196,9 @@ func TestChatDiscovery(t *testing.T) {
 						"chat": map[string]any{
 							"id":         111222,
 							"type":       "private",
-							"first_name": "Sheriff",
+							"first_name": "Test",
 							"last_name":  "User",
-							"username":   "sheriff_u",
+							"username":   "testuser",
 						},
 					},
 				},
@@ -232,10 +232,10 @@ func TestChatDiscovery(t *testing.T) {
 	}
 
 	chat1 := chats[0]
-	if chat1.ID != "111222" || chat1.Type != "private" || chat1.Username != "sheriff_u" {
+	if chat1.ID != "111222" || chat1.Type != "private" || chat1.Username != "testuser" {
 		t.Errorf("unexpected chat1: %+v", chat1)
 	}
-	if chat1.Label() != "Sheriff User (@sheriff_u)" {
+	if chat1.Label() != "Test User (@testuser)" {
 		t.Errorf("unexpected label: %s", chat1.Label())
 	}
 

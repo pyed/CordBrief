@@ -29,17 +29,16 @@ lifecycle states:
 
 ### Quickstart
 
-From the repository root:
+1. **Configure Discord Application**: Create an app in the [Discord Developer Portal](https://discord.com/developers/applications) with redirect URI `http://127.0.0.1:32145/callback`. Copy `.env.example` to `.env` and set your `DISCORD_CLIENT_ID` (see [full setup guide](docs/SETUP.md)).
+2. **Start Services**:
+   ```sh
+   docker compose -f docker/compose.yml up -d
+   ```
+3. **Authorize**:
+   - Open [the setup screen](http://127.0.0.1:28742) in your browser to log into Discord and approve the authorization prompt.
+   - Open [your inbox](http://127.0.0.1:28741) to select channels and configure your summary model.
 
-```sh
-docker compose -f docker/compose.yml up -d
-```
-
-Check container status and access:
-- If setup is needed, open [the setup screen](http://127.0.0.1:28742) to sign into Discord and authorize CordBrief.
-- Open [your inbox](http://127.0.0.1:28741) to select channels and configure your summary model.
-
-See [setup](docs/SETUP.md) for remote access, credentials, and troubleshooting.
+See [Setup Guide](docs/SETUP.md) for remote server access, credentials storage, and troubleshooting.
 
 ## Before you run it
 

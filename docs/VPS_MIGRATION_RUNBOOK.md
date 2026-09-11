@@ -1,9 +1,10 @@
-# CordBrief M17: VPS Migration Runbook
+# CordBrief M17: VPS Migration Runbook (Archival Reference)
 ## Legacy Vencord to Canonical Official Discord RPC Architecture
 
-> [!WARNING]
-> **DO NOT EXECUTE ON THE LIVE VPS YET.**  
-> This runbook is the approved operational blueprint. Execution occurs only after review and explicit operator authorization.
+> [!NOTE]
+> **ARCHIVAL / HISTORICAL REFERENCE ONLY**  
+> This migration runbook was developed during Milestone M17 as an operational design study for migrating in-place legacy deployments.  
+> **Current Status**: Archival. CordBrief v2.0.0 adopts a clean-room installation model (see [SETUP.md](SETUP.md)). This document is retained solely for historical and architectural provenance.
 
 ---
 

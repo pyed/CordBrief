@@ -32,7 +32,12 @@ if [ -z "$CLIENT_ID" ] && [ -f ".env" ]; then
 fi
 
 if [ -z "$CLIENT_ID" ]; then
-    CLIENT_ID="1547744191122247772"
+    read -p "Enter Discord Client ID: " CLIENT_ID
+fi
+
+if [ -z "$CLIENT_ID" ]; then
+    echo "ERROR: Empty Discord Client ID provided. Operation aborted." >&2
+    exit 1
 fi
 
 # 2. Masked secret input

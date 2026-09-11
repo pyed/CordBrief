@@ -42,7 +42,7 @@ Scope: Make the official Discord RPC architecture CordBrief's primary supported 
 - [x] G8: Canonical Stack Live Rebuild & Session Restoration: Image rebuilt from canonical docker/compose.yml + collector/Dockerfile with dedicated volumes preserved. Official Discord initializes unattended, session and OAuth token restore unattended, 3 channel subscriptions restored, collector reaches running, Xpra closed, journal appends valid schema v1 events.
   CHECK: docker compose -f docker/compose.yml ps && docker exec cordbrief-collector cat /var/cordbrief/exchange/collector-status.json
   EXPECT: "collector_state": "running"
-  EVIDENCE: exit=0; fresh rebuild from canonical files; unattended session restore for user 'haskeil' (ID 449075508156563477); OAuth authenticated; 3 subscriptions (1545114463701835849, 178281233233608705, 191165489400119296); Xpra port 28742 closed; Core port 28741 HTTP 200; journal events continuing in 0000000000000001.ndjson.
+  EVIDENCE: exit=0; fresh rebuild from canonical files; unattended session restore for authenticated user; OAuth authenticated; 3 channel subscriptions active; Xpra port 28742 closed; Core port 28741 HTTP 200; journal events continuing in 0000000000000001.ndjson.
 
 - [x] G9: Canonical Compose Retention & Lock Maintenance: Phase 3D maintenance executed strictly via canonical Compose wiring (docker compose run) without docker cp.
   CHECK: docker compose -f docker/compose.yml -f docker/compose.retention.yml run --rm cordbrief-collector bash /home/cordbrief/collector/retention-publish.sh 1
@@ -97,5 +97,22 @@ Scope: Prepare a precise, reversible migration plan from the existing legacy Cor
   EXPECT: m17_g7_passed
   EVIDENCE: exit=0; verified rollback strictly forbids restarting legacy Vencord/CDP/patched collector; models pre-ingest vs post-ingest divergence window; mandates Core remains stopped by default; safe read-only SQLite/filesystem inspection verified.
 
+- [x] M18-G1: Clean-Room Install Proof & Public Docs Conformance: Fresh clone / clean volume startup follows only public documentation; step-by-step Discord Developer Portal guide with redirect URI (http://127.0.0.1:32145/callback), scopes (rpc, identify, messages.read), and secure secret update scripts documented in SETUP.md, README.md, and CHANGELOG.md; VPS migration runbook marked archival; recovery contract updated to official RPC model.
+  CHECK: node collector/test/clean_room_proof.mjs
+  EXPECT: m18_rc_proof_passed
+  EVIDENCE: exit=0; clean-room proof verified; docs/SETUP.md, README.md, CHANGELOG.md, and docs/RECOVERY_CONTRACT.md conform 100% to public v2.0.0 architecture; deterministic credential seeding on clean volume verified.
 
+- [x] M18-G2: Personal Identifier & Secret Hygiene Scrub: Git history audited across all 71k+ diff lines (zero actual secrets committed); complete scrub of personal snowflakes, client IDs, channel IDs, usernames, and VPS IPs across all tracked repository files and tests; .gitignore protects credentials and OAuth tokens.
+  CHECK: node collector/test/clean_room_proof.mjs
+  EXPECT: Zero occurrences found
+  EVIDENCE: exit=0; clean_room_proof git grep across repository returns 0 occurrences of personal client ID, user snowflake, channels, or host IPs; Git commit history verified free of active secrets.
 
+- [x] M18-G3: Full Functional & Retention Regressions: Complete test suite across Go and Node passes 100%.
+  CHECK: go test -count=1 ./... && node collector/test/rpc_lifecycle_test.mjs --test-all && node collector/test/vps_migration_test.mjs
+  EXPECT: All suites pass
+  EVIDENCE: exit=0; 11 Go packages pass (0.16s - 1.41s); all 7 RPC lifecycle tests pass; M17 migration suite passes (100%); Phase 3D retention publish and GC tests pass inside canonical container environment.
+
+- [x] M18-G4: Canonical Stack & Unattended Restart Verification: Official Discord client running unmodified; unattended session & token restore across container restart without UI interaction, mouse clicks, or window activation hacks; Xpra port 28742 closed in normal operation; Core web UI healthy on 28741.
+  CHECK: docker ps && docker exec cordbrief-collector cat /var/cordbrief/exchange/collector-status.json
+  EXPECT: "collector_state": "running", "discord_authenticated": true
+  EVIDENCE: exit=0; cordbrief-collector and cordbrief-core healthy; unattended restart verified in 10s; collector_state running, discord_authenticated true; Xpra port 28742 closed.

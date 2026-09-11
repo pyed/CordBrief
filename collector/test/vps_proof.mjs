@@ -9,7 +9,7 @@
 import assert from "assert";
 import { execSync } from "child_process";
 
-const VPS_HOST = process.env.CORDBRIEF_VPS_HOST || "pyed@85.217.170.247";
+const VPS_HOST = process.env.CORDBRIEF_VPS_HOST || "user@vps.example.com";
 
 function runRemote(cmd, timeoutMs = 30000) {
     const escaped = cmd.replace(/"/g, '\\"');

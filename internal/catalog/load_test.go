@@ -14,7 +14,7 @@ func TestLoad_ValidCatalog(t *testing.T) {
   "guilds": [
     {
       "id": "g1",
-      "name": "Haskell Server",
+      "name": "Test Guild",
       "channels": [
         {"id": "c1", "name": "general", "type": 0},
         {"id": "c2", "name": "announcements", "type": 5}
@@ -34,7 +34,7 @@ func TestLoad_ValidCatalog(t *testing.T) {
 	if cat.Version != 1 {
 		t.Errorf("expected version 1, got %d", cat.Version)
 	}
-	if len(cat.Guilds) != 1 || cat.Guilds[0].Name != "Haskell Server" {
+	if len(cat.Guilds) != 1 || cat.Guilds[0].Name != "Test Guild" {
 		t.Errorf("unexpected guilds: %+v", cat.Guilds)
 	}
 	if len(cat.Guilds[0].Channels) != 2 {

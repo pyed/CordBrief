@@ -14,7 +14,7 @@ const event = (n, ch = channel) => JSON.stringify({
     version: 1, event: "message_create", message_id: id(n), channel_id: ch,
     guild_id: "1545114461868658862", timestamp: "2026-01-01T00:00:00Z",
     captured_at: "2026-01-01T00:00:00Z",
-    author: { id: "449075508156563477", name: "fixture", display_name: "fixture", bot: false },
+    author: { id: "100000000000000001", name: "fixture", display_name: "fixture", bot: false },
     content: "disposable fixture ".repeat(30), reply_to_message_id: null, attachments: []
 });
 
