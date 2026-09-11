@@ -58,7 +58,7 @@ try {
     if (process.argv.length > 4 || (process.argv[3] && !deleting)) fail("Usage: <through> [--delete-certified]");
     process.env.CORDBRIEF_RETENTION_INSPECT = "1";
     process.env.CORDBRIEF_RECOVERY_STATE_PATH = path.join(env("CORDBRIEF_COLLECTOR_DATA_DIR"), "recovery-state.json");
-    const source = fs.readFileSync(new URL("./native.ts", import.meta.url), "utf8").replace('import { IpcMainInvokeEvent } from "electron";', "");
+    const source = fs.readFileSync(new URL("./native.ts", import.meta.url), "utf8");
     const native = await import(`data:text/javascript;base64,${Buffer.from(stripTypeScriptTypes(source)).toString("base64")}`);
     native.inspectRetentionState();
     const manifestPath = path.join(exchange, "retention-manifest.json");

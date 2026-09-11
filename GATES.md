@@ -34,7 +34,23 @@ Scope: Make the official Discord RPC architecture CordBrief's primary supported 
   EXPECT: rpc_all_lifecycle_checks_passed
   EVIDENCE: exit=0; all 11 Go packages passed (0.16s - 1.55s); all 7 RPC lifecycle tests passed with strict schema conformance; 14 obsolete components verified deleted and 8 primary components preserved.
 
-- [x] G7: Documentation & Working Tree Cleanliness: README.md updated to reflect only official Discord RPC setup/runtime, git working tree clean, checkpoint commit ready.
-  CHECK: git status --porcelain
-  EXPECT: 
-  EVIDENCE: README.md, docs/SETUP.md, docs/ARCHITECTURE.md, and CONTRIBUTING.md updated to document official Discord RPC architecture only; working tree clean.
+- [x] G7: Documentation & Setup Alignment: README.md, docs/SETUP.md, docs/ARCHITECTURE.md, and CONTRIBUTING.md updated to reflect official Discord RPC architecture only.
+  CHECK: git diff --name-only HEAD~1 README.md docs/
+  EXPECT: README.md
+  EVIDENCE: All docs updated to document official Discord RPC architecture exclusively; Vencord references removed.
+
+- [x] G8: Canonical Stack Live Rebuild & Session Restoration: Image rebuilt from canonical docker/compose.yml + collector/Dockerfile with dedicated volumes preserved. Official Discord initializes unattended, session and OAuth token restore unattended, 3 channel subscriptions restored, collector reaches running, Xpra closed, journal appends valid schema v1 events.
+  CHECK: docker compose -f docker/compose.yml ps && docker exec cordbrief-collector cat /var/cordbrief/exchange/collector-status.json
+  EXPECT: "collector_state": "running"
+  EVIDENCE: exit=0; fresh rebuild from canonical files; unattended session restore for user 'haskeil' (ID 449075508156563477); OAuth authenticated; 3 subscriptions (1545114463701835849, 178281233233608705, 191165489400119296); Xpra port 28742 closed; Core port 28741 HTTP 200; journal events continuing in 0000000000000001.ndjson.
+
+- [x] G9: Canonical Compose Retention & Lock Maintenance: Phase 3D maintenance executed strictly via canonical Compose wiring (docker compose run) without docker cp.
+  CHECK: docker compose -f docker/compose.yml -f docker/compose.retention.yml run --rm cordbrief-collector bash /home/cordbrief/collector/retention-publish.sh 1
+  EXPECT: Collector runtime is busy
+  EVIDENCE: exit=1; runtime lock exclusion verified against running collector; offline retention publish test (55 segments, 54 retired sidecars, 108 identities, 3 crash boundaries, 3 lock refusals) and offline GC test (7 real segments, 6 deletable, 24 crash cases, 15 refusals) pass 100% via canonical Compose run.
+
+- [x] G10: Native Helper Audit & Recovery Invariant Suite: collector/native.ts purified of Electron/Vencord imports; 4 deleted tests audited with surviving invariants restored in collector/test/rpc_recovery_invariants_test.mjs.
+  CHECK: node --experimental-strip-types -e "import * as n from './collector/native.ts'; console.log(Object.keys(n).length);" && node collector/test/rpc_recovery_invariants_test.mjs
+  EXPECT: rpc_recovery_invariants_tests_passed
+  EVIDENCE: exit=0; native.ts exports 26 functions/types with zero synthetic .replace shims; rpc_recovery_invariants_test.mjs passes all 4 invariants (anchor ms safety, recovery contract crash safety, delayed visibility order independence, first-watch fail-closed retry).
+

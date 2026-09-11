@@ -1,10 +1,10 @@
 /*
- * CordBrief Collector Plugin - Native Process Bridge
- * Runs in Electron main process with full Node.js filesystem access.
+ * CordBrief Collector - Native Filesystem & Journal Bridge
+ * Pure Node.js filesystem module.
  * Manages exchange directory, segmented journal rotation, crash recovery, and fail-closed watchlist loading.
  */
 
-import { IpcMainInvokeEvent } from "electron";
+export type IpcMainInvokeEvent = unknown;
 import * as fs from "fs";
 import * as path from "path";
 import { createHash } from "crypto";
@@ -781,7 +781,7 @@ export function writeStatus(state: "starting" | "running" | "setup_required" | "
     }
 }
 
-// IPC Handlers callable from renderer userplugin
+// Handlers callable by daemon, retention maintenance, or tests
 
 export async function reportAuthState(_: IpcMainInvokeEvent, auth: boolean | null): Promise<boolean> {
     discordAuthenticatedState = auth;

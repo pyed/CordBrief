@@ -17,6 +17,11 @@ mkdir -p -m 0700 "$COLLECTOR_DATA_DIR"
 RUNTIME_DIR="${CORDBRIEF_RUNTIME_DIR:-/var/cordbrief/runtime}"
 mkdir -p "$RUNTIME_DIR"
 
+# If custom command was passed (e.g. maintenance or tests), execute it directly
+if [ $# -gt 0 ]; then
+    exec "$@"
+fi
+
 # 3. Kernel flock(2) single-ownership lease
 LOCK_FILE="$RUNTIME_DIR/runtime.lock"
 exec 9>"$LOCK_FILE"

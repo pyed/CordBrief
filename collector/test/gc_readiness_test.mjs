@@ -49,8 +49,7 @@ if (process.argv[2] === "--child") {
         if (request.partial && journalFDs.has(fd)) process.exit(76);
     };
     syncBuiltinESMExports();
-    const source = fs.readFileSync(new URL("../native.ts", import.meta.url), "utf8")
-        .replace('import { IpcMainInvokeEvent } from "electron";', "");
+    const source = fs.readFileSync(new URL("../native.ts", import.meta.url), "utf8");
     const native = await import(`data:text/javascript;base64,${Buffer.from(stripTypeScriptTypes(source)).toString("base64")}`);
     fs.unwatchFile(path.join(root, "exchange", "watchlist.json"));
     // Established-channel fixture. First-watch behavior is exercised by renderer tests.

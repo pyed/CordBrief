@@ -424,6 +424,10 @@ async function testAll() {
     const resProtocol = child_process.spawnSync("node collector/test/rpc_protocol_test.mjs", { stdio: "inherit", shell: true });
     assert.strictEqual(resProtocol.status, 0, "rpc_protocol_test.mjs must pass");
 
+    console.log("--- Running RPC recovery invariants test ---");
+    const resInvariants = child_process.spawnSync("node collector/test/rpc_recovery_invariants_test.mjs", { stdio: "inherit", shell: true });
+    assert.strictEqual(resInvariants.status, 0, "rpc_recovery_invariants_test.mjs must pass");
+
     // M16 Verification: Obsolete Vencord-era files decommissioned and deleted
     const decommissionedFiles = [
         "collector/Dockerfile.setup",
