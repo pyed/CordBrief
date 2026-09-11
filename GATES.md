@@ -22,12 +22,12 @@ Scope: Prove official Discord RPC collector end-to-end in local Docker environme
 - [x] G4: Natural message from watched channel arrives via RPC and is appended to CordBrief journal with real Snowflake ID.
   CHECK: node collector/test/docker_real_proof.mjs --check-live-message
   EXPECT: natural_discord_message_journaled
-  EVIDENCE: Captured real Discord MESSAGE_CREATE events in watched operator channel 1545114463701835849 and noisy channels; verified exact observed Snowflake ID 1547807021099778140 (content: "CB-LIVE-G4-001", author: haskeil 449075508156563477) appended to /var/cordbrief/exchange/events/0000000000000001.ndjson conforming to Schema v1.
+  EVIDENCE: Captured real Discord MESSAGE_CREATE live event in watched operator channel 1545114463701835849 without recovery sweep; verified exact Snowflake ID 1547889297745641555 (content: "CB-LIVE-G4-002", author: haskeil 449075508156563477) received via raw RPC dispatch at 08:39:26.032Z and appended immediately to /var/cordbrief/exchange/events/0000000000000001.ndjson at 08:39:26.040Z (sub-second gap from Discord timestamp 08:39:26.975Z) conforming to Schema v1.
 
 - [x] G5: CordBrief Core consumes the natural Discord journal record and advances core-ack.json.
   CHECK: node collector/test/docker_real_proof.mjs --check-core-consumption
   EXPECT: core_consumed_natural_message
-  EVIDENCE: CordBrief Core ingested the natural Discord journal records (including message 1547807021099778140 "CB-LIVE-G4-001") via exchange ingest -commit; verified core-ack.json atomically committed and cursor advanced to segment 1, offset 45097.
+  EVIDENCE: CordBrief Core ingested the natural Discord journal records (including live message 1547889297745641555 "CB-LIVE-G4-002" and recovered outage message 1547807021099778140 "CB-LIVE-G4-001") via exchange ingest -commit; verified core-ack.json atomically committed and cursor advanced across all segment records to offset 121685.
 
 - [x] G6: Outage recovery sweep: stopping collector during natural traffic and restarting it recovers missed IDs via GET_CHANNEL snapshot with deduplication.
   CHECK: node collector/test/docker_real_proof.mjs --check-outage-recovery
@@ -35,9 +35,9 @@ Scope: Prove official Discord RPC collector end-to-end in local Docker environme
   EVIDENCE: Outage recovery quantitatively proven across natural and controlled outages:
     - Outage windows: G4 collector outage (03:02:56Z - 03:14:57Z, ~12 min), container stop/restart (03:19:36Z - 08:35:55Z, ~5.25 hr), and test recovery sweep.
     - Controlled outage message: Exact message 1547807021099778140 ("CB-LIVE-G4-001", author haskeil, Discord timestamp 03:12:30.694Z) was recovered by GET_CHANNEL snapshot at 03:14:57.491Z exactly once.
-    - Recovered IDs across channels: Recovered 13 messages in 1545114463701835849, 182 messages in 178281233233608705, and 107 messages in 191165489400119296 across restart recovery sweeps.
-    - Deduplication & missing count: Deduplicated 30 messages in noisy channel 178281233233608705 with zero duplicates (0 duplicate count) and zero missing messages within the observed snapshot windows across all 304 Discord-originated journal records.
-    - Limitation: GET_CHANNEL has no documented completeness boundary or pagination beyond the client-cached snapshot limit (~30 messages per channel); outages exceeding this window in a channel cannot be paged back via documented local RPC.
+    - Exact deduplication: In the G6 check against channel 178281233233608705, 30 snapshot messages were fetched and deduplicated against existing journal records with 0 duplicate records produced (duplicate count = 0 across entire journal).
+    - Missing count: No known/witnessed controlled ID was missing; completeness outside the returned GET_CHANNEL snapshot cannot be established.
+    - Completeness guarantee: GET_CHANNEL is an undocumented-depth, client-state-dependent snapshot with no documented pagination or completeness boundary. Outages exceeding the client cache depth cannot be backfilled via documented local RPC.
 
 - [x] G7: Full container/Discord restart reconnects with saved OAuth token and restores live subscriptions without operator interaction.
   CHECK: node collector/test/docker_real_proof.mjs --check-full-restart
