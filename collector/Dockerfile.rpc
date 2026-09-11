@@ -75,6 +75,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     xdg-utils \
     nodejs \
     x11-utils \
+    xdotool \
     && mkdir -p /tmp/.X11-unix \
     && chmod 1777 /tmp/.X11-unix \
     && rm -rf /var/lib/apt/lists/*

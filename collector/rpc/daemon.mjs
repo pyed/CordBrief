@@ -81,7 +81,7 @@ export class RpcCollectorDaemon extends EventEmitter {
         this.mockXpra = !!options.mockXpra;
 
         // Tuning parameters
-        this.startupGracePeriodMs = options.startupGracePeriodMs || 5000;
+        this.startupGracePeriodMs = options.startupGracePeriodMs || parseInt(getEnv("CORDBRIEF_STARTUP_GRACE_PERIOD_MS", "20000"), 10);
         this.antiSpamCooldownMs = options.antiSpamCooldownMs || 10000;
         this.commandPollIntervalMs = options.commandPollIntervalMs || 1000;
 

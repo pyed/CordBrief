@@ -112,8 +112,34 @@ run_discord() {
 run_discord &
 DISCORD_PID=$!
 
+# Watchdog to ensure headless Discord window receives initial focus/activation in Xvfb
+run_window_activator() {
+    local count=0
+    while true; do
+        sleep 3
+        if [ ! -S "$XDG_RUNTIME_DIR/discord-ipc-0" ]; then
+            count=$((count + 1))
+            if [ "$count" -ge 3 ]; then
+                if command -v xdotool >/dev/null 2>&1; then
+                    WID=$(xdotool search --class discord 2>/dev/null | tail -n 1)
+                    if [ -n "$WID" ]; then
+                        xdotool windowactivate "$WID" key --window "$WID" ctrl+r 2>/dev/null || true
+                    fi
+                fi
+                count=0
+            fi
+        else
+            count=0
+            sleep 15
+        fi
+    done
+}
+run_window_activator &
+ACTIVATOR_PID=$!
+
 cleanup() {
     echo "[Runtime] Cleaning up background processes..."
+    kill "$ACTIVATOR_PID" 2>/dev/null || true
     kill "$DAEMON_PID" 2>/dev/null || true
     kill "$DISCORD_PID" 2>/dev/null || true
     pkill -u cordbrief -f "Discord" 2>/dev/null || true

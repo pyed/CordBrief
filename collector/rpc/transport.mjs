@@ -72,6 +72,10 @@ export class RpcTransport extends EventEmitter {
      * @returns {Promise<object>} READY data
      */
     async connect(clientId, options = {}) {
+        if (this.connected && this.readyData) {
+            return this.readyData;
+        }
+
         const socketPath = this.socketPath || findDiscordIPCPath();
         const timeoutMs = options.timeoutMs || 30000;
 

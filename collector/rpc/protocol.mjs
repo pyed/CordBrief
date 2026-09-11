@@ -133,21 +133,33 @@ export class DiscordRpcClient {
      * @returns {Promise<object>} User and scope confirmation
      */
     async authenticate(accessToken) {
-        const data = await this.transport.request("AUTHENTICATE", {
-            access_token: String(accessToken)
-        });
-
-        this.authenticatedUser = data.user || null;
-        this.grantedScopes = Array.isArray(data.scopes) ? data.scopes : [];
-
-        // Verify required scopes are granted
-        for (const reqScope of ["rpc", "messages.read"]) {
-            if (!this.grantedScopes.includes(reqScope)) {
-                console.warn(`[DiscordRpcClient] Warning: Expected scope ${reqScope} was not confirmed by Discord (got ${this.grantedScopes.join(", ")})`);
-            }
+        if (this.authenticatedUser && this.currentAccessToken === accessToken) {
+            return { user: this.authenticatedUser, scopes: this.grantedScopes };
         }
+        try {
+            const data = await this.transport.request("AUTHENTICATE", {
+                access_token: String(accessToken)
+            });
 
-        return data;
+            this.currentAccessToken = accessToken;
+            this.authenticatedUser = data.user || null;
+            this.grantedScopes = Array.isArray(data.scopes) ? data.scopes : [];
+
+            // Verify required scopes are granted
+            for (const reqScope of ["rpc", "messages.read"]) {
+                if (!this.grantedScopes.includes(reqScope)) {
+                    console.warn(`[DiscordRpcClient] Warning: Expected scope ${reqScope} was not confirmed by Discord (got ${this.grantedScopes.join(", ")})`);
+                }
+            }
+
+            return data;
+        } catch (err) {
+            if (err.code === 4002 || err.message?.includes("Already authenticated")) {
+                this.currentAccessToken = accessToken;
+                return { user: this.authenticatedUser, scopes: this.grantedScopes };
+            }
+            throw err;
+        }
     }
 
     /**

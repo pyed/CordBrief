@@ -715,8 +715,10 @@ export class DiscordRpcCollector {
             await this.transport.connect(config.clientId);
 
             // 2. Authenticate
-            await this.client.authenticate(config.accessToken);
-            this.authenticated = true;
+            if (!this.authenticated && config.accessToken) {
+                await this.client.authenticate(config.accessToken);
+                this.authenticated = true;
+            }
 
             // 3. Attach live event dispatch listener
             this.transport.on("dispatch", event => {
