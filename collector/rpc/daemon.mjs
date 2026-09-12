@@ -219,8 +219,12 @@ export class RpcCollectorDaemon extends EventEmitter {
                 }
                 if (colRec.collector_state === "error" || colRec.recovery_state === "error") {
                     this.collectorState = COLLECTOR_STATES.ERROR;
+                    if (colRec.recovery_state === "error") {
+                        this.recoveryState = "error";
+                    }
                 } else if (this.collectorState === COLLECTOR_STATES.ERROR && colRec.collector_state === "running" && colRec.recovery_state === "ready" && !colRec.last_error) {
                     this.collectorState = COLLECTOR_STATES.NORMAL_OPERATION;
+                    this.recoveryState = "ready";
                     this.lastError = null;
                 }
             }
@@ -595,9 +599,19 @@ export class RpcCollectorDaemon extends EventEmitter {
             this.collectorState = COLLECTOR_STATES.ERROR;
             this.lastError = fatalErr.message;
             this.publishStatus({ lastError: this.lastError });
-            if (this.options.exitOnClose) {
-                process.exit(1);
-            }
+            process.exit(1);
+        });
+
+        this.collector.on("recovery_error", (recErr) => {
+            console.warn(`[RPC Daemon] Recovery error from collector: ${recErr.message}`);
+            this.collectorState = COLLECTOR_STATES.ERROR;
+            this.recoveryState = "error";
+            this.recoveryLastError = recErr.message;
+            this.lastError = recErr.message;
+            this.publishStatus({
+                lastError: this.lastError,
+                recoveryLastError: this.recoveryLastError
+            });
         });
 
         await this.collector.start({
@@ -620,11 +634,31 @@ export class RpcCollectorDaemon extends EventEmitter {
             console.log(`[RPC Daemon] Official Discord RPC collector is running in normal operation.`);
         }
 
-        // Background status heartbeat
-        this.heartbeatTimer = setInterval(() => {
+        // Background status heartbeat and error retry
+        this.heartbeatTimer = setInterval(async () => {
             if (this.stopping) return;
+            if (this.collectorState === COLLECTOR_STATES.ERROR && this.collector && !this.collector.fatalError) {
+                try {
+                    await this.retryRecovery();
+                    return;
+                } catch {}
+            }
             this.publishStatus();
         }, 5000);
+    }
+
+    /**
+     * Supported path back to normal operation after recovery-state error.
+     * Retries reconciliation against persisted state and publishes updated status.
+     */
+    async retryRecovery() {
+        if (this.collector && !this.collector.fatalError) {
+            try {
+                await this.collector.reconcileWatchlist();
+            } catch {}
+        }
+        this.publishStatus();
+        return this.collectorState;
     }
 
     /**

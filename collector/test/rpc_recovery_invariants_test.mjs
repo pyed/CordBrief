@@ -511,14 +511,92 @@ async function runTests() {
     }
 
     // =========================================================================
-    // Invariant 7: Uncertain journal append fail-stop after directory fsync failure
+    // =========================================================================
+    // Invariant 7: Uncertain journal append fail-stop (file fsync EIO & directory fsync EIO)
     // =========================================================================
     {
-        console.log("\n[Invariant 7] Uncertain journal append fail-stop after directory fsync failure...");
-        const tmpExchange = path.join(os.tmpdir(), `cordbrief-invar7-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-        fs.mkdirSync(tmpExchange, { recursive: true });
-        const privateDir = path.join(tmpExchange, "private");
-        fs.mkdirSync(privateDir, { recursive: true });
+        console.log("\n[Invariant 7A] Uncertain journal append fail-stop after file fsync failure...");
+        const tmpExchangeA = path.join(os.tmpdir(), `cordbrief-invar7a-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+        fs.mkdirSync(tmpExchangeA, { recursive: true });
+        const privateDirA = path.join(tmpExchangeA, "private");
+        fs.mkdirSync(privateDirA, { recursive: true });
+
+        let fileSyncFail = false;
+        const faultFsync = (fd) => {
+            if (fileSyncFail) {
+                const err = new Error("EIO: input/output error during file fsync");
+                err.code = "EIO";
+                throw err;
+            }
+            fs.fsyncSync(fd);
+        };
+
+        const collector1A = new DiscordRpcCollector({
+            exchangeDir: tmpExchangeA,
+            collectorDataDir: privateDirA,
+            runtimeDir: path.join(tmpExchangeA, "runtime"),
+            enableLock: false,
+            fsyncFn: faultFsync
+        });
+        collector1A.initJournal();
+
+        const t0 = 1750000000000n;
+        const msgA = ((t0 << 22n) | 1n).toString();
+        const evtA = makeNormalizedMessage(msgA, "2001", "Uncertain append message (file sync)");
+
+        fileSyncFail = true;
+        let fatalFiredA = false;
+        collector1A.on("fatal_error", () => { fatalFiredA = true; });
+
+        // Appending must throw fatal journal error because bytes were written to file before fsync failed
+        assert.throws(() => {
+            collector1A.appendEvents([evtA]);
+        }, /Fatal journal error: sync failure after writing record/);
+
+        assert.strictEqual(fatalFiredA, true, "Must emit fatal_error on uncertain append");
+        assert.strictEqual(collector1A.collectorState, "error");
+        assert.ok(collector1A.fatalError.includes("sync failure after writing record"));
+        assert.strictEqual(collector1A.stopping, true);
+
+        // Subsequent append refused in fail-stop state
+        assert.throws(() => {
+            collector1A.appendEvents([evtA]);
+        }, /Collector is in fail-stop state/);
+
+        // Verify status file on disk
+        const statusFileA = path.join(tmpExchangeA, "collector-status.json");
+        assert.ok(fs.existsSync(statusFileA));
+        const statusRecordA = JSON.parse(fs.readFileSync(statusFileA, "utf8"));
+        assert.strictEqual(statusRecordA.collector_state, "error");
+        assert.ok(statusRecordA.last_error.includes("Fatal journal error"));
+
+        // Record reached disk physically
+        const rawRecordsA = readAllJournalRecords(tmpExchangeA);
+        assert.strictEqual(rawRecordsA.length, 1, "Record reached disk before fsync threw");
+        assert.strictEqual(rawRecordsA[0].message_id, msgA);
+
+        // Restarted collector rebuilds and dedupes
+        fileSyncFail = false;
+        const collector2A = new DiscordRpcCollector({
+            exchangeDir: tmpExchangeA,
+            collectorDataDir: privateDirA,
+            runtimeDir: path.join(tmpExchangeA, "runtime"),
+            enableLock: false,
+            fsyncFn: faultFsync
+        });
+        collector2A.initJournal();
+        assert.strictEqual(collector2A.journalRecordCount, 1);
+        assert.strictEqual(collector2A.recentMessageIds.has(msgA), true);
+        const retryAppendedA = collector2A.appendEvents([evtA]);
+        assert.strictEqual(retryAppendedA, 0, "Restarted collector must dedupe existing record");
+        assert.strictEqual(readAllJournalRecords(tmpExchangeA).length, 1, "Exactly one record on disk");
+        try { fs.rmSync(tmpExchangeA, { recursive: true, force: true }); } catch {}
+
+        console.log("\n[Invariant 7B] Uncertain journal append fail-stop after directory fsync failure...");
+        const tmpExchangeB = path.join(os.tmpdir(), `cordbrief-invar7b-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+        fs.mkdirSync(tmpExchangeB, { recursive: true });
+        const privateDirB = path.join(tmpExchangeB, "private");
+        fs.mkdirSync(privateDirB, { recursive: true });
 
         let dirSyncFail = false;
         const faultSyncDir = (dir) => {
@@ -529,81 +607,61 @@ async function runTests() {
             }
         };
 
-        const collector1 = new DiscordRpcCollector({
-            exchangeDir: tmpExchange,
-            collectorDataDir: privateDir,
-            runtimeDir: path.join(tmpExchange, "runtime"),
+        const collector1B = new DiscordRpcCollector({
+            exchangeDir: tmpExchangeB,
+            collectorDataDir: privateDirB,
+            runtimeDir: path.join(tmpExchangeB, "runtime"),
             enableLock: false,
             syncDirectoryFn: faultSyncDir
         });
-        collector1.initJournal();
+        collector1B.initJournal();
 
-        const t0 = 1750000000000n;
-        const msg1 = ((t0 << 22n) | 1n).toString();
-        const evt1 = makeNormalizedMessage(msg1, "2001", "Uncertain append message");
+        const msgB = (((t0 + 1000n) << 22n) | 1n).toString();
+        const evtB = makeNormalizedMessage(msgB, "2001", "Uncertain append message (dir sync)");
 
-        // Inject directory sync failure
         dirSyncFail = true;
+        let fatalFiredB = false;
+        collector1B.on("fatal_error", () => { fatalFiredB = true; });
 
-        let fatalErrorFired = false;
-        collector1.on("fatal_error", (err) => {
-            fatalErrorFired = true;
-        });
-
-        // Appending must throw a fatal journal error because the record was written to the file
-        // but directory fsync failed, leaving durability/bookkeeping uncertain.
         assert.throws(() => {
-            collector1.appendEvents([evt1]);
-        }, /Fatal journal error: directory sync failed/);
+            collector1B.appendEvents([evtB]);
+        }, /Fatal journal error: sync failure after writing record/);
 
-        // Collector must enter fail-stop state
-        assert.strictEqual(fatalErrorFired, true, "Must emit fatal_error on uncertain append");
-        assert.strictEqual(collector1.collectorState, "error");
-        assert.ok(collector1.fatalError.includes("directory sync failed"));
-        assert.strictEqual(collector1.stopping, true);
+        assert.strictEqual(fatalFiredB, true, "Must emit fatal_error on uncertain append");
+        assert.strictEqual(collector1B.collectorState, "error");
+        assert.ok(collector1B.fatalError.includes("sync failure after writing record"));
+        assert.strictEqual(collector1B.stopping, true);
 
-        // A second append in the same running collector must be rejected immediately
         assert.throws(() => {
-            collector1.appendEvents([evt1]);
+            collector1B.appendEvents([evtB]);
         }, /Collector is in fail-stop state/);
 
-        // Verify status file reflects error, not running
-        const statusFile = path.join(tmpExchange, "collector-status.json");
-        assert.ok(fs.existsSync(statusFile));
-        const statusRecord = JSON.parse(fs.readFileSync(statusFile, "utf8"));
-        assert.strictEqual(statusRecord.collector_state, "error");
-        assert.ok(statusRecord.last_error.includes("Fatal journal error"));
+        const statusFileB = path.join(tmpExchangeB, "collector-status.json");
+        assert.ok(fs.existsSync(statusFileB));
+        const statusRecordB = JSON.parse(fs.readFileSync(statusFileB, "utf8"));
+        assert.strictEqual(statusRecordB.collector_state, "error");
 
-        // Verify that the record reached the physical segment file on disk
-        const rawRecords = readAllJournalRecords(tmpExchange);
-        assert.strictEqual(rawRecords.length, 1, "Record was fsynced to segment before directory sync failed");
-        assert.strictEqual(rawRecords[0].message_id, msg1);
+        const rawRecordsB = readAllJournalRecords(tmpExchangeB);
+        assert.strictEqual(rawRecordsB.length, 1);
+        assert.strictEqual(rawRecordsB[0].message_id, msgB);
 
-        // Simulate supervisor restart: create fresh collector instance on same directory
         dirSyncFail = false;
-        const collector2 = new DiscordRpcCollector({
-            exchangeDir: tmpExchange,
-            collectorDataDir: privateDir,
-            runtimeDir: path.join(tmpExchange, "runtime"),
+        const collector2B = new DiscordRpcCollector({
+            exchangeDir: tmpExchangeB,
+            collectorDataDir: privateDirB,
+            runtimeDir: path.join(tmpExchangeB, "runtime"),
             enableLock: false,
             syncDirectoryFn: faultSyncDir
         });
-        collector2.initJournal();
+        collector2B.initJournal();
+        assert.strictEqual(collector2B.journalRecordCount, 1);
+        assert.strictEqual(collector2B.recentMessageIds.has(msgB), true);
+        const retryAppendedB = collector2B.appendEvents([evtB]);
+        assert.strictEqual(retryAppendedB, 0);
+        assert.strictEqual(readAllJournalRecords(tmpExchangeB).length, 1);
+        try { fs.rmSync(tmpExchangeB, { recursive: true, force: true }); } catch {}
 
-        // Verify startup rebuild identified the physical record and dedupes it
-        assert.strictEqual(collector2.journalRecordCount, 1);
-        assert.strictEqual(collector2.recentMessageIds.has(msg1), true);
-
-        // Retry the exact same event on the restarted collector
-        const appendedOnRestart = collector2.appendEvents([evt1]);
-        assert.strictEqual(appendedOnRestart, 0, "Restarted collector must dedupe existing record");
-
-        // Verify NO duplicate record was created in the physical journal
-        const recordsAfterRestart = readAllJournalRecords(tmpExchange);
-        assert.strictEqual(recordsAfterRestart.length, 1, "Exactly one record must exist in journal");
-
-        try { fs.rmSync(tmpExchange, { recursive: true, force: true }); } catch {}
-        console.log("  ✔ Uncertain append fail-stop & restart deduplication verified.");
+        console.log("  ✔ Uncertain append fail-stop & restart deduplication verified (file & directory fsync).");
     }
 
     // =========================================================================
@@ -731,6 +789,69 @@ async function runTests() {
         const diskStateAfter = JSON.parse(fs.readFileSync(recoveryStateFile, "utf8"));
         assert.strictEqual(diskStateAfter.channels["3001"].checkpoint_source, "rpc");
         assert.ok(diskStateAfter.channels["3001"].checkpoint_message_id.length > 0);
+
+        // 5B. Test first-watch live message race transaction:
+        // A genuinely new channel (5001) begins initialization (baseline_pending),
+        // receives a live MESSAGE_CREATE event BEFORE GET_CHANNEL completes, journals it,
+        // establishes baseline without being marked corrupted, dedupes M1, and captures M2.
+        const msgRaceM1 = (((t0 + 20000n) << 22n) | 1n).toString();
+        const msgRaceM2 = (((t0 + 25000n) << 22n) | 1n).toString();
+        mock.channelsByGuild["1001"].push({ id: "5001", name: "race-channel", type: 0 });
+        mock.channelData["5001"] = {
+            id: "5001",
+            name: "race-channel",
+            type: 0,
+            guild_id: "1001",
+            messages: [
+                makeNormalizedMessage(msgRaceM1, "5001", "Live M1 during init")
+            ]
+        };
+
+        collector.beginChannelInitialization("5001");
+        const initPendingState = collector.loadRecoveryState();
+        assert.strictEqual(initPendingState.channels["5001"].checkpoint_source, "baseline_pending");
+        assert.ok(initPendingState.channels["5001"].first_watch_boundary, "first_watch_boundary must be recorded");
+
+        // Live message M1 arrives BEFORE GET_CHANNEL completes
+        collector.activeSubscriptions.add("5001");
+        collector.handleMessageCreate({
+            channel_id: "5001",
+            message: makeNormalizedMessage(msgRaceM1, "5001", "Live M1 during init")
+        });
+
+        // M1 is journaled successfully
+        const journalFor5001 = readAllJournalRecords(tmpExchange).filter(r => r.channel_id === "5001");
+        assert.strictEqual(journalFor5001.length, 1, "M1 must be journaled");
+        assert.strictEqual(journalFor5001[0].message_id, msgRaceM1);
+
+        // Verify channel is NOT marked corrupted even though it now has journal evidence
+        const uncorruptedState = collector.loadRecoveryState();
+        assert.strictEqual(uncorruptedState.channels["5001"].checkpoint_source, "baseline_pending");
+        assert.strictEqual(collector.recoveryStateStatus, "ready");
+
+        // GET_CHANNEL completes
+        const raceRecovered = await collector.recoverChannelSnapshot("5001");
+        assert.strictEqual(collector.recoveryStateStatus, "ready");
+        assert.strictEqual(collector.collectorState, "running");
+
+        // Verify M1 is NOT duplicated by snapshot recovery
+        const journalAfterSnap = readAllJournalRecords(tmpExchange).filter(r => r.channel_id === "5001");
+        assert.strictEqual(journalAfterSnap.length, 1, "M1 must not be duplicated by snapshot recovery");
+
+        // Verify recovery state transitioned to ready ('rpc') and first_watch_boundary cleared
+        const finalRaceState = collector.loadRecoveryState();
+        assert.strictEqual(finalRaceState.channels["5001"].checkpoint_source, "rpc");
+        assert.strictEqual(finalRaceState.channels["5001"].first_watch_boundary, null);
+        assert.ok(BigInt(finalRaceState.channels["5001"].checkpoint_message_id) >= BigInt(msgRaceM1));
+
+        // Verify subsequent live message M2 is captured normally
+        collector.handleMessageCreate({
+            channel_id: "5001",
+            message: makeNormalizedMessage(msgRaceM2, "5001", "Live M2 after ready")
+        });
+        const journalAfterM2 = readAllJournalRecords(tmpExchange).filter(r => r.channel_id === "5001");
+        assert.strictEqual(journalAfterM2.length, 2, "Subsequent message M2 must be captured");
+        assert.strictEqual(journalAfterM2[1].message_id, msgRaceM2);
 
         // 6. Test legitimate fresh install (clean installation: zero journal, zero recovery state)
         const freshExchange = path.join(os.tmpdir(), `cordbrief-fresh-${Date.now()}-${Math.random().toString(36).slice(2)}`);

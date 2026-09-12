@@ -305,10 +305,186 @@ async function runDaemonRecoveryErrorVisibilityTest() {
     }
 }
 
+async function runDaemonRuntimeRecoveryErrorAndRetryTest() {
+    const tmpExchange = path.join(os.tmpdir(), `cordbrief-runtime-err-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    fs.mkdirSync(tmpExchange, { recursive: true });
+    const privateDir = path.join(tmpExchange, "private");
+    fs.mkdirSync(privateDir, { recursive: true });
+
+    const t0 = 1750000000000n;
+    const msg1 = ((t0 << 22n) | 1n).toString();
+    const msg2 = (((t0 + 5000n) << 22n) | 1n).toString();
+
+    const validState = {
+        version: 2,
+        channels: {
+            "2001": {
+                checkpoint_message_id: msg1,
+                checkpoint_source: "rpc",
+                watch_after: msg1
+            }
+        },
+        pending: null
+    };
+    const recoveryStateFile = path.join(privateDir, "recovery-state.json");
+    fs.writeFileSync(recoveryStateFile, JSON.stringify(validState));
+
+    fs.writeFileSync(path.join(tmpExchange, "watchlist.json"), JSON.stringify({
+        version: 1,
+        generation: 1,
+        channel_ids: ["2001"]
+    }));
+
+    const mock = new MockDiscordRpcServer({
+        guilds: [{ id: "1001", name: "Alpha Guild" }],
+        channelsByGuild: { "1001": [{ id: "2001", name: "general", type: 0 }] },
+        channelData: {
+            "2001": {
+                id: "2001",
+                name: "general",
+                type: 0,
+                guild_id: "1001",
+                messages: [
+                    { id: msg1, channel_id: "2001", content: "Initial msg", timestamp: new Date().toISOString() }
+                ]
+            }
+        }
+    });
+    const pipePath = await mock.start();
+    const transport = new RpcTransport({ socketPath: pipePath });
+    const client = new DiscordRpcClient(transport);
+
+    const daemon = new RpcCollectorDaemon({
+        exchangeDir: tmpExchange,
+        collectorDataDir: privateDir,
+        runtimeDir: path.join(tmpExchange, "runtime"),
+        clientId: "test_daemon_client",
+        clientSecret: "test_daemon_secret",
+        tokenPath: path.join(privateDir, "oauth-token.json"),
+        transport,
+        client,
+        mockXpra: true
+    });
+    daemon.saveToken({ accessToken: "token123", refreshToken: "refresh456", expiresIn: 3600 });
+
+    const statusFile = path.join(tmpExchange, "collector-status.json");
+
+    try {
+        await daemon.start();
+        assert.strictEqual(daemon.collectorState, "running");
+        const statusInit = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+        assert.strictEqual(statusInit.collector_state, "running");
+        assert.strictEqual(statusInit.recovery_state, "ready");
+
+        // Corrupt recovery-state.json at runtime
+        fs.writeFileSync(recoveryStateFile, "{\"version\": 2, \"channels\": { CORRUPT_RUNTIME...");
+
+        // Inject live message
+        daemon.collector.handleMessageCreate({
+            channel_id: "2001",
+            message: { id: msg2, channel_id: "2001", content: "live msg", timestamp: new Date().toISOString() }
+        });
+
+        // Verify message capture refused and daemon entered error state
+        assert.strictEqual(daemon.collectorState, "error");
+        assert.strictEqual(daemon.recoveryState, "error");
+        const statusErr = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+        assert.strictEqual(statusErr.collector_state, "error");
+        assert.strictEqual(statusErr.recovery_state, "error");
+        assert.ok(statusErr.last_error && statusErr.last_error.includes("Corrupt recovery-state"));
+
+        // Heartbeat preserves error state
+        daemon.publishStatus();
+        const statusHb = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+        assert.strictEqual(statusHb.collector_state, "error");
+        assert.strictEqual(statusHb.recovery_state, "error");
+
+        // Restore valid recovery-state.json and exercise retryRecovery() (Option B)
+        fs.writeFileSync(recoveryStateFile, JSON.stringify(validState));
+        await daemon.retryRecovery();
+
+        // Status returns to running/ready
+        assert.strictEqual(daemon.collectorState, "running");
+        assert.strictEqual(daemon.recoveryState, "ready");
+        const statusRepaired = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+        assert.strictEqual(statusRepaired.collector_state, "running");
+        assert.strictEqual(statusRepaired.recovery_state, "ready");
+        assert.strictEqual(statusRepaired.last_error, null);
+
+        await daemon.stop();
+        console.log("rpc_daemon_test (runtime recovery error & Option B retry) passed");
+    } finally {
+        await daemon.stop().catch(() => {});
+        await mock.stop().catch(() => {});
+        try { fs.rmSync(tmpExchange, { recursive: true, force: true }); } catch {}
+    }
+}
+
+async function runDaemonFatalErrorExitTest() {
+    const tmpExchange = path.join(os.tmpdir(), `cordbrief-daemon-fatal-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    fs.mkdirSync(tmpExchange, { recursive: true });
+    const privateDir = path.join(tmpExchange, "private");
+    fs.mkdirSync(privateDir, { recursive: true });
+
+    const daemonPath = path.resolve("collector/rpc/daemon.mjs").replace(/\\/g, "/");
+    const mockPath = path.resolve("collector/test/mock_discord_rpc.mjs").replace(/\\/g, "/");
+    const transportPath = path.resolve("collector/rpc/transport.mjs").replace(/\\/g, "/");
+    const protoPath = path.resolve("collector/rpc/protocol.mjs").replace(/\\/g, "/");
+
+    const harnessScript = path.join(tmpExchange, "harness.mjs");
+    fs.writeFileSync(harnessScript, `
+        import { RpcCollectorDaemon } from ${JSON.stringify(daemonPath)};
+        import { MockDiscordRpcServer } from ${JSON.stringify(mockPath)};
+        import { RpcTransport } from ${JSON.stringify(transportPath)};
+        import { DiscordRpcClient } from ${JSON.stringify(protoPath)};
+        import * as fs from "fs";
+        import * as path from "path";
+
+        const mock = new MockDiscordRpcServer({
+            guilds: [{ id: "1001", name: "Alpha Guild" }],
+            channelsByGuild: { "1001": [] },
+            channelData: {}
+        });
+        const pipePath = await mock.start();
+        const transport = new RpcTransport({ socketPath: pipePath });
+        const client = new DiscordRpcClient(transport);
+
+        const daemon = new RpcCollectorDaemon({
+            exchangeDir: ${JSON.stringify(tmpExchange)},
+            collectorDataDir: ${JSON.stringify(privateDir)},
+            runtimeDir: ${JSON.stringify(path.join(tmpExchange, "runtime"))},
+            clientId: "test_daemon_client",
+            clientSecret: "test_daemon_secret",
+            tokenPath: ${JSON.stringify(path.join(privateDir, "oauth-token.json"))},
+            transport,
+            client,
+            mockXpra: true,
+            exitOnClose: false
+        });
+        daemon.saveToken({ accessToken: "token", refreshToken: "refresh", expiresIn: 3600 });
+        fs.writeFileSync(${JSON.stringify(path.join(tmpExchange, "watchlist.json"))}, JSON.stringify({ version: 1, generation: 1, channel_ids: [] }));
+
+        await daemon.start();
+        daemon.collector.failStop("Simulated write uncertainty");
+    `);
+
+    const { spawn } = await import("child_process");
+    const child = spawn(process.execPath, [harnessScript], { stdio: "ignore" });
+    const exitCode = await new Promise((resolve) => {
+        child.on("exit", (code) => resolve(code));
+    });
+
+    assert.strictEqual(exitCode, 1, "Production daemon process must exit with code 1 on fatal_error");
+    try { fs.rmSync(tmpExchange, { recursive: true, force: true }); } catch {}
+    console.log("rpc_daemon_test (fatal error exit code 1) passed");
+}
+
 async function main() {
     await runDaemonTest();
     await runLoginRequiredSlowReadyTest();
     await runDaemonRecoveryErrorVisibilityTest();
+    await runDaemonRuntimeRecoveryErrorAndRetryTest();
+    await runDaemonFatalErrorExitTest();
 }
 
 main().catch(err => {
