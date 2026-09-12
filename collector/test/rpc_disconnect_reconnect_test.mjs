@@ -18,7 +18,9 @@ async function runDisconnectReconnectTest() {
     const exchangeDir = path.join(rootDir, "exchange");
     const privateDir = path.join(rootDir, "private");
     const runtimeDir = path.join(rootDir, "runtime");
-    const socketPath = path.join(rootDir, "discord-ipc-0");
+    const socketPath = process.platform === "win32"
+        ? `\\\\.\\pipe\\cb-recon-test-${path.basename(rootDir)}`
+        : path.join(rootDir, "discord-ipc-0");
 
     fs.mkdirSync(exchangeDir, { recursive: true });
     fs.mkdirSync(path.join(exchangeDir, "events"), { recursive: true });

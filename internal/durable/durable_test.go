@@ -6,8 +6,10 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -121,6 +123,31 @@ func TestDurableAtomicWrite(t *testing.T) {
 		tmpDir := t.TempDir()
 		if err := SyncDir(tmpDir); err != nil {
 			t.Fatalf("SyncDir failed on valid dir: %v", err)
+		}
+
+		// Nonexistent directory must fail on non-Windows
+		if runtime.GOOS != "windows" {
+			nonexistent := filepath.Join(tmpDir, "nonexistent-dir-12345")
+			if err := SyncDir(nonexistent); err == nil {
+				t.Fatalf("SyncDir expected error on nonexistent dir, got nil")
+			}
+		}
+
+		// Verify isUnsupportedDirSyncErr logic
+		if !isUnsupportedDirSyncErr(syscall.EINVAL) {
+			t.Errorf("expected EINVAL to be recognized as unsupported dir sync error")
+		}
+		if !isUnsupportedDirSyncErr(syscall.ENOTSUP) {
+			t.Errorf("expected ENOTSUP to be recognized as unsupported dir sync error")
+		}
+		if !isUnsupportedDirSyncErr(syscall.EISDIR) {
+			t.Errorf("expected EISDIR to be recognized as unsupported dir sync error")
+		}
+		if isUnsupportedDirSyncErr(syscall.EIO) {
+			t.Errorf("EIO must NOT be recognized as unsupported dir sync error")
+		}
+		if isUnsupportedDirSyncErr(syscall.EACCES) {
+			t.Errorf("EACCES must NOT be recognized as unsupported dir sync error")
 		}
 	})
 

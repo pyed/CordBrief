@@ -401,6 +401,105 @@ async function runTests() {
         console.log("  ✔ Fail-closed error retry preserved baseline_pending and succeeded on recovery.");
     }
 
+    // -------------------------------------------------------------
+    // Invariant 6: Corrupt recovery state fail-closed protection
+    // An existing watched channel with events in the journal cannot be
+    // converted into a fresh first-watch anchor if recovery-state.json
+    // becomes malformed or corrupt. Outage messages must NOT be masked.
+    // -------------------------------------------------------------
+    {
+        console.log("\n[Invariant 6] Corrupt recovery-state fail-closed protection...");
+        const tmpExchange = createTempDir("cb-inv6");
+        const privateDir = path.join(tmpExchange, "private");
+        fs.mkdirSync(privateDir, { recursive: true });
+
+        const mock = new MockDiscordRpcServer();
+        const pipePath = await mock.start();
+        const transport = new RpcTransport({ socketPath: pipePath });
+        const client = new DiscordRpcClient(transport);
+
+        const collector = new DiscordRpcCollector({
+            exchangeDir: tmpExchange,
+            collectorDataDir: privateDir,
+            transport,
+            client,
+            enableLock: false
+        });
+
+        await transport.connect("test_app");
+        await client.authenticate("test_token");
+
+        // Step 1: Channel 2001 is initially watched and captures message 1
+        const msg1 = "1545225000000000101";
+        mock.channelData["2001"] = {
+            id: "2001",
+            name: "general",
+            type: 0,
+            messages: [makeNormalizedMessage(msg1, "2001", "Seed message")]
+        };
+        await collector.recoverChannelSnapshot("2001");
+        assert.strictEqual(readAllJournalRecords(tmpExchange).length, 1);
+        const validState = collector.loadRecoveryState();
+        assert.strictEqual(validState.channels["2001"].checkpoint_message_id, msg1);
+
+        // Step 2: Collector offline. Outage message 2 occurs in Discord
+        const msg2 = "1545225000000000102";
+        mock.channelData["2001"].messages.push(makeNormalizedMessage(msg2, "2001", "Outage message 2"));
+
+        // Step 3: recovery-state.json becomes corrupt (truncated/invalid JSON)
+        const recoveryStateFile = path.join(privateDir, "recovery-state.json");
+        fs.writeFileSync(recoveryStateFile, "{\"version\": 2, \"channels\": { CORRUPT_DATA...");
+
+        // Verify loadRecoveryState() refuses to return clean fresh state and throws fail-closed error
+        assert.throws(() => {
+            collector.loadRecoveryState();
+        }, /Corrupt recovery-state\.json/);
+
+        // Verify beginChannelInitialization() refuses to re-initialize an existing journal channel with corrupt state
+        assert.throws(() => {
+            collector.beginChannelInitialization("2001");
+        }, /Corrupt recovery-state\.json/);
+
+        // Verify beginChannelInitialization() refuses to re-anchor an existing journal channel missing checkpoint
+        fs.writeFileSync(recoveryStateFile, JSON.stringify({ version: 2, channels: { "2001": {} } }));
+        assert.throws(() => {
+            collector.beginChannelInitialization("2001");
+        }, /Cannot initialize existing journal channel 2001/);
+
+        // Re-corrupt recovery-state.json for snapshot and live-append fail-closed tests
+        fs.writeFileSync(recoveryStateFile, "{\"version\": 2, \"channels\": { CORRUPT_DATA...");
+
+        // Verify recoverChannelSnapshot fails closed:
+        // Sets recoveryStateStatus to 'error', does NOT overwrite corrupt file, does NOT re-anchor to msg2
+        const recoveredCount = await collector.recoverChannelSnapshot("2001");
+        assert.strictEqual(recoveredCount, 0, "Recovery must fail closed on corrupt recovery state");
+        assert.strictEqual(collector.recoveryStateStatus, "error");
+        assert.ok(collector.recoveryLastError.includes("Corrupt recovery-state.json"));
+
+        // Verify the corrupt recovery-state file was NOT overwritten with a clean baseline
+        const onDiskRaw = fs.readFileSync(recoveryStateFile, "utf8");
+        assert.ok(onDiskRaw.includes("CORRUPT_DATA"), "Corrupt file must not be silently replaced");
+
+        // Verify live message handler also fails closed against corrupt recovery state
+        collector.activeSubscriptions.add("2001");
+        collector.handleMessageCreate({
+            channel_id: "2001",
+            message: makeNormalizedMessage("1545225000000000103", "2001", "Live message during corruption")
+        });
+        assert.ok(collector.lastError.includes("Recovery state error"), "Must refuse live appends against corrupt recovery state");
+
+        // Step 4: Repair recovery state by restoring valid state
+        fs.writeFileSync(recoveryStateFile, JSON.stringify(validState));
+        const recoveredAfterFix = await collector.recoverChannelSnapshot("2001");
+        assert.strictEqual(recoveredAfterFix, 1, "Outage message 2 must be captured once recovery state is restored");
+        assert.strictEqual(readAllJournalRecords(tmpExchange).length, 2, "Both msg1 and msg2 must be in journal");
+
+        transport.close();
+        await mock.stop();
+        try { fs.rmSync(tmpExchange, { recursive: true, force: true }); } catch {}
+        console.log("  ✔ Corrupt recovery state fail-closed protection verified: outage messages cannot be lost.");
+    }
+
     console.log("rpc_recovery_invariants_tests_passed");
 }
 

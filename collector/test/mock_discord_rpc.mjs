@@ -16,7 +16,7 @@ export class MockDiscordRpcServer {
         this.clients = new Set();
         this.subscriptions = new Set(); // set of "channelId:MESSAGE_CREATE"
 
-        // Configurable mock data
+        this.suppressReady = Boolean(options.suppressReady);
         this.guilds = options.guilds || [
             { id: "1001", name: "Alpha Guild" },
             { id: "1002", name: "Beta Guild" }
@@ -85,6 +85,9 @@ export class MockDiscordRpcServer {
         const { opcode, payload } = frame;
 
         if (opcode === OPCODES.HANDSHAKE) {
+            if (this.suppressReady) {
+                return;
+            }
             // Send READY dispatch
             const readyPayload = {
                 cmd: "DISPATCH",

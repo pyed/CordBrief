@@ -27,7 +27,13 @@ function syncDirectory(dir) {
     try {
         const fd = fs.openSync(dir, "r");
         try { fs.fsyncSync(fd); } finally { fs.closeSync(fd); }
-    } catch {}
+    } catch (err) {
+        const unsupportedCodes = new Set(["EINVAL", "ENOTSUP", "EISDIR", "EBADF"]);
+        if (err && unsupportedCodes.has(err.code)) {
+            return;
+        }
+        throw err;
+    }
 }
 
 export function safeReplaceJSON(destinationPath, data, mode = 0o644) {
@@ -242,22 +248,41 @@ export class DiscordRpcCollector {
     }
 
     /**
-     * Loads and validates recovery-state.json (Schema v2).
+     * Loads and validates recovery-state.json (Schema v2). Fail-closed on corruption.
      * @returns {object}
      */
     loadRecoveryState() {
         if (!fs.existsSync(this.recoveryStatePath)) {
+            if (this.journalChannels && this.journalChannels.size > 0) {
+                throw new Error("Recovery state missing for existing journal channels");
+            }
             return { version: 2, channels: {}, pending: null };
         }
+        let raw;
         try {
-            const raw = fs.readFileSync(this.recoveryStatePath, "utf8");
-            const parsed = JSON.parse(raw);
-            if (parsed && parsed.version === 2 && typeof parsed.channels === "object") {
-                if (parsed.pending === undefined) parsed.pending = null;
-                return parsed;
+            raw = fs.readFileSync(this.recoveryStatePath, "utf8");
+        } catch (readErr) {
+            throw new Error(`Failed to read recovery-state.json: ${readErr.message}`);
+        }
+        let parsed;
+        try {
+            parsed = JSON.parse(raw);
+        } catch (jsonErr) {
+            throw new Error(`Corrupt recovery-state.json: malformed JSON (${jsonErr.message})`);
+        }
+        if (!parsed || parsed.version !== 2 || typeof parsed.channels !== "object" || parsed.channels === null || Array.isArray(parsed.channels)) {
+            throw new Error("Corrupt recovery-state.json: invalid schema (version must be 2 and channels must be an object)");
+        }
+        if (parsed.pending === undefined) parsed.pending = null;
+
+        if (this.journalChannels) {
+            for (const chId of this.journalChannels) {
+                if (!parsed.channels[chId]) {
+                    throw new Error(`Corrupt recovery-state.json: existing journal channel ${chId} missing from recovery state`);
+                }
             }
-        } catch {}
-        return { version: 2, channels: {}, pending: null };
+        }
+        return parsed;
     }
 
     /**
@@ -272,11 +297,15 @@ export class DiscordRpcCollector {
 
     /**
      * Initializes a newly watched channel's recovery checkpoint.
+     * Refuses to re-initialize an existing channel that already has messages in the physical journal.
      * @param {string} channelId
      */
     beginChannelInitialization(channelId) {
         const state = this.loadRecoveryState();
         if (state.channels[channelId]?.checkpoint_message_id) return;
+        if (this.journalChannels && this.journalChannels.has(channelId)) {
+            throw new Error(`Cannot initialize existing journal channel ${channelId} as new first-watch channel`);
+        }
 
         state.channels[channelId] = {
             checkpoint_message_id: "",
@@ -609,13 +638,17 @@ export class DiscordRpcCollector {
         } catch (err) {
             this.recoveryStateStatus = "error";
             this.recoveryLastError = `Recovery failed for ${channelId}: ${err?.message || String(err)}`;
-            const state = this.loadRecoveryState();
-            if (state.channels[channelId]) {
-                state.channels[channelId].last_result = "error";
-                state.channels[channelId].last_error = this.recoveryLastError;
-                state.channels[channelId].last_recovery_at = new Date().toISOString();
-                this.saveRecoveryState(state);
-            }
+            this.lastError = this.recoveryLastError;
+            try {
+                const state = this.loadRecoveryState();
+                if (state.channels[channelId]) {
+                    state.channels[channelId].last_result = "error";
+                    state.channels[channelId].last_error = this.recoveryLastError;
+                    state.channels[channelId].last_recovery_at = new Date().toISOString();
+                    this.saveRecoveryState(state);
+                }
+            } catch {}
+            this.writeStatus("running");
             return 0;
         }
     }
@@ -637,7 +670,14 @@ export class DiscordRpcCollector {
             return;
         }
 
-        const state = this.loadRecoveryState();
+        let state;
+        try {
+            state = this.loadRecoveryState();
+        } catch (err) {
+            console.error(`[RPC Collector] Refusing live message append due to recovery state error: ${err.message}`);
+            this.lastError = `Recovery state error: ${err.message}`;
+            return;
+        }
         const chState = state.channels[chId];
         if (chState?.watch_after && BigInt(msg.id) <= BigInt(chState.watch_after)) {
             console.log(`[RPC Collector] Dropping pre-watch message: ${msg.id} <= ${chState.watch_after}`);

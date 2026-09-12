@@ -83,16 +83,20 @@ export class RpcCollectorDaemon extends EventEmitter {
         this.xpraRunning = false;
         this.mockXpra = !!options.mockXpra;
 
-        // Tuning parameters
         this.startupGracePeriodMs = options.startupGracePeriodMs || parseInt(getEnv("CORDBRIEF_STARTUP_GRACE_PERIOD_MS", "20000"), 10);
         this.antiSpamCooldownMs = options.antiSpamCooldownMs || 10000;
         this.commandPollIntervalMs = options.commandPollIntervalMs || 1000;
+        this.connectTimeoutMs = options.connectTimeoutMs || 3000;
+        this.connectPollIntervalMs = options.connectPollIntervalMs || 1000;
+        this.statusHeartbeatIntervalMs = options.statusHeartbeatIntervalMs || 5000;
 
-        // Timers
+        // Timers & lifecycle flags
         this.heartbeatTimer = null;
+        this.statusHeartbeatTimer = null;
         this.commandTimer = null;
         this.refreshTimer = null;
         this.stopping = false;
+        this.sessionEstablished = false;
     }
 
     reloadCredentials() {
@@ -325,9 +329,10 @@ export class RpcCollectorDaemon extends EventEmitter {
 
             if (socketExists) {
                 try {
-                    const readyData = await this.transport.connect(this.clientId || "123456789012345678", { timeoutMs: 3000 });
+                    const readyData = await this.transport.connect(this.clientId || "123456789012345678", { timeoutMs: this.connectTimeoutMs });
                     if (readyData && readyData.user && readyData.user.id) {
                         this.authenticatedUser = readyData.user;
+                        this.sessionEstablished = true;
                         const userTag = readyData.user.username;
                         console.log(`[RPC Daemon] Discord user authenticated: ${userTag} (ID: ${readyData.user.id})`);
                         this.transitionTo(COLLECTOR_STATES.DISCORD_AUTHENTICATED, MODES.SETUP, {
@@ -470,8 +475,15 @@ export class RpcCollectorDaemon extends EventEmitter {
         // Start command polling loop
         this.commandTimer = setInterval(() => this.pollCommands(), this.commandPollIntervalMs);
 
+        // Periodically refresh collector-status.json updated_at while waiting for operator login/auth
+        this.statusHeartbeatTimer = setInterval(() => {
+            if (!this.stopping && !this.collector) {
+                this.publishStatus();
+            }
+        }, this.statusHeartbeatIntervalMs);
+
         // State 1 & 2: Discord Starting -> Discord Login Required (if needed) -> Discord Authenticated
-        await this.connectAndInspectSession();
+        await this.connectAndInspectSession(this.connectPollIntervalMs);
 
         // Check for existing OAuth token
         let token = this.loadToken();
@@ -588,8 +600,11 @@ export class RpcCollectorDaemon extends EventEmitter {
      */
     handleTransportClose(hadError) {
         if (this.stopping) return;
-        // If still in initial connection loop before active authentication, let connect loop retry
-        if (!this.discordAuthenticated && this.collectorState === COLLECTOR_STATES.DISCORD_STARTING) {
+        // If still in initial pre-auth / login discovery loop before active authentication, let inspection loop continue
+        if (!this.sessionEstablished || (!this.discordAuthenticated && (
+            this.collectorState === COLLECTOR_STATES.DISCORD_STARTING ||
+            this.collectorState === COLLECTOR_STATES.DISCORD_LOGIN_REQUIRED
+        ))) {
             return;
         }
 
@@ -599,6 +614,10 @@ export class RpcCollectorDaemon extends EventEmitter {
         if (this.heartbeatTimer) {
             clearInterval(this.heartbeatTimer);
             this.heartbeatTimer = null;
+        }
+        if (this.statusHeartbeatTimer) {
+            clearInterval(this.statusHeartbeatTimer);
+            this.statusHeartbeatTimer = null;
         }
         if (this.commandTimer) {
             clearInterval(this.commandTimer);
@@ -634,6 +653,7 @@ export class RpcCollectorDaemon extends EventEmitter {
         if (this.stopping) return;
         this.stopping = true;
         if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+        if (this.statusHeartbeatTimer) clearInterval(this.statusHeartbeatTimer);
         if (this.commandTimer) clearInterval(this.commandTimer);
         if (this.refreshTimer) clearTimeout(this.refreshTimer);
 

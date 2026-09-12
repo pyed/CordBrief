@@ -7,11 +7,13 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"syscall"
 	"time"
 )
 
 // SyncDir flushes directory metadata to disk on systems that support it (POSIX/Linux).
-// On Windows or platforms/filesystems where directory syncing is unsupported, it returns nil.
+// On Windows or platforms/filesystems where directory syncing is unsupported (EINVAL, ENOTSUP, EISDIR), it returns nil.
+// Genuine I/O errors (such as EIO) are returned.
 func SyncDir(dir string) error {
 	if runtime.GOOS == "windows" {
 		return nil
@@ -24,14 +26,24 @@ func SyncDir(dir string) error {
 	defer d.Close()
 
 	if err := d.Sync(); err != nil {
-		var pathErr *os.PathError
-		if errors.As(err, &pathErr) {
+		if isUnsupportedDirSyncErr(err) {
 			// Ignore unsupported operations on specific filesystems
 			return nil
 		}
 		return err
 	}
 	return nil
+}
+
+func isUnsupportedDirSyncErr(err error) bool {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
+		switch errno {
+		case syscall.EINVAL, syscall.ENOTSUP, syscall.EISDIR:
+			return true
+		}
+	}
+	return false
 }
 
 // AtomicWriteFile writes data to dest atomically:
@@ -82,7 +94,9 @@ func AtomicWriteFile(dest string, data []byte, perm os.FileMode) error {
 	}
 
 	cleanup = false
-	_ = SyncDir(dir)
+	if err := SyncDir(dir); err != nil {
+		return fmt.Errorf("sync directory metadata: %w", err)
+	}
 	return nil
 }
 
@@ -166,7 +180,9 @@ func AtomicWriteFileExclusive(dest string, data []byte, perm os.FileMode) error 
 
 	cleanup = false
 	_ = os.Remove(tmpName)
-	_ = SyncDir(dir)
+	if err := SyncDir(dir); err != nil {
+		return fmt.Errorf("sync directory metadata: %w", err)
+	}
 	return nil
 }
 
