@@ -37,6 +37,29 @@ subscription. Once persisted, the baseline is write-once: retries and restarts
 reuse it, including an established empty baseline. Later visibility after an empty
 lookup can therefore bring in pre-watch history; no newer cutoff is guessed.
 
+Immutable provenance is stored independently in `recovery-state.json.anchors`
+(the configured recovery-state path plus `.anchors`). This private JSON file has
+`version: 1` and a `channels` map from channel ID to its original `watch_after`.
+It is atomically replaced and synced with mode `0600` **before** the corresponding
+recovery-state commit and before subscription. Its entries survive even when no
+user message has ever been journaled. Valid existing recovery-state is adopted
+into this provenance file before recovery proceeds on upgrade.
+
+A channel ID identifies the continuing watch episode: removing a channel suspends
+collection; re-adding it resumes the original baseline. Restart, state loss, and
+journal retirement never create a new episode or remove its anchor. A genuinely
+new channel with no anchor or journal evidence can initialize normally.
+
+If recovery-state is missing, malformed, or lacks an anchored channel's original
+baseline/checkpoint, collection fails visibly closed. A crash after anchor commit
+but before recovery-state commit also fails closed. The collector does not
+automatically reconstruct recovery-state or query a replacement cutoff. Restore
+valid recovery-state consistent with the anchors; the normal heartbeat retry then
+reconciles against those same baselines. Malformed anchor data is also refused.
+Back up both files together: this protection relies on independent provenance
+surviving loss of recovery-state, and cannot recover evidence erased from both
+files before any journal record exists.
+
 All asynchronous recovery operations share one collector-owned queue. Startup,
 watchlist changes, and daemon retries use the same reconciliation owner; triggers
 received during a pass request another pass over the latest watchlist. Live

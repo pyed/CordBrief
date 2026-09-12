@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import { EventEmitter } from "node:events";
 import { pathToFileURL } from "node:url";
+import { syncBuiltinESMExports } from "node:module";
 import { RpcCollectorDaemon } from "../rpc/daemon.mjs";
 import { deriveFirstWatchBoundary } from "../rpc/retention.mjs";
 
@@ -34,12 +35,19 @@ async function fixture(channels = []) {
         subscribeMessageCreate: async () => {}, unsubscribeMessageCreate: async () => {},
         getChannel: async channel => ({ id: channel, messages: [message(1, channel)] })
     };
-    const daemon = new RpcCollectorDaemon({ exchangeDir: root, collectorDataDir: path.join(root, "private"),
-        runtimeDir: path.join(root, "runtime"), transport, client, clientId: "synthetic", clientSecret: "synthetic", mockXpra: true });
+    const options = { exchangeDir: root, collectorDataDir: path.join(root, "private"),
+        runtimeDir: path.join(root, "runtime"), transport, client, clientId: "synthetic", clientSecret: "synthetic", mockXpra: true };
+    let daemon = new RpcCollectorDaemon(options);
     daemon.saveToken({ accessToken: "synthetic", expiresIn: 3600 });
     await daemon.start();
-    const collector = daemon.collector;
-    return { root, daemon, collector, client, watch,
+    let collector = daemon.collector;
+    return { root, get daemon() { return daemon; }, get collector() { return collector; }, client, watch,
+        restart: async () => {
+            await daemon.stop();
+            daemon = new RpcCollectorDaemon(options);
+            await daemon.start();
+            collector = daemon.collector;
+        },
         records: () => fs.readdirSync(collector.eventsDir).filter(f => f.endsWith(".ndjson")).sort()
             .flatMap(f => fs.readFileSync(path.join(collector.eventsDir, f), "utf8").trim().split("\n").filter(Boolean).map(JSON.parse)),
         close: async () => { await daemon.stop(); fs.rmSync(root, { recursive: true, force: true }); }
@@ -47,6 +55,124 @@ async function fixture(channels = []) {
 }
 
 export async function runStateOwnershipTests() {
+    // First-watch provenance must survive loss of recovery-state even BEFORE the
+    // first journal record. Exercise the actual subscription gap, restart, and repair.
+    {
+        const f = await fixture();
+        const subscribed = deferred();
+        let calls = 0, subscriptions = 0;
+        try {
+            f.client.getChannel = async channel => ({ id: channel,
+                messages: channel === "2002" ? [] : (++calls === 1 ? [message(1)] : [message(1), message(2), message(3)]) });
+            f.client.subscribeMessageCreate = async () => { subscriptions++; await subscribed.promise; };
+            f.watch(["2001"]);
+            const pass = f.daemon.retryRecovery();
+            await until(() => subscriptions === 1);
+            const valid = fs.readFileSync(f.collector.recoveryStatePath, "utf8");
+            const baseline = JSON.parse(valid).channels["2001"].watch_after;
+            assert.equal(baseline, deriveFirstWatchBoundary(id(1)));
+            assert.equal(f.records().length, 0, "No journal evidence may hide the zero-message bug");
+            fs.unlinkSync(f.collector.recoveryStatePath);
+            subscribed.resolve();
+            await pass;
+            assert.equal(f.daemon.collectorState, "error", "Missing initialized state must not become running");
+            assert.equal(f.daemon.recoveryState, "error");
+            assert(f.daemon.lastError && f.daemon.recoveryLastError);
+            assert.equal(fs.existsSync(f.collector.recoveryStatePath), false, "Never manufacture replacement state");
+            assert.equal(calls, 1, "Lost state must not cause another baseline observation");
+            const anchors = fs.readFileSync(f.collector.recoveryAnchorsPath, "utf8");
+            assert.equal(JSON.parse(anchors).channels["2001"], baseline);
+            await f.daemon.heartbeat();
+            await f.restart(); // A new collector cannot rely on an in-memory baseline.
+            assert.equal(f.daemon.collectorState, "error");
+            assert.equal(f.daemon.recoveryState, "error");
+            assert.equal(calls, 1);
+            assert.equal(f.records().length, 0);
+            assert.equal(fs.readFileSync(f.collector.recoveryAnchorsPath, "utf8"), anchors);
+            // A missing entry, changed cutoff, or malformed primary cannot bypass
+            // the anchor either, even with no journal witness in this new process.
+            const moved = JSON.parse(valid);
+            moved.channels["2001"].watch_after = deriveFirstWatchBoundary(id(3));
+            for (const invalid of [JSON.stringify({ version: 2, channels: {} }), JSON.stringify(moved), "{corrupt"]) {
+                fs.writeFileSync(f.collector.recoveryStatePath, invalid);
+                await f.daemon.retryRecovery();
+                assert.equal(f.daemon.collectorState, "error");
+                assert.equal(f.daemon.recoveryState, "error");
+                assert.equal(calls, 1);
+                assert.equal(fs.readFileSync(f.collector.recoveryStatePath, "utf8"), invalid);
+                assert.equal(fs.readFileSync(f.collector.recoveryAnchorsPath, "utf8"), anchors);
+            }
+            fs.writeFileSync(f.collector.recoveryStatePath, valid);
+            for (const invalid of ["{corrupt", JSON.stringify({ version: 1, channels: [] })]) {
+                fs.writeFileSync(f.collector.recoveryAnchorsPath, invalid);
+                await f.daemon.retryRecovery();
+                assert.equal(f.daemon.collectorState, "error");
+                assert.equal(f.daemon.recoveryState, "error");
+                assert.equal(calls, 1);
+                assert.equal(fs.readFileSync(f.collector.recoveryAnchorsPath, "utf8"), invalid);
+            }
+            fs.writeFileSync(f.collector.recoveryAnchorsPath, anchors);
+            await f.daemon.heartbeat();
+            assert.equal(f.daemon.collectorState, "running");
+            assert.equal(f.collector.loadRecoveryState().channels["2001"].watch_after, baseline);
+            for (const n of [2, 3]) assert.equal(f.records().filter(r => r.message_id === id(n)).length, 1);
+
+            // Pre-upgrade primary state has no sidecar. Adoption must preserve its
+            // established boundary before a newer snapshot is observed.
+            fs.unlinkSync(f.collector.recoveryAnchorsPath);
+            await f.restart();
+            assert.equal(JSON.parse(fs.readFileSync(f.collector.recoveryAnchorsPath)).channels["2001"], baseline);
+            for (const n of [2, 3]) assert.equal(f.records().filter(r => r.message_id === id(n)).length, 1);
+
+            // A genuinely new, empty channel still establishes an explicit zero
+            // baseline. Removal/re-addition resumes that episode, including restart.
+            f.watch(["2001", "2002"]);
+            await f.daemon.retryRecovery();
+            const emptyBaseline = f.collector.loadRecoveryState().channels["2002"].watch_after;
+            assert.equal(emptyBaseline, "0");
+            assert.equal(f.records().filter(r => r.channel_id === "2002").length, 0);
+            f.watch(["2001"]);
+            await f.daemon.retryRecovery();
+            await f.restart();
+            f.client.getChannel = async channel => ({ messages: channel === "2002" ? [message(4, channel), message(5, channel)] : [message(1), message(2), message(3)] });
+            f.watch(["2001", "2002"]);
+            await f.daemon.retryRecovery();
+            assert.equal(f.collector.loadRecoveryState().channels["2002"].watch_after, emptyBaseline);
+            for (const n of [4, 5]) assert.equal(f.records().filter(r => r.message_id === id(n)).length, 1);
+        } finally { subscribed.resolve(); await f.close(); }
+    }
+    // Anchor commits precede primary-state commits. A failure between the two
+    // files must survive restart as an error, with no subscription or new query.
+    {
+        const f = await fixture();
+        const rename = fs.renameSync;
+        let calls = 0, subscriptions = 0, interrupted = false;
+        try {
+            f.client.getChannel = async () => { calls++; return { messages: [message(1)] }; };
+            f.client.subscribeMessageCreate = async () => { subscriptions++; };
+            fs.renameSync = (from, to) => {
+                if (to === f.collector.recoveryStatePath) {
+                    assert.equal(JSON.parse(fs.readFileSync(f.collector.recoveryAnchorsPath)).channels["2001"], deriveFirstWatchBoundary(id(1)));
+                    interrupted = true;
+                    throw new Error("Injected primary commit failure after durable anchor");
+                }
+                return rename(from, to);
+            };
+            syncBuiltinESMExports();
+            f.watch(["2001"]);
+            await f.daemon.retryRecovery();
+            fs.renameSync = rename;
+            syncBuiltinESMExports();
+            assert(interrupted, "Must reach the actual primary rename after anchor persistence");
+            assert.equal(fs.existsSync(f.collector.recoveryStatePath), false);
+            assert.equal(subscriptions, 0);
+            await f.restart();
+            assert.equal(calls, 1);
+            assert.equal(subscriptions, 0);
+            assert.equal(f.daemon.collectorState, "error");
+            assert.equal(f.daemon.recoveryState, "error");
+        } finally { fs.renameSync = rename; syncBuiltinESMExports(); await f.close(); }
+    }
     // All real entry points converge: watcher starts a pending baseline, heartbeat and
     // another watchlist edit arrive during it. Subscription must use the FIRST baseline.
     {

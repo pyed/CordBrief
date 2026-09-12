@@ -99,6 +99,7 @@ export class DiscordRpcCollector extends EventEmitter {
         this.exchangeDir = options.exchangeDir || process.env.CORDBRIEF_EXCHANGE_DIR || "/var/cordbrief/exchange";
         this.collectorDataDir = options.collectorDataDir || process.env.CORDBRIEF_COLLECTOR_DATA_DIR || path.join(this.exchangeDir, "private");
         this.recoveryStatePath = options.recoveryStatePath || process.env.CORDBRIEF_RECOVERY_STATE_PATH || path.join(this.collectorDataDir, "recovery-state.json");
+        this.recoveryAnchorsPath = this.recoveryStatePath + ".anchors";
         this.runtimeDir = options.runtimeDir || process.env.CORDBRIEF_RUNTIME_DIR || path.join(this.exchangeDir, "runtime");
         this.runtimeLockFile = options.runtimeLockFile || path.join(this.runtimeDir, "runtime.lock");
         this.enableLock = options.enableLock !== undefined ? options.enableLock : true;
@@ -328,7 +329,11 @@ export class DiscordRpcCollector extends EventEmitter {
         if (!this.journalValidated && fs.existsSync(this.eventsDir)) {
             this.initJournal();
         }
+        const anchors = this.loadRecoveryAnchors();
         if (!fs.existsSync(this.recoveryStatePath)) {
+            if (Object.keys(anchors.channels).length > 0) {
+                throw new Error("Recovery state missing for established first-watch channels");
+            }
             if (this.journalChannels && this.journalChannels.size > 0) {
                 throw new Error("Recovery state missing for existing journal channels");
             }
@@ -365,7 +370,46 @@ export class DiscordRpcCollector extends EventEmitter {
                 }
             }
         }
+        this.preserveRecoveryAnchors(parsed, anchors);
         return parsed;
+    }
+
+    // Independent immutable provenance survives zero-message periods and state
+    // loss. Channel identity persists across removal/re-addition, as before.
+    loadRecoveryAnchors() {
+        let raw;
+        try { raw = fs.readFileSync(this.recoveryAnchorsPath, "utf8"); }
+        catch (err) {
+            if (err.code === "ENOENT") return { version: 1, channels: {} };
+            throw err;
+        }
+        const anchors = JSON.parse(raw);
+        if (!anchors || anchors.version !== 1 || !anchors.channels || typeof anchors.channels !== "object" ||
+            Array.isArray(anchors.channels) || Object.entries(anchors.channels).some(([id, baseline]) => !isSnowflake(id) || !isSnowflake(baseline))) {
+            throw new Error("Corrupt recovery anchors: invalid schema");
+        }
+        return anchors;
+    }
+
+    preserveRecoveryAnchors(state, anchors = this.loadRecoveryAnchors()) {
+        for (const [id, baseline] of Object.entries(anchors.channels)) {
+            const ch = state.channels[id];
+            if (!ch || ch.watch_after !== baseline || ch.checkpoint_source === "baseline_pending" || !isSnowflake(ch.checkpoint_message_id)) {
+                throw new Error(`Corrupt recovery-state.json: established baseline missing or changed for ${id}`);
+            }
+        }
+        let changed = false;
+        for (const [id, ch] of Object.entries(state.channels)) {
+            if (ch?.checkpoint_source !== "baseline_pending" && isSnowflake(ch?.watch_after) && isSnowflake(ch?.checkpoint_message_id) &&
+                !Object.hasOwn(anchors.channels, id)) {
+                anchors.channels[id] = ch.watch_after;
+                changed = true;
+            }
+        }
+        // Adopt valid pre-upgrade state before any RPC wait. New anchors commit
+        // BEFORE recovery-state: a crash between files leaves a visible error,
+        // never permission to choose another baseline.
+        if (changed) safeReplaceJSON(this.recoveryAnchorsPath, anchors, 0o600);
     }
 
     /**
@@ -375,6 +419,7 @@ export class DiscordRpcCollector extends EventEmitter {
     saveRecoveryState(state) {
         state.version = 2;
         if (state.pending === undefined) state.pending = null;
+        this.preserveRecoveryAnchors(state);
         safeReplaceJSON(this.recoveryStatePath, state, 0o600);
     }
 
