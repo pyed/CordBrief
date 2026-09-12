@@ -117,13 +117,17 @@ if ($exitCode -ne 0) {
 # 6. Non-echoing verification check in container
 $verifyExit = 0
 try {
-    $vCheck = docker run --rm -v "${TargetVolume}:/var/lib/cordbrief:ro" alpine sh -c '
-        if [ ! -f /var/lib/cordbrief/credentials.json ]; then exit 1; fi
-        mode=$(stat -c %a /var/lib/cordbrief/credentials.json 2>/dev/null || echo unknown)
-        if [ "$mode" != "600" ]; then exit 2; fi
-        if ! grep -q "\"client_id\"" /var/lib/cordbrief/credentials.json || ! grep -q "\"client_secret\"" /var/lib/cordbrief/credentials.json; then exit 3; fi
-        echo OK
-    ' 2>$null
+    $shScript = @'
+set -e
+targetOwner="$1"
+[ -f /var/lib/cordbrief/credentials.json ]
+statOut=$(stat -c "%a %u:%g" /var/lib/cordbrief/credentials.json 2>/dev/null)
+[ "$statOut" = "600 $targetOwner" ]
+grep -q '"client_id"' /var/lib/cordbrief/credentials.json
+grep -q '"client_secret"' /var/lib/cordbrief/credentials.json
+echo OK
+'@
+    $vCheck = $shScript | docker run --rm -i -v "${TargetVolume}:/var/lib/cordbrief:ro" alpine sh -s -- "$TargetOwner" 2>$null
     if ($LASTEXITCODE -ne 0 -or $vCheck.Trim() -ne "OK") { $verifyExit = 1 }
 } catch {
     $verifyExit = 1
