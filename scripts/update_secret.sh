@@ -51,7 +51,7 @@ if [ -z "$plainSecret" ]; then
 fi
 
 # 3. Safely format JSON without exposing or printing the secret
-if command -v python3 >/dev/null 2>&1; then
+if command -v python3 >/dev/null 2>&1 && python3 -c "import sys" >/dev/null 2>&1; then
     PAYLOAD=$(python3 -c "import json, sys; print(json.dumps({'client_id': sys.argv[1], 'client_secret': sys.argv[2]}))" "$CLIENT_ID" "$plainSecret")
 elif command -v node >/dev/null 2>&1; then
     PAYLOAD=$(node -e "console.log(JSON.stringify({client_id: process.argv[1], client_secret: process.argv[2]}))" "$CLIENT_ID" "$plainSecret")
