@@ -24,7 +24,8 @@ export const COLLECTOR_STATES = {
     AUTHORIZATION_REQUIRED: "cordbrief_authorization_required",
     OAUTH_EXCHANGE: "oauth_exchange",
     CATALOG_WATCHLIST_READY: "catalog_watchlist_ready",
-    NORMAL_OPERATION: "running"
+    NORMAL_OPERATION: "running",
+    ERROR: "error"
 };
 
 export const MODES = {
@@ -200,6 +201,31 @@ export class RpcCollectorDaemon extends EventEmitter {
      * Publishes strictly validated collector-status.json to exchange directory.
      */
     publishStatus(extra = {}) {
+        if (this.collector) {
+            const colRec = typeof this.collector.getStatusRecord === "function" ? this.collector.getStatusRecord() : null;
+            if (colRec) {
+                this.activeSegment = colRec.active_segment;
+                this.watchedGeneration = colRec.watched_generation;
+                this.watchedChannelCount = colRec.watched_channel_count;
+                this.catalogState = colRec.catalog_state;
+                this.catalogUpdatedAt = colRec.catalog_updated_at;
+                this.lastEventAt = colRec.last_event_at;
+                this.recoveryState = colRec.recovery_state;
+                this.recoveryLastAt = colRec.recovery_last_at;
+                this.recoveryPendingChannels = colRec.recovery_pending_channels;
+                this.recoveryLastError = colRec.recovery_last_error;
+                if (colRec.last_error) {
+                    this.lastError = colRec.last_error;
+                }
+                if (colRec.collector_state === "error" || colRec.recovery_state === "error") {
+                    this.collectorState = COLLECTOR_STATES.ERROR;
+                } else if (this.collectorState === COLLECTOR_STATES.ERROR && colRec.collector_state === "running" && colRec.recovery_state === "ready" && !colRec.last_error) {
+                    this.collectorState = COLLECTOR_STATES.NORMAL_OPERATION;
+                    this.lastError = null;
+                }
+            }
+        }
+
         const statusRecord = {
             version: 1,
             updated_at: new Date().toISOString(),
@@ -218,7 +244,7 @@ export class RpcCollectorDaemon extends EventEmitter {
             recovery_state: this.recoveryState,
             recovery_last_at: this.recoveryLastAt,
             recovery_pending_channels: this.recoveryPendingChannels,
-            recovery_last_error: this.recoveryLastError
+            recovery_last_error: extra.recoveryLastError !== undefined ? extra.recoveryLastError : this.recoveryLastError
         };
         safeReplaceJSON(path.join(this.exchangeDir, "collector-status.json"), statusRecord);
     }
@@ -564,33 +590,39 @@ export class RpcCollectorDaemon extends EventEmitter {
             client: this.client
         });
 
+        this.collector.on("fatal_error", (fatalErr) => {
+            console.error(`[RPC Daemon] Fatal error from collector: ${fatalErr.message}`);
+            this.collectorState = COLLECTOR_STATES.ERROR;
+            this.lastError = fatalErr.message;
+            this.publishStatus({ lastError: this.lastError });
+            if (this.options.exitOnClose) {
+                process.exit(1);
+            }
+        });
+
         await this.collector.start({
             clientId: this.clientId,
             accessToken
         });
 
-        // State 7: Normal Operation
-        this.transitionTo(COLLECTOR_STATES.NORMAL_OPERATION, MODES.NORMAL, {
-            promptState: null,
-            actionRequired: null,
-            lastError: null
-        });
-
-        console.log(`[RPC Daemon] Official Discord RPC collector is running in normal operation.`);
+        if (this.collector.recoveryStateStatus === "error" || this.collector.collectorState === "error" || this.collector.lastError) {
+            console.warn(`[RPC Daemon] Collector entered error state during startup: ${this.collector.lastError || this.collector.recoveryLastError}`);
+            this.transitionTo(COLLECTOR_STATES.ERROR, MODES.NORMAL, {
+                lastError: this.collector.lastError || this.collector.recoveryLastError
+            });
+        } else {
+            // State 7: Normal Operation
+            this.transitionTo(COLLECTOR_STATES.NORMAL_OPERATION, MODES.NORMAL, {
+                promptState: null,
+                actionRequired: null,
+                lastError: null
+            });
+            console.log(`[RPC Daemon] Official Discord RPC collector is running in normal operation.`);
+        }
 
         // Background status heartbeat
         this.heartbeatTimer = setInterval(() => {
             if (this.stopping) return;
-            if (this.collector) {
-                this.activeSegment = this.collector.activeSegment;
-                this.watchedGeneration = this.collector.watchedGeneration;
-                this.watchedChannelCount = this.collector.watchedChannels ? this.collector.watchedChannels.size : 0;
-                this.catalogState = this.collector.catalog ? "ready" : "unavailable";
-                this.catalogUpdatedAt = this.collector.catalogUpdatedAt;
-                this.lastEventAt = this.collector.lastEventAt;
-                this.recoveryState = this.collector.recoveryState;
-                this.recoveryPendingChannels = this.collector.recoveryPendingChannels;
-            }
             this.publishStatus();
         }, 5000);
     }

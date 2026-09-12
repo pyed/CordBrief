@@ -8,6 +8,7 @@
 
 import * as fs from "fs";
 import * as path from "path";
+import { EventEmitter } from "events";
 import { RpcTransport } from "./transport.mjs";
 import { DiscordRpcClient } from "./protocol.mjs";
 import {
@@ -92,8 +93,9 @@ export function normalizeDiscordMessage(message, explicitGuildId = "", explicitC
     };
 }
 
-export class DiscordRpcCollector {
+export class DiscordRpcCollector extends EventEmitter {
     constructor(options = {}) {
+        super();
         this.exchangeDir = options.exchangeDir || process.env.CORDBRIEF_EXCHANGE_DIR || "/var/cordbrief/exchange";
         this.collectorDataDir = options.collectorDataDir || process.env.CORDBRIEF_COLLECTOR_DATA_DIR || path.join(this.exchangeDir, "private");
         this.recoveryStatePath = options.recoveryStatePath || process.env.CORDBRIEF_RECOVERY_STATE_PATH || path.join(this.collectorDataDir, "recovery-state.json");
@@ -104,6 +106,7 @@ export class DiscordRpcCollector {
 
         this.eventsDir = path.join(this.exchangeDir, "events");
         this.maxSegmentSize = options.maxSegmentSize || parseInt(process.env.CORDBRIEF_MAX_SEGMENT_SIZE || String(DEFAULT_MAX_SEGMENT_SIZE), 10);
+        this.syncDirectoryFn = options.syncDirectoryFn || syncDirectory;
 
         this.transport = options.transport || new RpcTransport({ socketPath: options.socketPath });
         this.client = options.client || new DiscordRpcClient(this.transport);
@@ -112,6 +115,8 @@ export class DiscordRpcCollector {
         this.currentSegmentPath = "";
         this.currentSegmentSize = 0;
 
+        this.collectorState = "starting";
+        this.fatalError = null;
         this.lastEventAt = null;
         this.lastError = null;
         this.authenticated = false;
@@ -142,6 +147,32 @@ export class DiscordRpcCollector {
         this.cachedWatchlist = { valid: false, generation: -1, channel_ids: [] };
         this.heartbeatTimer = null;
         this.stopping = false;
+    }
+
+    /**
+     * Enters terminal fail-stop state when journal write uncertainty occurs.
+     * Halts further appends in-process and emits fatal_error for supervisor restart.
+     * @param {string} reason
+     */
+    failStop(reason) {
+        this.fatalError = reason;
+        this.lastError = reason;
+        this.collectorState = "error";
+        this.stopping = true;
+        this.writeStatus("error");
+        this.emit("fatal_error", new Error(reason));
+    }
+
+    /**
+     * Checks whether durable journal segments or retired sidecars contain prior collection evidence for this channel.
+     * @param {string} channelId
+     * @returns {boolean}
+     */
+    hasPriorCollectionEvidence(channelId) {
+        if (!this.journalValidated && fs.existsSync(this.eventsDir)) {
+            this.initJournal();
+        }
+        return Boolean(this.journalChannels && this.journalChannels.has(channelId));
     }
 
     /**
@@ -252,6 +283,9 @@ export class DiscordRpcCollector {
      * @returns {object}
      */
     loadRecoveryState() {
+        if (!this.journalValidated && fs.existsSync(this.eventsDir)) {
+            this.initJournal();
+        }
         if (!fs.existsSync(this.recoveryStatePath)) {
             if (this.journalChannels && this.journalChannels.size > 0) {
                 throw new Error("Recovery state missing for existing journal channels");
@@ -280,6 +314,10 @@ export class DiscordRpcCollector {
                 if (!parsed.channels[chId]) {
                     throw new Error(`Corrupt recovery-state.json: existing journal channel ${chId} missing from recovery state`);
                 }
+                const ch = parsed.channels[chId];
+                if (ch.checkpoint_source === "baseline_pending" || !ch.checkpoint_message_id) {
+                    throw new Error(`Corrupt recovery-state.json: existing journal channel ${chId} has invalid unanchored baseline_pending state`);
+                }
             }
         }
         return parsed;
@@ -301,11 +339,11 @@ export class DiscordRpcCollector {
      * @param {string} channelId
      */
     beginChannelInitialization(channelId) {
-        const state = this.loadRecoveryState();
-        if (state.channels[channelId]?.checkpoint_message_id) return;
-        if (this.journalChannels && this.journalChannels.has(channelId)) {
+        if (this.hasPriorCollectionEvidence(channelId)) {
             throw new Error(`Cannot initialize existing journal channel ${channelId} as new first-watch channel`);
         }
+        const state = this.loadRecoveryState();
+        if (state.channels[channelId]?.checkpoint_message_id) return;
 
         state.channels[channelId] = {
             checkpoint_message_id: "",
@@ -330,10 +368,16 @@ export class DiscordRpcCollector {
      */
     appendEvents(events) {
         if (!events || events.length === 0) return 0;
+        if (this.fatalError) {
+            throw new Error(`Collector is in fail-stop state: ${this.fatalError}`);
+        }
         if (!this.journalValidated) this.initJournal();
 
         let appendedCount = 0;
         for (const evt of events) {
+            if (this.fatalError) {
+                throw new Error(`Collector is in fail-stop state: ${this.fatalError}`);
+            }
             if (!isSnowflake(evt.message_id) || !isSnowflake(evt.channel_id)) continue;
 
             // 1. Cache hit check
@@ -377,10 +421,19 @@ export class DiscordRpcCollector {
 
             const isNewFile = !fs.existsSync(this.currentSegmentPath);
             const fd = fs.openSync(this.currentSegmentPath, "a");
+            let fileWritten = false;
             try {
                 fs.writeFileSync(fd, buf);
                 fs.fsyncSync(fd);
-                if (isNewFile) syncDirectory(this.eventsDir);
+                fileWritten = true;
+                if (isNewFile) (this.syncDirectoryFn || syncDirectory)(this.eventsDir);
+            } catch (ioErr) {
+                if (fileWritten) {
+                    const fatalMsg = `Fatal journal error: directory sync failed after writing record ${evt.message_id}: ${ioErr.message}`;
+                    this.failStop(fatalMsg);
+                    throw new Error(fatalMsg);
+                }
+                throw ioErr;
             } finally {
                 fs.closeSync(fd);
             }
@@ -402,7 +455,9 @@ export class DiscordRpcCollector {
         }
 
         if (appendedCount > 0) {
-            this.writeStatus("running");
+            if (this.collectorState !== "error") {
+                this.writeStatus("running");
+            }
         }
         return appendedCount;
     }
@@ -533,7 +588,7 @@ export class DiscordRpcCollector {
         const targetIds = wl.valid ? new Set(wl.channel_ids) : new Set();
         this.watchedChannelCount = targetIds.size;
 
-        // Channels to subscribe
+        // Channels to subscribe or retry recovery
         for (const chId of targetIds) {
             if (!this.activeSubscriptions.has(chId)) {
                 try {
@@ -543,6 +598,8 @@ export class DiscordRpcCollector {
                 } catch (err) {
                     this.lastError = `Subscribe failed for ${chId}: ${err?.message || String(err)}`;
                 }
+            } else if (this.recoveryStateStatus === "error") {
+                await this.recoverChannelSnapshot(chId);
             }
         }
 
@@ -556,7 +613,17 @@ export class DiscordRpcCollector {
             }
         }
 
-        this.writeStatus("running");
+        if (this.recoveryStateStatus === "ready" && this.lastError && this.lastError.startsWith("Recovery failed for")) {
+            this.lastError = null;
+        }
+
+        if (this.recoveryStateStatus === "error" || this.lastError) {
+            this.collectorState = "error";
+            this.writeStatus("error");
+        } else {
+            this.collectorState = "running";
+            this.writeStatus("running");
+        }
     }
 
     /**
@@ -581,6 +648,9 @@ export class DiscordRpcCollector {
 
             if (messages.length === 0) {
                 if (chState.checkpoint_source === "baseline_pending") {
+                    if (this.hasPriorCollectionEvidence(channelId)) {
+                        throw new Error(`Cannot re-anchor channel ${channelId}: channel has existing durable collection evidence but recovery state is baseline_pending`);
+                    }
                     chState.watch_after = "0";
                     chState.checkpoint_message_id = "0";
                     chState.checkpoint_source = "rpc";
@@ -599,6 +669,9 @@ export class DiscordRpcCollector {
 
             // First-watch anchor policy: establish watch_after from the latest visible message H
             if (chState.checkpoint_source === "baseline_pending") {
+                if (this.hasPriorCollectionEvidence(channelId)) {
+                    throw new Error(`Cannot re-anchor channel ${channelId}: channel has existing durable collection evidence but recovery state is baseline_pending`);
+                }
                 const latestMsg = messages[messages.length - 1];
                 const watchAfter = deriveFirstWatchBoundary(latestMsg.id);
                 chState.watch_after = watchAfter;
@@ -634,11 +707,19 @@ export class DiscordRpcCollector {
             this.recoveryStateStatus = "ready";
             this.recoveryLastAt = new Date().toISOString();
             this.recoveryLastError = null;
+            if (this.lastError && this.lastError.startsWith("Recovery failed for")) {
+                this.lastError = null;
+            }
+            if (this.collectorState === "error" && !this.fatalError) {
+                this.collectorState = "running";
+                this.writeStatus("running");
+            }
             return appended;
         } catch (err) {
             this.recoveryStateStatus = "error";
             this.recoveryLastError = `Recovery failed for ${channelId}: ${err?.message || String(err)}`;
             this.lastError = this.recoveryLastError;
+            this.collectorState = "error";
             try {
                 const state = this.loadRecoveryState();
                 if (state.channels[channelId]) {
@@ -648,7 +729,7 @@ export class DiscordRpcCollector {
                     this.saveRecoveryState(state);
                 }
             } catch {}
-            this.writeStatus("running");
+            this.writeStatus("error");
             return 0;
         }
     }
@@ -659,6 +740,10 @@ export class DiscordRpcCollector {
      */
     handleMessageCreate(dispatchData) {
         if (!dispatchData) return;
+        if (this.fatalError) {
+            console.error(`[RPC Collector] Refusing live message append: collector is in fail-stop state (${this.fatalError})`);
+            return;
+        }
         const msg = dispatchData.message || dispatchData;
         if (!msg || !msg.id) return;
         const chId = String(dispatchData.channel_id || msg.channel_id || "");
@@ -667,6 +752,12 @@ export class DiscordRpcCollector {
 
         // Fail-closed: only record if channel is currently in active subscriptions
         if (!this.activeSubscriptions.has(chId)) {
+            return;
+        }
+
+        if (this.recoveryStateStatus === "error") {
+            console.error(`[RPC Collector] Refusing live message append due to recovery state error: ${this.recoveryLastError}`);
+            this.lastError = `Recovery state error: ${this.recoveryLastError}`;
             return;
         }
 
@@ -699,29 +790,38 @@ export class DiscordRpcCollector {
     }
 
     /**
+     * Authoritative telemetry snapshot for collector-status.json conforming to Schema v1.
+     */
+    getStatusRecord() {
+        return {
+            version: 1,
+            updated_at: new Date().toISOString(),
+            mode: "normal",
+            collector_state: this.collectorState,
+            discord_authenticated: this.authenticated,
+            catalog_state: this.catalogState,
+            catalog_updated_at: this.catalogUpdatedAt,
+            watched_generation: this.watchedGeneration,
+            watched_channel_count: this.watchedChannelCount,
+            active_segment: this.currentSegmentNumber,
+            last_event_at: this.lastEventAt,
+            last_error: this.lastError,
+            prompt_state: null,
+            action_required: null,
+            recovery_state: this.recoveryStateStatus,
+            recovery_last_at: this.recoveryLastAt,
+            recovery_pending_channels: 0,
+            recovery_last_error: this.recoveryLastError
+        };
+    }
+
+    /**
      * Writes operational telemetry to collector-status.json conforming to Schema v1.
      */
-    writeStatus(state = "running") {
+    writeStatus(state = null) {
+        if (state) this.collectorState = state;
         try {
-            const statusRecord = {
-                version: 1,
-                updated_at: new Date().toISOString(),
-                mode: "normal",
-                collector_state: state,
-                discord_authenticated: this.authenticated,
-                catalog_state: this.catalogState,
-                catalog_updated_at: this.catalogUpdatedAt,
-                watched_generation: this.watchedGeneration,
-                watched_channel_count: this.watchedChannelCount,
-                active_segment: this.currentSegmentNumber,
-                last_event_at: this.lastEventAt,
-                last_error: this.lastError,
-                recovery_state: this.recoveryStateStatus,
-                recovery_last_at: this.recoveryLastAt,
-                recovery_pending_channels: 0,
-                recovery_last_error: this.recoveryLastError
-            };
-
+            const statusRecord = this.getStatusRecord();
             const statusPath = path.join(this.exchangeDir, "collector-status.json");
             safeReplaceJSON(statusPath, statusRecord);
         } catch (err) {
@@ -786,11 +886,13 @@ export class DiscordRpcCollector {
                 });
             } catch {}
 
-            this.writeStatus("running");
-            this.heartbeatTimer = setInterval(() => {
-                if (this.stopping) return;
+            if (this.recoveryStateStatus === "error" || this.lastError) {
+                this.collectorState = "error";
+                this.writeStatus("error");
+            } else {
+                this.collectorState = "running";
                 this.writeStatus("running");
-            }, 10000);
+            }
         } catch (err) {
             if (this.lockHandle) {
                 this.lockHandle.release();

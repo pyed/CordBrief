@@ -168,9 +168,147 @@ async function runLoginRequiredSlowReadyTest() {
     }
 }
 
+async function runDaemonRecoveryErrorVisibilityTest() {
+    const tmpExchange = path.join(os.tmpdir(), `cordbrief-daemon-rec-err-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+    fs.mkdirSync(tmpExchange, { recursive: true });
+    const privateDir = path.join(tmpExchange, "private");
+    fs.mkdirSync(privateDir, { recursive: true });
+
+    const DISCORD_EPOCH = 1420070400000n;
+    const t0 = 1750000000000n;
+    const msg1 = (((t0 - DISCORD_EPOCH) << 22n) | 1n).toString();
+
+    // 1. Seed existing journal so channel 2001 has prior durable collection evidence
+    const eventsDir = path.join(tmpExchange, "events");
+    fs.mkdirSync(eventsDir, { recursive: true });
+    const seg1 = path.join(eventsDir, "0000000000000001.ndjson");
+    fs.writeFileSync(seg1, JSON.stringify({
+        version: 1,
+        event: "message_create",
+        id: msg1,
+        message_id: msg1,
+        channel_id: "2001",
+        guild_id: "1001",
+        content: "Prior msg",
+        timestamp: new Date().toISOString()
+    }) + "\n");
+
+    // 2. Corrupt/unanchored recovery state for channel 2001: baseline_pending
+    const recoveryStateFile = path.join(privateDir, "recovery-state.json");
+    fs.writeFileSync(recoveryStateFile, JSON.stringify({
+        version: 2,
+        channels: {
+            "2001": {
+                checkpoint_message_id: "",
+                checkpoint_source: "baseline_pending",
+                watch_after: ""
+            }
+        },
+        pending: null
+    }));
+
+    // 3. Watchlist watching channel 2001
+    fs.writeFileSync(path.join(tmpExchange, "watchlist.json"), JSON.stringify({
+        version: 1,
+        generation: 1,
+        channel_ids: ["2001"]
+    }));
+
+    // 4. Seed mock Discord server
+    const mock = new MockDiscordRpcServer({
+        guilds: [{ id: "1001", name: "Alpha Guild" }],
+        channelsByGuild: { "1001": [{ id: "2001", name: "general", type: 0 }] },
+        channelData: {
+            "2001": {
+                id: "2001",
+                name: "general",
+                type: 0,
+                guild_id: "1001",
+                messages: [
+                    { id: msg1, channel_id: "2001", content: "Prior msg", timestamp: new Date().toISOString() }
+                ]
+            }
+        }
+    });
+    const pipePath = await mock.start();
+
+    const transport = new RpcTransport({ socketPath: pipePath });
+    const client = new DiscordRpcClient(transport);
+
+    const daemon = new RpcCollectorDaemon({
+        exchangeDir: tmpExchange,
+        collectorDataDir: privateDir,
+        runtimeDir: path.join(tmpExchange, "runtime"),
+        clientId: "test_daemon_client",
+        clientSecret: "test_daemon_secret",
+        tokenPath: path.join(privateDir, "oauth-token.json"),
+        transport,
+        client,
+        mockXpra: true
+    });
+
+    daemon.saveToken({
+        accessToken: "test_daemon_token_123",
+        refreshToken: "test_refresh_token_456",
+        expiresIn: 3600
+    });
+
+    const statusFile = path.join(tmpExchange, "collector-status.json");
+
+    try {
+        await daemon.start();
+
+        // Verify that recovery failure on channel 2001 caused daemon to enter error state
+        assert.strictEqual(daemon.collectorState, "error", "Daemon collectorState must be 'error'");
+        assert.ok(fs.existsSync(statusFile));
+        const status1 = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+        assert.strictEqual(status1.collector_state, "error", "status.json collector_state must be 'error'");
+        assert.strictEqual(status1.recovery_state, "error", "status.json recovery_state must be 'error'");
+        assert.ok(status1.last_error && status1.last_error.includes("baseline_pending"), `last_error must contain recovery failure reason: ${status1.last_error}`);
+        assert.ok(status1.recovery_last_error && status1.recovery_last_error.includes("baseline_pending"));
+
+        // Verify heartbeats do NOT overwrite error state with running
+        daemon.publishStatus();
+        const statusHb = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+        assert.strictEqual(statusHb.collector_state, "error", "Heartbeat must preserve collector_state: 'error'");
+        assert.strictEqual(statusHb.recovery_state, "error", "Heartbeat must preserve recovery_state: 'error'");
+        assert.ok(statusHb.last_error, "Heartbeat must preserve last_error");
+
+        // Verify recovery: repair recovery-state.json with valid checkpoint
+        fs.writeFileSync(recoveryStateFile, JSON.stringify({
+            version: 2,
+            channels: {
+                "2001": {
+                    checkpoint_message_id: msg1,
+                    checkpoint_source: "rpc",
+                    watch_after: msg1
+                }
+            },
+            pending: null
+        }));
+
+        // Reconcile and recover
+        await daemon.collector.reconcileWatchlist();
+        daemon.publishStatus();
+
+        const statusRecovered = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+        assert.strictEqual(statusRecovered.collector_state, "running", "Once recovery succeeds, status returns to 'running'");
+        assert.strictEqual(statusRecovered.recovery_state, "ready", "recovery_state must return to 'ready'");
+        assert.strictEqual(statusRecovered.last_error, null, "last_error must be cleared upon clean recovery");
+
+        await daemon.stop();
+        console.log("rpc_daemon_test (recovery error visibility) passed");
+    } finally {
+        await daemon.stop().catch(() => {});
+        await mock.stop().catch(() => {});
+        try { fs.rmSync(tmpExchange, { recursive: true, force: true }); } catch {}
+    }
+}
+
 async function main() {
     await runDaemonTest();
     await runLoginRequiredSlowReadyTest();
+    await runDaemonRecoveryErrorVisibilityTest();
 }
 
 main().catch(err => {

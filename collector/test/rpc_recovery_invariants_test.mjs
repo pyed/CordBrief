@@ -17,11 +17,16 @@ import assert from "assert";
 import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
+import * as crypto from "crypto";
 import { MockDiscordRpcServer } from "./mock_discord_rpc.mjs";
 import { DiscordRpcCollector } from "../rpc/collector.mjs";
 import { RpcTransport } from "../rpc/transport.mjs";
 import { DiscordRpcClient } from "../rpc/protocol.mjs";
 import { deriveFirstWatchBoundary } from "../rpc/retention.mjs";
+
+function sha256(buf) {
+    return crypto.createHash("sha256").update(buf).digest("hex");
+}
 
 const DISCORD_EPOCH = 1420070400000n;
 
@@ -35,7 +40,10 @@ function makeSnowflake(timestampMs, seq = 0) {
 
 function makeNormalizedMessage(id, channelId = "2001", content = `Message ${id}`) {
     return {
+        version: 1,
+        event: "message_create",
         id: String(id),
+        message_id: String(id),
         channel_id: String(channelId),
         guild_id: "1001",
         content: String(content),
@@ -430,7 +438,9 @@ async function runTests() {
         await client.authenticate("test_token");
 
         // Step 1: Channel 2001 is initially watched and captures message 1
-        const msg1 = "1545225000000000101";
+        const t0 = 1750000000000n;
+        const msg1 = ((t0 << 22n) | 1n).toString();
+        const msg2 = (((t0 + 5000n) << 22n) | 1n).toString(); // 5000ms later (distinct millisecond timestamp)
         mock.channelData["2001"] = {
             id: "2001",
             name: "general",
@@ -442,8 +452,7 @@ async function runTests() {
         const validState = collector.loadRecoveryState();
         assert.strictEqual(validState.channels["2001"].checkpoint_message_id, msg1);
 
-        // Step 2: Collector offline. Outage message 2 occurs in Discord
-        const msg2 = "1545225000000000102";
+        // Step 2: Collector offline. Outage message 2 occurs in Discord (distinct millisecond)
         mock.channelData["2001"].messages.push(makeNormalizedMessage(msg2, "2001", "Outage message 2"));
 
         // Step 3: recovery-state.json becomes corrupt (truncated/invalid JSON)
@@ -458,13 +467,13 @@ async function runTests() {
         // Verify beginChannelInitialization() refuses to re-initialize an existing journal channel with corrupt state
         assert.throws(() => {
             collector.beginChannelInitialization("2001");
-        }, /Corrupt recovery-state\.json/);
+        }, /Corrupt recovery-state\.json|Cannot initialize existing/);
 
         // Verify beginChannelInitialization() refuses to re-anchor an existing journal channel missing checkpoint
         fs.writeFileSync(recoveryStateFile, JSON.stringify({ version: 2, channels: { "2001": {} } }));
         assert.throws(() => {
             collector.beginChannelInitialization("2001");
-        }, /Cannot initialize existing journal channel 2001/);
+        }, /Cannot initialize existing journal channel 2001|Corrupt recovery-state\.json/);
 
         // Re-corrupt recovery-state.json for snapshot and live-append fail-closed tests
         fs.writeFileSync(recoveryStateFile, "{\"version\": 2, \"channels\": { CORRUPT_DATA...");
@@ -474,6 +483,7 @@ async function runTests() {
         const recoveredCount = await collector.recoverChannelSnapshot("2001");
         assert.strictEqual(recoveredCount, 0, "Recovery must fail closed on corrupt recovery state");
         assert.strictEqual(collector.recoveryStateStatus, "error");
+        assert.strictEqual(collector.collectorState, "error");
         assert.ok(collector.recoveryLastError.includes("Corrupt recovery-state.json"));
 
         // Verify the corrupt recovery-state file was NOT overwritten with a clean baseline
@@ -484,7 +494,7 @@ async function runTests() {
         collector.activeSubscriptions.add("2001");
         collector.handleMessageCreate({
             channel_id: "2001",
-            message: makeNormalizedMessage("1545225000000000103", "2001", "Live message during corruption")
+            message: makeNormalizedMessage((((t0 + 10000n) << 22n) | 1n).toString(), "2001", "Live message during corruption")
         });
         assert.ok(collector.lastError.includes("Recovery state error"), "Must refuse live appends against corrupt recovery state");
 
@@ -498,6 +508,314 @@ async function runTests() {
         await mock.stop();
         try { fs.rmSync(tmpExchange, { recursive: true, force: true }); } catch {}
         console.log("  ✔ Corrupt recovery state fail-closed protection verified: outage messages cannot be lost.");
+    }
+
+    // =========================================================================
+    // Invariant 7: Uncertain journal append fail-stop after directory fsync failure
+    // =========================================================================
+    {
+        console.log("\n[Invariant 7] Uncertain journal append fail-stop after directory fsync failure...");
+        const tmpExchange = path.join(os.tmpdir(), `cordbrief-invar7-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+        fs.mkdirSync(tmpExchange, { recursive: true });
+        const privateDir = path.join(tmpExchange, "private");
+        fs.mkdirSync(privateDir, { recursive: true });
+
+        let dirSyncFail = false;
+        const faultSyncDir = (dir) => {
+            if (dirSyncFail) {
+                const err = new Error("EIO: input/output error during directory sync");
+                err.code = "EIO";
+                throw err;
+            }
+        };
+
+        const collector1 = new DiscordRpcCollector({
+            exchangeDir: tmpExchange,
+            collectorDataDir: privateDir,
+            runtimeDir: path.join(tmpExchange, "runtime"),
+            enableLock: false,
+            syncDirectoryFn: faultSyncDir
+        });
+        collector1.initJournal();
+
+        const t0 = 1750000000000n;
+        const msg1 = ((t0 << 22n) | 1n).toString();
+        const evt1 = makeNormalizedMessage(msg1, "2001", "Uncertain append message");
+
+        // Inject directory sync failure
+        dirSyncFail = true;
+
+        let fatalErrorFired = false;
+        collector1.on("fatal_error", (err) => {
+            fatalErrorFired = true;
+        });
+
+        // Appending must throw a fatal journal error because the record was written to the file
+        // but directory fsync failed, leaving durability/bookkeeping uncertain.
+        assert.throws(() => {
+            collector1.appendEvents([evt1]);
+        }, /Fatal journal error: directory sync failed/);
+
+        // Collector must enter fail-stop state
+        assert.strictEqual(fatalErrorFired, true, "Must emit fatal_error on uncertain append");
+        assert.strictEqual(collector1.collectorState, "error");
+        assert.ok(collector1.fatalError.includes("directory sync failed"));
+        assert.strictEqual(collector1.stopping, true);
+
+        // A second append in the same running collector must be rejected immediately
+        assert.throws(() => {
+            collector1.appendEvents([evt1]);
+        }, /Collector is in fail-stop state/);
+
+        // Verify status file reflects error, not running
+        const statusFile = path.join(tmpExchange, "collector-status.json");
+        assert.ok(fs.existsSync(statusFile));
+        const statusRecord = JSON.parse(fs.readFileSync(statusFile, "utf8"));
+        assert.strictEqual(statusRecord.collector_state, "error");
+        assert.ok(statusRecord.last_error.includes("Fatal journal error"));
+
+        // Verify that the record reached the physical segment file on disk
+        const rawRecords = readAllJournalRecords(tmpExchange);
+        assert.strictEqual(rawRecords.length, 1, "Record was fsynced to segment before directory sync failed");
+        assert.strictEqual(rawRecords[0].message_id, msg1);
+
+        // Simulate supervisor restart: create fresh collector instance on same directory
+        dirSyncFail = false;
+        const collector2 = new DiscordRpcCollector({
+            exchangeDir: tmpExchange,
+            collectorDataDir: privateDir,
+            runtimeDir: path.join(tmpExchange, "runtime"),
+            enableLock: false,
+            syncDirectoryFn: faultSyncDir
+        });
+        collector2.initJournal();
+
+        // Verify startup rebuild identified the physical record and dedupes it
+        assert.strictEqual(collector2.journalRecordCount, 1);
+        assert.strictEqual(collector2.recentMessageIds.has(msg1), true);
+
+        // Retry the exact same event on the restarted collector
+        const appendedOnRestart = collector2.appendEvents([evt1]);
+        assert.strictEqual(appendedOnRestart, 0, "Restarted collector must dedupe existing record");
+
+        // Verify NO duplicate record was created in the physical journal
+        const recordsAfterRestart = readAllJournalRecords(tmpExchange);
+        assert.strictEqual(recordsAfterRestart.length, 1, "Exactly one record must exist in journal");
+
+        try { fs.rmSync(tmpExchange, { recursive: true, force: true }); } catch {}
+        console.log("  ✔ Uncertain append fail-stop & restart deduplication verified.");
+    }
+
+    // =========================================================================
+    // Invariant 8: Pending-baseline restart protection against re-anchoring existing channels
+    // =========================================================================
+    {
+        console.log("\n[Invariant 8] Pending-baseline restart protection against re-anchoring existing channels...");
+        const tmpExchange = path.join(os.tmpdir(), `cordbrief-invar8-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+        fs.mkdirSync(tmpExchange, { recursive: true });
+        const privateDir = path.join(tmpExchange, "private");
+        fs.mkdirSync(privateDir, { recursive: true });
+
+        const t0 = 1750000000000n;
+        const msg1 = ((t0 << 22n) | 1n).toString();
+        const msg2 = (((t0 + 5000n) << 22n) | 1n).toString(); // 5s later
+        const msg3 = (((t0 + 10000n) << 22n) | 1n).toString(); // 10s later
+        const msgNewCh = (((t0 + 15000n) << 22n) | 1n).toString(); // 15s later
+
+        const mock = new MockDiscordRpcServer({
+            guilds: [{ id: "1001", name: "Alpha Guild" }],
+            channelsByGuild: { "1001": [
+                { id: "2001", name: "test-channel", type: 0 },
+                { id: "3001", name: "brand-new-channel", type: 0 }
+            ] },
+            channelData: {
+                "2001": {
+                    id: "2001",
+                    name: "test-channel",
+                    type: 0,
+                    guild_id: "1001",
+                    messages: [
+                        makeNormalizedMessage(msg1, "2001", "Msg 1"),
+                        makeNormalizedMessage(msg2, "2001", "Msg 2 (outage)"),
+                        makeNormalizedMessage(msg3, "2001", "Msg 3 (latest)")
+                    ]
+                },
+                "3001": {
+                    id: "3001",
+                    name: "brand-new-channel",
+                    type: 0,
+                    guild_id: "1001",
+                    messages: [
+                        makeNormalizedMessage(msgNewCh, "3001", "New channel seed")
+                    ]
+                }
+            }
+        });
+        const pipePath = await mock.start();
+        const transport = new RpcTransport({ socketPath: pipePath });
+        const client = new DiscordRpcClient(transport);
+        await transport.connect("test_app");
+        await client.authenticate("test_token");
+
+        // 1. Pre-seed durable journal with Msg 1 for channel 2001
+        const collectorSetup = new DiscordRpcCollector({
+            exchangeDir: tmpExchange,
+            collectorDataDir: privateDir,
+            runtimeDir: path.join(tmpExchange, "runtime"),
+            transport,
+            client,
+            enableLock: false
+        });
+        collectorSetup.initJournal();
+        collectorSetup.appendEvents([makeNormalizedMessage(msg1, "2001", "Msg 1")]);
+        assert.strictEqual(readAllJournalRecords(tmpExchange).length, 1);
+
+        // 2. Simulate interrupted initialization / crash:
+        // recovery-state.json has baseline_pending for channel 2001 (unanchored / no checkpoint)
+        const recoveryStateFile = path.join(privateDir, "recovery-state.json");
+        fs.writeFileSync(recoveryStateFile, JSON.stringify({
+            version: 2,
+            channels: {
+                "2001": {
+                    checkpoint_message_id: "",
+                    checkpoint_source: "baseline_pending",
+                    watch_after: ""
+                }
+            },
+            pending: null
+        }));
+
+        // 3. Process restarts: new collector starts against existing durable journal
+        const collector = new DiscordRpcCollector({
+            exchangeDir: tmpExchange,
+            collectorDataDir: privateDir,
+            runtimeDir: path.join(tmpExchange, "runtime"),
+            transport,
+            client,
+            enableLock: false
+        });
+        collector.initJournal();
+
+        // Verify channel 2001 has prior collection evidence in physical journal
+        assert.strictEqual(collector.hasPriorCollectionEvidence("2001"), true);
+
+        // 4. recoverChannelSnapshot("2001") MUST FAIL CLOSED:
+        // Must NOT silently re-anchor to msg3 and skip outage msg2!
+        const recovered = await collector.recoverChannelSnapshot("2001");
+        assert.strictEqual(recovered, 0, "Recovery must fail closed");
+        assert.strictEqual(collector.recoveryStateStatus, "error");
+        assert.strictEqual(collector.collectorState, "error");
+        assert.ok(collector.recoveryLastError.includes("baseline_pending") || collector.recoveryLastError.includes("existing durable"));
+
+        // Verify state on disk was NOT updated to re-anchor to msg3
+        const diskState = JSON.parse(fs.readFileSync(recoveryStateFile, "utf8"));
+        assert.notStrictEqual(diskState.channels["2001"].checkpoint_message_id, msg3);
+        assert.notStrictEqual(diskState.channels["2001"].watch_after, msg3);
+
+        // 5. Test adding a genuinely new channel (3001) to an existing installation:
+        // First repair 2001 state so recovery state is valid
+        fs.writeFileSync(recoveryStateFile, JSON.stringify({
+            version: 2,
+            channels: {
+                "2001": {
+                    checkpoint_message_id: msg1,
+                    checkpoint_source: "rpc",
+                    watch_after: msg1
+                }
+            },
+            pending: null
+        }));
+        assert.strictEqual(collector.hasPriorCollectionEvidence("3001"), false);
+        const newChRecovered = await collector.recoverChannelSnapshot("3001");
+        assert.strictEqual(newChRecovered, 1, "Baseline anchor consumes seed message in anchor millisecond");
+        const diskStateAfter = JSON.parse(fs.readFileSync(recoveryStateFile, "utf8"));
+        assert.strictEqual(diskStateAfter.channels["3001"].checkpoint_source, "rpc");
+        assert.ok(diskStateAfter.channels["3001"].checkpoint_message_id.length > 0);
+
+        // 6. Test legitimate fresh install (clean installation: zero journal, zero recovery state)
+        const freshExchange = path.join(os.tmpdir(), `cordbrief-fresh-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+        fs.mkdirSync(freshExchange, { recursive: true });
+        const freshPrivate = path.join(freshExchange, "private");
+        fs.mkdirSync(freshPrivate, { recursive: true });
+
+        const freshCollector = new DiscordRpcCollector({
+            exchangeDir: freshExchange,
+            collectorDataDir: freshPrivate,
+            runtimeDir: path.join(freshExchange, "runtime"),
+            transport,
+            client,
+            enableLock: false
+        });
+        freshCollector.initJournal();
+        assert.strictEqual(freshCollector.hasPriorCollectionEvidence("3001"), false);
+        const freshRecovered = await freshCollector.recoverChannelSnapshot("3001");
+        assert.strictEqual(freshRecovered, 1);
+        assert.strictEqual(freshCollector.recoveryStateStatus, "ready");
+        const freshState = freshCollector.loadRecoveryState();
+        assert.strictEqual(freshState.channels["3001"].checkpoint_source, "rpc");
+
+        // 7. Test retired journal evidence: retired sidecars count as prior collection evidence
+        const retiredExchange = path.join(os.tmpdir(), `cordbrief-retired-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+        fs.mkdirSync(retiredExchange, { recursive: true });
+        const retiredEvents = path.join(retiredExchange, "events");
+        fs.mkdirSync(retiredEvents, { recursive: true });
+        fs.writeFileSync(path.join(retiredEvents, "0000000000000002.ndjson"), "");
+        const retentionDir = path.join(retiredExchange, "retention");
+        fs.mkdirSync(retentionDir, { recursive: true });
+
+        const seg1Records = [
+            {
+                message_id: msg1,
+                channel_id: "4001",
+                offset: 0,
+                next_offset: 100
+            }
+        ];
+        const sidecar1 = {
+            version: 1,
+            segment: 1,
+            size: 100,
+            sha256: "0".repeat(64),
+            records: seg1Records
+        };
+        const sidecar1Buf = Buffer.from(JSON.stringify(sidecar1, null, 2), "utf8");
+        fs.writeFileSync(path.join(retentionDir, "0000000000000001.ids.json"), sidecar1Buf);
+
+        const manifest = {
+            version: 1,
+            retired_through: 1,
+            segments: [
+                {
+                    segment: 1,
+                    size: 100,
+                    sha256: "0".repeat(64),
+                    sidecar_sha256: sha256(sidecar1Buf)
+                }
+            ]
+        };
+        fs.writeFileSync(path.join(retiredExchange, "retention-manifest.json"), JSON.stringify(manifest, null, 2), "utf8");
+
+        const retiredCollector = new DiscordRpcCollector({
+            exchangeDir: retiredExchange,
+            collectorDataDir: path.join(retiredExchange, "private"),
+            runtimeDir: path.join(retiredExchange, "runtime"),
+            transport,
+            client,
+            enableLock: false
+        });
+        retiredCollector.initJournal();
+        assert.strictEqual(retiredCollector.hasPriorCollectionEvidence("4001"), true, "Retired sidecar evidence must be recognized");
+        assert.throws(
+            () => retiredCollector.beginChannelInitialization("4001"),
+            /Cannot initialize existing journal channel 4001 as new first-watch channel/
+        );
+
+        transport.close();
+        await mock.stop();
+        try { fs.rmSync(tmpExchange, { recursive: true, force: true }); } catch {}
+        try { fs.rmSync(freshExchange, { recursive: true, force: true }); } catch {}
+        try { fs.rmSync(retiredExchange, { recursive: true, force: true }); } catch {}
+        console.log("  ✔ Pending-baseline restart protection verified: cannot re-anchor existing channels.");
     }
 
     console.log("rpc_recovery_invariants_tests_passed");
