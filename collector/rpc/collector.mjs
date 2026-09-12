@@ -37,7 +37,7 @@ function syncDirectory(dir) {
     }
 }
 
-export function safeReplaceJSON(destinationPath, data, mode = 0o644) {
+export function safeReplaceJSON(destinationPath, data, mode = 0o644, syncDir = syncDirectory) {
     const dir = path.dirname(destinationPath);
     if (!fs.existsSync(dir)) {
         fs.mkdirSync(dir, { recursive: true, mode: 0o755 });
@@ -53,7 +53,22 @@ export function safeReplaceJSON(destinationPath, data, mode = 0o644) {
         fs.closeSync(fd);
     }
     fs.renameSync(tmpPath, destinationPath);
-    syncDirectory(dir);
+    syncDir(dir);
+}
+
+// Status supplies only a conservative refusal signal, never a baseline. Preserve
+// this diagnosed error in subsequent status publications so restart cannot erase it.
+export function recoveryProvenanceError(exchangeDir, recoveryStatePath, observedAnchor = false) {
+    if (fs.existsSync(recoveryStatePath) || fs.existsSync(recoveryStatePath + ".anchors")) return null;
+    const reason = "Recovery provenance lost after prior operation; restore recovery-state and anchors from backup";
+    if (observedAnchor) return reason;
+    try {
+        const prior = JSON.parse(fs.readFileSync(path.join(exchangeDir, "collector-status.json"), "utf8"));
+        if (prior?.version === 1 && (prior.recovery_last_error === reason ||
+            (prior.recovery_state === "ready" && prior.watched_channel_count > 0 &&
+                typeof prior.recovery_last_at === "string" && Number.isFinite(Date.parse(prior.recovery_last_at))))) return reason;
+    } catch {} // Missing/unreadable telemetry does not prove prior activation.
+    return null;
 }
 
 export function normalizeDiscordMessage(message, explicitGuildId = "", explicitChannelId = "") {
@@ -100,6 +115,7 @@ export class DiscordRpcCollector extends EventEmitter {
         this.collectorDataDir = options.collectorDataDir || process.env.CORDBRIEF_COLLECTOR_DATA_DIR || path.join(this.exchangeDir, "private");
         this.recoveryStatePath = options.recoveryStatePath || process.env.CORDBRIEF_RECOVERY_STATE_PATH || path.join(this.collectorDataDir, "recovery-state.json");
         this.recoveryAnchorsPath = this.recoveryStatePath + ".anchors";
+        this.observedRecoveryAnchor = false;
         this.runtimeDir = options.runtimeDir || process.env.CORDBRIEF_RUNTIME_DIR || path.join(this.exchangeDir, "runtime");
         this.runtimeLockFile = options.runtimeLockFile || path.join(this.runtimeDir, "runtime.lock");
         this.enableLock = options.enableLock !== undefined ? options.enableLock : true;
@@ -331,6 +347,8 @@ export class DiscordRpcCollector extends EventEmitter {
         }
         const anchors = this.loadRecoveryAnchors();
         if (!fs.existsSync(this.recoveryStatePath)) {
+            const lost = recoveryProvenanceError(this.exchangeDir, this.recoveryStatePath, this.observedRecoveryAnchor);
+            if (lost) throw new Error(lost);
             if (Object.keys(anchors.channels).length > 0) {
                 throw new Error("Recovery state missing for established first-watch channels");
             }
@@ -388,6 +406,9 @@ export class DiscordRpcCollector extends EventEmitter {
             Array.isArray(anchors.channels) || Object.entries(anchors.channels).some(([id, baseline]) => !isSnowflake(id) || !isSnowflake(baseline))) {
             throw new Error("Corrupt recovery anchors: invalid schema");
         }
+        // A visible rename is not evidence that its directory barrier succeeded.
+        this.syncDirectoryFn(path.dirname(this.recoveryAnchorsPath));
+        if (Object.keys(anchors.channels).length) this.observedRecoveryAnchor = true;
         return anchors;
     }
 
@@ -409,7 +430,10 @@ export class DiscordRpcCollector extends EventEmitter {
         // Adopt valid pre-upgrade state before any RPC wait. New anchors commit
         // BEFORE recovery-state: a crash between files leaves a visible error,
         // never permission to choose another baseline.
-        if (changed) safeReplaceJSON(this.recoveryAnchorsPath, anchors, 0o600);
+        if (changed) {
+            safeReplaceJSON(this.recoveryAnchorsPath, anchors, 0o600, this.syncDirectoryFn);
+            this.observedRecoveryAnchor = true;
+        }
     }
 
     /**
@@ -972,6 +996,10 @@ export class DiscordRpcCollector extends EventEmitter {
         if (state) this.collectorState = state;
         try {
             const statusRecord = this.getStatusRecord();
+            const lost = recoveryProvenanceError(this.exchangeDir, this.recoveryStatePath, this.observedRecoveryAnchor);
+            if (lost) Object.assign(statusRecord, {
+                collector_state: "error", recovery_state: "error", last_error: lost, recovery_last_error: lost
+            });
             const statusPath = path.join(this.exchangeDir, "collector-status.json");
             safeReplaceJSON(statusPath, statusRecord);
         } catch (err) {

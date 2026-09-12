@@ -11,7 +11,7 @@ import * as child_process from "child_process";
 import { EventEmitter } from "events";
 import { RpcTransport, findDiscordIPCPath } from "./transport.mjs";
 import { DiscordRpcClient, DEFAULT_REDIRECT_URI } from "./protocol.mjs";
-import { DiscordRpcCollector, safeReplaceJSON } from "./collector.mjs";
+import { DiscordRpcCollector, safeReplaceJSON, recoveryProvenanceError } from "./collector.mjs";
 
 function getEnv(name, defaultValue = "") {
     return process.env[name] || defaultValue;
@@ -40,6 +40,7 @@ export class RpcCollectorDaemon extends EventEmitter {
         this.options = options;
         this.exchangeDir = options.exchangeDir || getEnv("CORDBRIEF_EXCHANGE_DIR", "/var/cordbrief/exchange");
         this.collectorDataDir = options.collectorDataDir || getEnv("CORDBRIEF_COLLECTOR_DATA_DIR", path.join(this.exchangeDir, "private"));
+        this.recoveryStatePath = options.recoveryStatePath || getEnv("CORDBRIEF_RECOVERY_STATE_PATH", path.join(this.collectorDataDir, "recovery-state.json"));
         this.runtimeDir = options.runtimeDir || getEnv("CORDBRIEF_RUNTIME_DIR", "/var/cordbrief/runtime");
 
         this.clientId = options.clientId || getEnv("DISCORD_CLIENT_ID");
@@ -255,6 +256,10 @@ export class RpcCollectorDaemon extends EventEmitter {
             recovery_pending_channels: this.recoveryPendingChannels,
             recovery_last_error: extra.recoveryLastError !== undefined ? extra.recoveryLastError : this.recoveryLastError
         };
+        const lost = recoveryProvenanceError(this.exchangeDir, this.recoveryStatePath, this.collector?.observedRecoveryAnchor);
+        if (lost) Object.assign(statusRecord, {
+            collector_state: "error", recovery_state: "error", last_error: lost, recovery_last_error: lost
+        });
         safeReplaceJSON(path.join(this.exchangeDir, "collector-status.json"), statusRecord);
     }
 
@@ -594,6 +599,7 @@ export class RpcCollectorDaemon extends EventEmitter {
         this.collector = new DiscordRpcCollector({
             exchangeDir: this.exchangeDir,
             collectorDataDir: this.collectorDataDir,
+            recoveryStatePath: this.recoveryStatePath,
             runtimeDir: this.runtimeDir,
             transport: this.transport,
             client: this.client

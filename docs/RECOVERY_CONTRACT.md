@@ -44,6 +44,9 @@ It is atomically replaced and synced with mode `0600` **before** the correspondi
 recovery-state commit and before subscription. Its entries survive even when no
 user message has ever been journaled. Valid existing recovery-state is adopted
 into this provenance file before recovery proceeds on upgrade.
+Reading an existing anchor also re-syncs its containing directory before the
+anchor can authorize operation. A visible rename after a failed directory sync
+does not suffice: retries remain closed until that durability barrier succeeds.
 
 A channel ID identifies the continuing watch episode: removing a channel suspends
 collection; re-adding it resumes the original baseline. Restart, state loss, and
@@ -56,9 +59,16 @@ but before recovery-state commit also fails closed. The collector does not
 automatically reconstruct recovery-state or query a replacement cutoff. Restore
 valid recovery-state consistent with the anchors; the normal heartbeat retry then
 reconciles against those same baselines. Malformed anchor data is also refused.
-Back up both files together: this protection relies on independent provenance
-surviving loss of recovery-state, and cannot recover evidence erased from both
-files before any journal record exists.
+Back up both files together. Simultaneous loss of both authoritative recovery
+files may make recovery impossible. An anchor already observed by the running
+collector, or surviving status showing successful recovery with watched channels,
+is a conservative tripwire: both files missing then means error, not fresh
+initialization. That diagnosed error is retained through subsequent status updates
+and restarts. Status never supplies message IDs, a baseline, or a checkpoint;
+it can only refuse operation. When no such evidence survives, it cannot distinguish
+total historical erasure from a truly fresh installation. Fresh installations
+and genuinely new channels with intact installation provenance still initialize
+normally. No additional authoritative recovery store is used.
 
 All asynchronous recovery operations share one collector-owned queue. Startup,
 watchlist changes, and daemon retries use the same reconciliation owner; triggers

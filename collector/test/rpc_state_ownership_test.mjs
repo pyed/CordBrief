@@ -55,6 +55,81 @@ async function fixture(channels = []) {
 }
 
 export async function runStateOwnershipTests() {
+    // Adoption of a valid pre-upgrade primary can publish an anchor whose rename
+    // succeeds but directory sync fails. Visibility alone must not permit retry.
+    {
+        const f = await fixture();
+        let failSync = true, barriers = 0, subscriptions = 0;
+        try {
+            const baseline = deriveFirstWatchBoundary(id(1));
+            f.collector.beginChannelInitialization("2001", baseline);
+            fs.unlinkSync(f.collector.recoveryAnchorsPath); // pre-upgrade representation
+            f.collector.syncDirectoryFn = dir => {
+                if (dir === path.dirname(f.collector.recoveryAnchorsPath)) {
+                    barriers++;
+                    assert(fs.existsSync(f.collector.recoveryAnchorsPath), "Anchor rename must precede the failing barrier");
+                    if (failSync) throw Object.assign(new Error("Injected anchor directory EIO"), { code: "EIO" });
+                }
+            };
+            f.client.subscribeMessageCreate = async () => { subscriptions++; };
+            f.client.getChannel = async () => ({ messages: [message(1), message(2), message(3)] });
+            f.watch(["2001"]);
+            await f.daemon.retryRecovery();
+            assert.equal(f.daemon.collectorState, "error");
+            assert.equal(subscriptions, 0);
+            const firstBarriers = barriers;
+            await f.daemon.retryRecovery();
+            assert(barriers > firstBarriers, "Retry must recheck publication durability");
+            assert.equal(f.daemon.collectorState, "error");
+            assert.equal(subscriptions, 0);
+            failSync = false;
+            await f.daemon.retryRecovery();
+            assert.equal(subscriptions, 1);
+            assert.equal(f.daemon.collectorState, "running");
+            assert.equal(f.collector.loadRecoveryState().channels["2001"].watch_after, baseline);
+            for (const n of [2, 3]) assert.equal(f.records().filter(r => r.message_id === id(n)).length, 1);
+        } finally { await f.close(); }
+    }
+    // Public status is only evidence to refuse initialization, never a replacement
+    // checkpoint. Preserve the refusal through live retry and repeated restarts.
+    for (const entry of ["retry", "restart"]) {
+        const f = await fixture();
+        let calls = 0;
+        try {
+            f.client.getChannel = async () => { calls++; return { messages: [] }; };
+            f.watch(["2001"]);
+            await f.daemon.retryRecovery();
+            assert.equal(f.records().length, 0);
+            assert.equal(f.daemon.collectorState, "running");
+            const statusPath = path.join(f.root, "collector-status.json");
+            const operationalStatus = fs.readFileSync(statusPath, "utf8");
+            const priorCalls = calls;
+            fs.unlinkSync(f.collector.recoveryStatePath);
+            fs.unlinkSync(f.collector.recoveryAnchorsPath);
+            f.client.getChannel = async () => { calls++; return { messages: [message(2), message(3)] }; };
+            if (entry === "restart") {
+                await f.daemon.stop();
+                // Simulate abrupt process loss: preserve its last actual public
+                // operational status, without the graceful stop's publication.
+                fs.writeFileSync(statusPath, operationalStatus);
+                await f.restart();
+            } else {
+                await f.daemon.retryRecovery();
+            }
+            for (let restart = 0; restart < 3; restart++) {
+                assert.equal(f.daemon.collectorState, "error");
+                assert.equal(f.daemon.recoveryState, "error");
+                const status = JSON.parse(fs.readFileSync(path.join(f.root, "collector-status.json")));
+                assert.equal(status.collector_state, "error");
+                assert.equal(status.recovery_state, "error");
+                assert(status.last_error && status.recovery_last_error);
+                assert.equal(calls, priorCalls, "Lost provenance cannot authorize a new Discord baseline query");
+                assert.equal(fs.existsSync(f.collector.recoveryStatePath), false);
+                assert.equal(fs.existsSync(f.collector.recoveryAnchorsPath), false);
+                await f.restart();
+            }
+        } finally { await f.close(); }
+    }
     // First-watch provenance must survive loss of recovery-state even BEFORE the
     // first journal record. Exercise the actual subscription gap, restart, and repair.
     {
