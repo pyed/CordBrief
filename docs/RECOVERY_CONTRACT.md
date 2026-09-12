@@ -60,8 +60,8 @@ re-adding a channel preserves its watch boundary and recovery progress.
 
 | Field | Meaning |
 |---|---|
-| `checkpoint_message_id` | Nondecreasing high-water K of committed REST pages, or an explicitly labelled baseline/legacy value. Not a completeness certificate. |
-| `checkpoint_source` | `baseline_rest`: initial exclusion derived from Discord; `baseline_pending`: no exclusion yet; `rest`: REST high-water; `legacy`: preserved v1 value with unknown provenance. |
+| `checkpoint_message_id` | Nondecreasing high-water K of committed RPC snapshots/pages, or an explicitly labelled baseline/legacy value. Not a completeness certificate. |
+| `checkpoint_source` | `rpc`: official Discord RPC snapshot recovery; `baseline_rest`: historical initial exclusion; `baseline_pending`: no exclusion yet; `rest`: historical REST high-water; `legacy`: preserved v1 value with unknown provenance. |
 | `watch_after` | Immutable exclusive replay lower bound. Zero for uncertain initialization and v1 migration. |
 | `scan_after` | Last committed page end in the current sweep; null between sweeps. |
 | `scan_until` | Saved inclusive upper bound of that sweep; null together with `scan_after`. |
@@ -86,7 +86,7 @@ All state validates before reconciliation, migration, or even active-tail repair
 In particular:
 
 - Every journaled channel has metadata. IDs and physical boundaries are valid.
-- `watch_after <= K`. A REST K has a same-channel durable witness; legacy K
+- `watch_after <= K`. An RPC or REST K has a same-channel durable witness; legacy K
   may have unknown provenance. Baseline provenance constrains the permitted ID.
 - Sweep bounds are both null or satisfy `watch_after <= scan_after <= scan_until`,
   `scan_until > watch_after`, and `scan_after <= K`. A progressed scan cursor has
@@ -123,7 +123,7 @@ multi-page replay, cache clearing, removal/re-addition, pending refetch, migrati
 state corruption, and certified missing prefixes. See [contributing](../CONTRIBUTING.md)
 for the commands. Older copied-model tests are not substitutes for these proofs.
 
-REST sweeps, identity scans, and exact duplicate checks grow with history. Work
+Recovery snapshot sweeps, identity scans, and exact duplicate checks grow with history. Work
 per run is capped; total work and memory are not constant. Retention removes
 transcript bytes but keeps identity evidence. No physical power-cut or fixed
 throughput guarantee is claimed.

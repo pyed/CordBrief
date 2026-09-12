@@ -150,7 +150,7 @@ async function runTests() {
     // -----------------------------------------------------------------------
     // Test 2: Recovery Contract & Unpersisted Crash Safety (from recovery_contract_test)
     // -----------------------------------------------------------------------
-    console.log("[Test 2] Recovery contract: uncommitted events leave checkpoint safe; REST snapshot recovers...");
+    console.log("[Test 2] Recovery contract: uncommitted events leave checkpoint safe; RPC GET_CHANNEL snapshot recovers...");
     {
         const tmpExchange = createTempDir("cordbrief-contract");
         const privateDir = path.join(tmpExchange, "private");

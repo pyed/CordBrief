@@ -102,10 +102,10 @@ Scope: Prepare a precise, reversible migration plan from the existing legacy Cor
   EXPECT: m18_rc_proof_passed
   EVIDENCE: exit=0; clean-room proof verified; docs/SETUP.md, README.md, CHANGELOG.md, and docs/RECOVERY_CONTRACT.md conform 100% to public v2.0.0 architecture; deterministic credential seeding on clean volume verified.
 
-- [x] M18-G2: Personal Identifier & Secret Hygiene Scrub: Release HEAD / tracked tree scrubbed of personal proof identifiers (zero personal snowflakes, client IDs, personal channel IDs, personal usernames, or VPS IPs); Git commit history intentionally unrewritten (retains historical non-secret development snowflakes/identifiers; verified zero active or real secrets committed); .gitignore protects credentials and OAuth tokens.
+- [x] M18-G2: Personal Identifier & Secret Hygiene Scrub: Release HEAD / tracked tree scrubbed of known personal proof identifiers (zero personal snowflakes, client IDs, personal channel IDs, personal usernames, or VPS IPs); Git commit history intentionally unrewritten (retains historical non-secret development snowflakes/identifiers; no real secrets were found in Git history by the performed audit); .gitignore protects credentials and OAuth tokens.
   CHECK: node collector/test/clean_room_proof.mjs
-  EXPECT: Zero personal identifiers in tracked tree; git history verified zero active secrets
-  EVIDENCE: exit=0; clean_room_proof git grep across repository returns 0 occurrences of personal client ID, user snowflake, channels, or host IPs; Git commit history audited across all diff lines: verified zero active or real secrets committed.
+  EXPECT: Zero personal identifiers in tracked tree; no real secrets found in Git history by performed audit
+  EVIDENCE: exit=0; clean_room_proof git grep across repository returns 0 occurrences of personal client ID, user snowflake, channels, or host IPs; Git commit history audited across all diff lines: no real Client Secret/OAuth/Telegram/API credential was found committed by the history audit.
 
 - [x] M18-G3: Full Functional & Retention Regressions: Complete test suite across Go and Node passes 100%.
   CHECK: go test -count=1 ./... && node collector/test/rpc_lifecycle_test.mjs --test-all && node collector/test/vps_migration_test.mjs
