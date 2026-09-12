@@ -98,6 +98,8 @@ export class RpcCollectorDaemon extends EventEmitter {
         this.refreshTimer = null;
         this.stopping = false;
         this.sessionEstablished = false;
+        this.retryInProgress = false;
+        this.retryPromise = null;
     }
 
     reloadCredentials() {
@@ -226,6 +228,7 @@ export class RpcCollectorDaemon extends EventEmitter {
                     this.collectorState = COLLECTOR_STATES.NORMAL_OPERATION;
                     this.recoveryState = "ready";
                     this.lastError = null;
+                    this.recoveryLastError = null;
                 }
             }
         }
@@ -595,11 +598,22 @@ export class RpcCollectorDaemon extends EventEmitter {
         });
 
         this.collector.on("fatal_error", (fatalErr) => {
-            console.error(`[RPC Daemon] Fatal error from collector: ${fatalErr.message}`);
-            this.collectorState = COLLECTOR_STATES.ERROR;
-            this.lastError = fatalErr.message;
-            this.publishStatus({ lastError: this.lastError });
-            process.exit(1);
+            try {
+                this.collectorState = COLLECTOR_STATES.ERROR;
+                this.lastError = fatalErr.message;
+                try {
+                    console.error(`[RPC Daemon] Fatal error from collector: ${fatalErr.message}`);
+                } catch {}
+                try {
+                    this.publishStatus({ lastError: this.lastError });
+                } catch (pubErr) {
+                    try {
+                        console.error(`[RPC Daemon] Failed to publish status on fatal error: ${pubErr.message}`);
+                    } catch {}
+                }
+            } finally {
+                process.exit(1);
+            }
         });
 
         this.collector.on("recovery_error", (recErr) => {
@@ -635,30 +649,53 @@ export class RpcCollectorDaemon extends EventEmitter {
         }
 
         // Background status heartbeat and error retry
-        this.heartbeatTimer = setInterval(async () => {
-            if (this.stopping) return;
-            if (this.collectorState === COLLECTOR_STATES.ERROR && this.collector && !this.collector.fatalError) {
-                try {
-                    await this.retryRecovery();
-                    return;
-                } catch {}
-            }
-            this.publishStatus();
-        }, 5000);
+        this.heartbeatTimer = setInterval(() => this.heartbeat(), 5000);
+    }
+
+    /**
+     * Periodic heartbeat: publishes status and triggers retryRecovery when in recoverable error state.
+     */
+    async heartbeat() {
+        if (this.stopping) return;
+        if (this.collectorState === COLLECTOR_STATES.ERROR && this.collector && !this.collector.fatalError) {
+            try {
+                await this.retryRecovery();
+                return;
+            } catch {}
+        }
+        this.publishStatus();
     }
 
     /**
      * Supported path back to normal operation after recovery-state error.
      * Retries reconciliation against persisted state and publishes updated status.
+     * Single-flight: concurrent calls return the in-flight reconciliation promise.
      */
-    async retryRecovery() {
-        if (this.collector && !this.collector.fatalError) {
+    retryRecovery() {
+        if (!this.collector || this.collector.fatalError) {
+            this.publishStatus();
+            return Promise.resolve(this.collectorState);
+        }
+
+        if (this.retryInProgress && this.retryPromise) {
+            return this.retryPromise;
+        }
+
+        this.retryInProgress = true;
+        this.retryPromise = (async () => {
             try {
                 await this.collector.reconcileWatchlist();
-            } catch {}
-        }
-        this.publishStatus();
-        return this.collectorState;
+            } catch (err) {
+                console.warn(`[RPC Daemon] retryRecovery reconciliation error: ${err?.message || String(err)}`);
+            } finally {
+                this.retryInProgress = false;
+                this.retryPromise = null;
+            }
+            this.publishStatus();
+            return this.collectorState;
+        })();
+
+        return this.retryPromise;
     }
 
     /**

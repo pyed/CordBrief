@@ -790,68 +790,87 @@ async function runTests() {
         assert.strictEqual(diskStateAfter.channels["3001"].checkpoint_source, "rpc");
         assert.ok(diskStateAfter.channels["3001"].checkpoint_message_id.length > 0);
 
-        // 5B. Test first-watch live message race transaction:
-        // A genuinely new channel (5001) begins initialization (baseline_pending),
-        // receives a live MESSAGE_CREATE event BEFORE GET_CHANNEL completes, journals it,
-        // establishes baseline without being marked corrupted, dedupes M1, and captures M2.
-        const msgRaceM1 = (((t0 + 20000n) << 22n) | 1n).toString();
-        const msgRaceM2 = (((t0 + 25000n) << 22n) | 1n).toString();
-        mock.channelsByGuild["1001"].push({ id: "5001", name: "race-channel", type: 0 });
+        // 5B. Astra Gap B: Interrupted first-watch initialization & restart protection against re-anchoring
+        const tsH1 = t0 + 100000n;
+        const tsH2 = t0 + 101000n;
+        const tsM1 = t0 + 105000n;
+        const tsM2 = t0 + 106000n;
+        const tsM3 = t0 + 107000n;
+
+        const msgH1 = ((tsH1 << 22n) | 1n).toString();
+        const msgH2 = ((tsH2 << 22n) | 1n).toString();
+        const msgM1 = ((tsM1 << 22n) | 1n).toString();
+        const msgM2 = ((tsM2 << 22n) | 1n).toString();
+        const msgM3 = ((tsM3 << 22n) | 1n).toString();
+
+        const expectedBaseline = deriveFirstWatchBoundary(msgH2);
+
+        mock.channelsByGuild["1001"].push({ id: "5001", name: "gap-b-channel", type: 0 });
         mock.channelData["5001"] = {
             id: "5001",
-            name: "race-channel",
+            name: "gap-b-channel",
             type: 0,
             guild_id: "1001",
             messages: [
-                makeNormalizedMessage(msgRaceM1, "5001", "Live M1 during init")
+                makeNormalizedMessage(msgH1, "5001", "Historical H1"),
+                makeNormalizedMessage(msgH2, "5001", "Historical H2")
             ]
         };
 
-        collector.beginChannelInitialization("5001");
-        const initPendingState = collector.loadRecoveryState();
-        assert.strictEqual(initPendingState.channels["5001"].checkpoint_source, "baseline_pending");
-        assert.ok(initPendingState.channels["5001"].first_watch_boundary, "first_watch_boundary must be recorded");
+        // 1. Establish ORIGINAL durable first-watch message baseline
+        await collector.establishFirstWatchBaseline("5001");
+        const baseState = collector.loadRecoveryState();
+        assert.strictEqual(baseState.channels["5001"].watch_after, expectedBaseline);
+        assert.strictEqual(baseState.channels["5001"].checkpoint_source, "rpc");
+        assert.strictEqual(baseState.channels["5001"].last_result, "pending");
 
-        // Live message M1 arrives BEFORE GET_CHANNEL completes
+        // 2. Live message M1 arrives and is captured in journal
         collector.activeSubscriptions.add("5001");
         collector.handleMessageCreate({
             channel_id: "5001",
-            message: makeNormalizedMessage(msgRaceM1, "5001", "Live M1 during init")
+            message: makeNormalizedMessage(msgM1, "5001", "Live M1")
         });
+        const journalPreCrash = readAllJournalRecords(tmpExchange).filter(r => r.channel_id === "5001");
+        assert.strictEqual(journalPreCrash.length, 1, "M1 must be captured in journal before crash");
+        assert.strictEqual(journalPreCrash[0].message_id, msgM1);
 
-        // M1 is journaled successfully
-        const journalFor5001 = readAllJournalRecords(tmpExchange).filter(r => r.channel_id === "5001");
-        assert.strictEqual(journalFor5001.length, 1, "M1 must be journaled");
-        assert.strictEqual(journalFor5001[0].message_id, msgRaceM1);
+        // 3. Crash before initialization completes (simulate process restart)
+        // During downtime, M2 and M3 arrive on Discord
+        // As specified by Astra: restart recovery snapshot contains M1/M2/M3
+        mock.channelData["5001"].messages = [
+            makeNormalizedMessage(msgM1, "5001", "Live M1"),
+            makeNormalizedMessage(msgM2, "5001", "Outage M2"),
+            makeNormalizedMessage(msgM3, "5001", "Outage M3")
+        ];
 
-        // Verify channel is NOT marked corrupted even though it now has journal evidence
-        const uncorruptedState = collector.loadRecoveryState();
-        assert.strictEqual(uncorruptedState.channels["5001"].checkpoint_source, "baseline_pending");
-        assert.strictEqual(collector.recoveryStateStatus, "ready");
-
-        // GET_CHANNEL completes
-        const raceRecovered = await collector.recoverChannelSnapshot("5001");
-        assert.strictEqual(collector.recoveryStateStatus, "ready");
-        assert.strictEqual(collector.collectorState, "running");
-
-        // Verify M1 is NOT duplicated by snapshot recovery
-        const journalAfterSnap = readAllJournalRecords(tmpExchange).filter(r => r.channel_id === "5001");
-        assert.strictEqual(journalAfterSnap.length, 1, "M1 must not be duplicated by snapshot recovery");
-
-        // Verify recovery state transitioned to ready ('rpc') and first_watch_boundary cleared
-        const finalRaceState = collector.loadRecoveryState();
-        assert.strictEqual(finalRaceState.channels["5001"].checkpoint_source, "rpc");
-        assert.strictEqual(finalRaceState.channels["5001"].first_watch_boundary, null);
-        assert.ok(BigInt(finalRaceState.channels["5001"].checkpoint_message_id) >= BigInt(msgRaceM1));
-
-        // Verify subsequent live message M2 is captured normally
-        collector.handleMessageCreate({
-            channel_id: "5001",
-            message: makeNormalizedMessage(msgRaceM2, "5001", "Live M2 after ready")
+        // Restart: new collector instance pointing to same exchangeDir and privateDir
+        const restartedCollector = new DiscordRpcCollector({
+            exchangeDir: tmpExchange,
+            collectorDataDir: privateDir,
+            runtimeDir: path.join(tmpExchange, "runtime"),
+            transport,
+            client,
+            enableLock: false
         });
-        const journalAfterM2 = readAllJournalRecords(tmpExchange).filter(r => r.channel_id === "5001");
-        assert.strictEqual(journalAfterM2.length, 2, "Subsequent message M2 must be captured");
-        assert.strictEqual(journalAfterM2[1].message_id, msgRaceM2);
+        restartedCollector.initJournal();
+
+        // 4. Run recovery snapshot on restarted collector
+        const recoveredRestart = await restartedCollector.recoverChannelSnapshot("5001");
+        assert.strictEqual(recoveredRestart, 2, "Must recover M2 and M3 (M1 deduplicated, H1/H2 excluded)");
+
+        // 5. Verify original baseline is UNCHANGED (did not shift to M3)
+        const restartState = restartedCollector.loadRecoveryState();
+        assert.strictEqual(restartState.channels["5001"].watch_after, expectedBaseline, "Original watch_after baseline must remain unchanged");
+        assert.strictEqual(restartState.channels["5001"].checkpoint_message_id, msgM3, "Checkpoint must advance to latest eligible message M3");
+        assert.strictEqual(restartState.channels["5001"].last_result, "success");
+
+        // 6. Verify final journal contains M1, M2, M3 in order, exactly once
+        const finalJournal5001 = readAllJournalRecords(tmpExchange).filter(r => r.channel_id === "5001");
+        assert.strictEqual(finalJournal5001.length, 3, "Journal must contain exactly M1, M2, M3");
+        assert.strictEqual(finalJournal5001[0].message_id, msgM1);
+        assert.strictEqual(finalJournal5001[1].message_id, msgM2);
+        assert.strictEqual(finalJournal5001[2].message_id, msgM3);
+        assert.ok(!finalJournal5001.some(r => r.message_id === msgH1 || r.message_id === msgH2), "Historical messages must not be in journal");
 
         // 6. Test legitimate fresh install (clean installation: zero journal, zero recovery state)
         const freshExchange = path.join(os.tmpdir(), `cordbrief-fresh-${Date.now()}-${Math.random().toString(36).slice(2)}`);
