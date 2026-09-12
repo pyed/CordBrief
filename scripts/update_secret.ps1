@@ -97,7 +97,7 @@ $plainSecret = $null
 $obj = $null
 
 # 5. Write securely to target volume with mode 0600 and resolved ownership
-$shCmd = "mkdir -p /var/lib/cordbrief && cat > /var/lib/cordbrief/credentials.json && chmod 0600 /var/lib/cordbrief/credentials.json && chown $TargetOwner /var/lib/cordbrief/credentials.json"
+$shCmd = "mkdir -p /var/lib/cordbrief && chown $TargetOwner /var/lib/cordbrief && chmod 0700 /var/lib/cordbrief && cat > /var/lib/cordbrief/credentials.json && chmod 0600 /var/lib/cordbrief/credentials.json && chown $TargetOwner /var/lib/cordbrief/credentials.json"
 
 try {
     $jsonPayload | docker run --rm -i -v "${TargetVolume}:/var/lib/cordbrief" alpine sh -c $shCmd
@@ -117,18 +117,18 @@ if ($exitCode -ne 0) {
 # 6. Non-echoing verification check in container
 $verifyExit = 0
 try {
-    $shScript = @'
-set -e
-targetOwner="$1"
-[ -f /var/lib/cordbrief/credentials.json ]
-statOut=$(stat -c "%a %u:%g" /var/lib/cordbrief/credentials.json 2>/dev/null)
-[ "$statOut" = "600 $targetOwner" ]
-grep -q '"client_id"' /var/lib/cordbrief/credentials.json
-grep -q '"client_secret"' /var/lib/cordbrief/credentials.json
-echo OK
-'@
-    $vCheck = $shScript | docker run --rm -i -v "${TargetVolume}:/var/lib/cordbrief:ro" alpine sh -s -- "$TargetOwner" 2>$null
-    if ($LASTEXITCODE -ne 0 -or $vCheck.Trim() -ne "OK") { $verifyExit = 1 }
+    $vCheck = docker run --rm -v "${TargetVolume}:/var/lib/cordbrief:ro" alpine sh -c '
+        set -e
+        targetOwner="$1"
+        [ -f /var/lib/cordbrief/credentials.json ]
+        statOut=$(stat -c "%a %u:%g" /var/lib/cordbrief/credentials.json 2>/dev/null)
+        [ "$statOut" = "600 $targetOwner" ]
+        grep -q "\"client_id\"" /var/lib/cordbrief/credentials.json
+        grep -q "\"client_secret\"" /var/lib/cordbrief/credentials.json
+        echo OK
+    ' sh "$TargetOwner" 2>$null
+    $vCheck = ($vCheck | Out-String).Trim()
+    if ($LASTEXITCODE -ne 0 -or $vCheck -ne "OK") { $verifyExit = 1 }
 } catch {
     $verifyExit = 1
 }

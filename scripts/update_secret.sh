@@ -66,6 +66,8 @@ unset plainSecret
 printf '%s\n' "$PAYLOAD" | docker run --rm -i -v "${TARGET_VOLUME}:/var/lib/cordbrief" alpine sh -c "
     set -e
     mkdir -p /var/lib/cordbrief
+    chown ${TARGET_OWNER} /var/lib/cordbrief
+    chmod 0700 /var/lib/cordbrief
     cat > /var/lib/cordbrief/credentials.json
     chmod 0600 /var/lib/cordbrief/credentials.json
     chown ${TARGET_OWNER} /var/lib/cordbrief/credentials.json
