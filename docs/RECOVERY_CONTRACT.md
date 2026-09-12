@@ -34,73 +34,50 @@ initialization keeps `watch_after=0` instead of selecting an unverified cutoff.
 Later visibility can therefore bring in pre-watch history. Recoverability takes
 priority over guessing an exclusion boundary when no trustworthy anchor exists.
 
-## Local RPC snapshot bounds and dedupe
+## Canonical v2 Official RPC Recovery Architecture
 
-Unlike arbitrary REST scraping, official Discord RPC exposes a bounded snapshot of
-messages cached in the desktop client via `GET_CHANNEL`. Bounded snapshots have no
-guarantee of arbitrary historical depth or pagination into deep history; recovery
-is best-effort across the client's visible window.
+In CordBrief v2.0.0, the collection and recovery architecture is strictly based on the official Discord desktop client local RPC protocol:
 
-Snapshot overlap and live event reconciliation use exact durable identities. The
-collector scans identity evidence at startup; its bounded recent cache is an
-optimization. An exact maximum can prove an ID is new, but older cache misses
-need a durable scan against journal segments or certified retention sidecars.
-Clearing the cache does not change correctness. An ID belonging to another channel
-is refused rather than counted as a duplicate.
+1. **Authoritative Live Capture**: When connected, live `MESSAGE_CREATE` RPC dispatch events are authoritative.
+2. **Bounded Snapshot Recovery**: On initial channel watch or after reconnection, the collector performs bounded, best-effort recovery via `GET_CHANNEL`. The desktop client returns its currently visible cached window of messages.
+3. **No Deep Pagination Guarantee**: Official local RPC provides bounded recent client cache visibility, not an arbitrary historical pagination API. Long outages exceeding the local client's in-memory buffer depth cannot be retrieved via local RPC; no lossless arbitrary-outage claim is made.
+4. **Append-Before-Checkpoint Ordering**: Recovery transactions strictly follow physical write ordering:
+   - Visible messages are sorted ascending by Snowflake and filtered against `watch_after`.
+   - Each eligible candidate is checked against the authoritative deduplication ledger (in-memory cache + physical journal scan if candidate ID $\le$ `journalMaxID`).
+   - New messages are appended to the active NDJSON segment with synchronous file flush (`fsync`).
+   - Only after all eligible events are durably persisted to disk is `checkpoint_message_id` advanced to the highest message Snowflake and `checkpoint_journal_boundary` updated.
+   - `recovery-state.json` is atomically replaced via `safeReplaceJSON` with mode `0600`.
 
-[Retention](RETENTION.md) substitutes certified identity/position sidecars for
-retired transcript segments. This preserves original positions for dedupe floors
-and state witnesses. Arbitrary missing segments are never silently skipped.
+## Durable state: Schema version 2
 
-Watch removal prevents in-flight recovery transactions from committing. Already
-accepted native writes can finish. Removal does not erase durable recovery state;
-re-adding a channel preserves its watch boundary and recovery progress.
-
-## Durable state: version 2
+### Active Canonical RPC Fields
 
 | Field | Meaning |
 |---|---|
-| `checkpoint_message_id` | Nondecreasing high-water K of committed RPC snapshots/pages, or an explicitly labelled baseline/legacy value. Not a completeness certificate. |
-| `checkpoint_source` | `rpc`: official Discord RPC snapshot recovery; `baseline_rest`: historical initial exclusion; `baseline_pending`: no exclusion yet; `rest`: historical REST high-water; `legacy`: preserved v1 value with unknown provenance. |
-| `watch_after` | Immutable exclusive replay lower bound. Zero for uncertain initialization and v1 migration. |
-| `scan_after` | Last committed page end in the current sweep; null between sweeps. |
-| `scan_until` | Saved inclusive upper bound of that sweep; null together with `scan_after`. |
-| `checkpoint_journal_boundary` | Every already-journaled channel ID above K is at/after this physical position. It does not cover historical replay at/below K. |
-| pending `channel_id` | Owner of the single interrupted page transaction. |
-| pending `old_checkpoint_message_id` | K before that page. |
-| pending `new_checkpoint_message_id` | The page's greatest ID, possibly below K during historical replay. Committed K is the maximum of old K and this value. |
-| pending `message_ids` | Exact ordered identity of the page. |
-| pending `journal_start` | Original boundary before the transaction's appends. Preserved across retries. |
-| `last_recovery_at`, `last_result`, `last_error`, `recovered_count` | Diagnostics, not authority for deleting history. |
+| `checkpoint_message_id` | Nondecreasing high-water K of durably committed messages, or an explicitly labelled baseline value. Updated only after physical journal sync. |
+| `checkpoint_source` | `rpc`: official Discord RPC snapshot recovery; `baseline_pending`: initial watch anchor pending. |
+| `watch_after` | Immutable exclusive replay lower bound established at first watch anchor. Pre-watch history ($\le$ `watch_after`) is excluded. |
+| `checkpoint_journal_boundary` | Physical journal segment number and byte offset where events through K are safely persisted. |
+| `last_recovery_at`, `last_result`, `last_error`, `recovered_count` | Operational telemetry and diagnostics. |
 
-## Transactions and validation
+### Legacy / Historical Compatibility Fields
 
-An intent is saved before missing page records are appended. Each append is
-synced before checkpoint commit. After a crash, complete durable page evidence
-can reconcile the intent. An incomplete transaction can resume when the same
-page is refetched, keeping its original `journal_start`. A different page or
-another channel cannot overwrite an unresolved intent. A permanently changed
-page may require investigation; clearing pending is not a safe recovery procedure.
+These fields are preserved in Schema v2 for backward compatibility when loading historical state from prior versions; in the canonical v2 RPC collector, they remain `null`:
 
-All state validates before reconciliation, migration, or even active-tail repair.
-In particular:
+| Field | Status in v2 | Historical Meaning |
+|---|---|---|
+| `scan_after`, `scan_until` | `null` | Historical multi-page sweep cursors from legacy scraping paths. |
+| `pending` | `null` | Historical single-page incomplete transaction intent descriptor. |
+| `checkpoint_source` (`legacy`, `rest`, `baseline_rest`) | Historical | Provenance markers from pre-v2 installations. |
 
-- Every journaled channel has metadata. IDs and physical boundaries are valid.
-- `watch_after <= K`. An RPC or REST K has a same-channel durable witness; legacy K
-  may have unknown provenance. Baseline provenance constrains the permitted ID.
-- Sweep bounds are both null or satisfy `watch_after <= scan_after <= scan_until`,
-  `scan_until > watch_after`, and `scan_after <= K`. A progressed scan cursor has
-  a same-channel witness. `scan_until` may legitimately be below K.
-- No local channel ID above K precedes that channel's forward physical floor.
-- Pending has a known owner and the current old K, 1–100 strictly increasing
-  IDs after the replay cursor, and a page end equal to the final ID. It cannot
-  exceed an active sweep's upper bound. Its journal start is not before the floor
-  or beyond the journal end. Existing pending IDs belong to the same channel.
+## Invariants and Validation
 
-Malformed or contradictory state fails before rewriting the original file.
-Only a valid active trailing fragment can be repaired; closed segments are
-immutable. These checks establish consistency, not authenticity against someone
-who can coherently rewrite all local state and its evidence.
+All recovery state validates before reconciliation, reload, or tail repair:
+
+- Every watched channel has an entry in `channels`.
+- `watch_after <= checkpoint_message_id`. An RPC checkpoint has a durable journal witness.
+- Active-tail repair truncates only torn trailing fragments in the active segment; closed physical segments are immutable.
+- A conflicting message ID mapped to a different channel triggers a fail-closed error to prevent journal corruption.
 
 ## Legacy migration
 

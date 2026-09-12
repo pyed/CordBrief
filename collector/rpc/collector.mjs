@@ -761,6 +761,16 @@ export class DiscordRpcCollector {
     }
 
     /**
+     * Releases exclusive runtime single-ownership lease.
+     */
+    releaseRuntimeLock() {
+        if (this.lockHandle) {
+            this.lockHandle.release();
+            this.lockHandle = null;
+        }
+    }
+
+    /**
      * Stops the collector cleanly.
      */
     async stop() {

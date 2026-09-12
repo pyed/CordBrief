@@ -75,7 +75,7 @@ func TestCLI_Version(t *testing.T) {
 	}
 
 	out := stdout.String()
-	if !strings.Contains(out, "cordbrief v0.1.0-dev") {
+	if !strings.Contains(out, "cordbrief v2.0.0") {
 		t.Errorf("expected version output to contain version string, got: %s", out)
 	}
 }

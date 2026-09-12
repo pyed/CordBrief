@@ -412,7 +412,7 @@ const layoutShellTop = `<!DOCTYPE html>
         </a>
       </nav>
       <div class="sidebar-footer">
-        <div class="footer-meta">Appliance v0.1.0-dev</div>
+        <div class="footer-meta">Appliance v2.0.0</div>
       </div>
     </aside>
     <main class="main-content">

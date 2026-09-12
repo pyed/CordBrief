@@ -26,7 +26,7 @@ import (
 	"cordbrief/internal/web"
 )
 
-const Version = "v0.1.0-dev"
+const Version = "v2.0.0"
 
 func main() {
 	os.Exit(Run(os.Args[1:], os.Stdout, os.Stderr))

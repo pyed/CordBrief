@@ -6,7 +6,7 @@
 # Target volume can be specified via:
 #   1. First command-line argument: ./scripts/update_secret.sh [volume_name]
 #   2. Environment variable: TARGET_VOLUME=... ./scripts/update_secret.sh
-#   3. Default: cordbrief_rpc_collector_data
+#   3. Default: ${COMPOSE_PROJECT_NAME:-cordbrief}_collector_data
 #
 # Target ownership defaults to canonical UID:GID 1000:1000 (proven by Dockerfiles and compose.yml),
 # but can be overridden via TARGET_UID and TARGET_GID.

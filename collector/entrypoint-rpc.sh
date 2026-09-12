@@ -138,6 +138,7 @@ DISCORD_PID=$!
 cleanup() {
     echo "[Runtime] Cleaning up background processes..."
     kill "$DAEMON_PID" 2>/dev/null || true
+    pkill -u cordbrief -f "daemon.mjs" 2>/dev/null || true
     kill "$DISCORD_PID" 2>/dev/null || true
     pkill -u cordbrief -f "Discord" 2>/dev/null || true
     kill "$OPENBOX_PID" 2>/dev/null || true

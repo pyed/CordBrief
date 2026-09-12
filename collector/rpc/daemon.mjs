@@ -54,6 +54,9 @@ export class RpcCollectorDaemon extends EventEmitter {
         this.transport.on("error", (err) => {
             console.warn(`[RPC Transport] Socket error: ${err?.message || err}`);
         });
+        this.transport.on("close", (hadError) => {
+            this.handleTransportClose(hadError);
+        });
         this.client = options.client || new DiscordRpcClient(this.transport);
         this.collector = null;
 
@@ -581,6 +584,50 @@ export class RpcCollectorDaemon extends EventEmitter {
     }
 
     /**
+     * Handles unexpected Discord IPC socket termination during active operation.
+     */
+    handleTransportClose(hadError) {
+        if (this.stopping) return;
+        // If still in initial connection loop before active authentication, let connect loop retry
+        if (!this.discordAuthenticated && this.collectorState === COLLECTOR_STATES.DISCORD_STARTING) {
+            return;
+        }
+
+        console.warn(`[RPC Daemon] Discord IPC transport closed unexpectedly (hadError: ${Boolean(hadError)}). Halting heartbeat and reporting disconnect.`);
+        this.stopping = true;
+
+        if (this.heartbeatTimer) {
+            clearInterval(this.heartbeatTimer);
+            this.heartbeatTimer = null;
+        }
+        if (this.commandTimer) {
+            clearInterval(this.commandTimer);
+            this.commandTimer = null;
+        }
+        if (this.refreshTimer) {
+            clearTimeout(this.refreshTimer);
+            this.refreshTimer = null;
+        }
+
+        this.collectorState = COLLECTOR_STATES.DISCORD_STARTING;
+        this.discordAuthenticated = false;
+        this.lastError = "Discord IPC connection closed unexpectedly";
+        this.publishStatus({ lastError: this.lastError });
+
+        if (this.collector) {
+            try {
+                this.collector.releaseRuntimeLock();
+            } catch {}
+        }
+
+        this.emit("unexpected_close", new Error("Discord IPC connection closed unexpectedly"));
+
+        if (this.options.exitOnClose) {
+            process.exit(1);
+        }
+    }
+
+    /**
      * Clean shutdown.
      */
     async stop() {
@@ -615,6 +662,11 @@ if (process.argv[1] && process.argv[1].endsWith("daemon.mjs")) {
 
     process.on("SIGTERM", () => shutdown("SIGTERM"));
     process.on("SIGINT", () => shutdown("SIGINT"));
+
+    daemon.on("unexpected_close", (err) => {
+        console.error(`[RPC Daemon] ${err.message}. Exiting process for supervisor restart.`);
+        process.exit(1);
+    });
 
     daemon.start().catch(async (err) => {
         console.error(`[RPC Daemon] Fatal error on startup:`, err);
