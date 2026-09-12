@@ -14,9 +14,11 @@ seen or the local clock.
 
 ## First watch and snapshot recovery
 
-The collector durably records initialization before processing messages. Local RPC
-event capture starts as soon as the watchlist allows it, streaming `MESSAGE_CREATE`
-dispatches directly into native journal persistence.
+The collector queries pre-watch Discord history and durably records its exclusion
+baseline before subscribing to live `MESSAGE_CREATE` events. After subscribing,
+it reconciles a second snapshot against that same baseline and deduplicates any
+overlap with live capture. Messages arriving between the baseline observation and
+subscription remain eligible if the snapshot exposes them.
 
 For a successful initial channel discovery with latest visible message H, the
 exclusion boundary is:
@@ -29,10 +31,26 @@ This includes H's entire Discord timestamp millisecond. Messages in earlier
 milliseconds are excluded from replay, while already-persisted live messages remain
 accepted. Same-millisecond IDs below H remain eligible.
 
-An empty or failed lookup establishes no exclusion ID. An interrupted or retried
-initialization keeps `watch_after=0` instead of selecting an unverified cutoff.
-Later visibility can therefore bring in pre-watch history. Recoverability takes
-priority over guessing an exclusion boundary when no trustworthy anchor exists.
+A successful empty lookup establishes the explicit baseline `watch_after="0"`.
+A failed lookup leaves initialization incomplete and does not activate a live
+subscription. Once persisted, the baseline is write-once: retries and restarts
+reuse it, including an established empty baseline. Later visibility after an empty
+lookup can therefore bring in pre-watch history; no newer cutoff is guessed.
+
+All asynchronous recovery operations share one collector-owned queue. Startup,
+watchlist changes, and daemon retries use the same reconciliation owner; triggers
+received during a pass request another pass over the latest watchlist. Live
+capture remains synchronous. After awaiting Discord, recovery reloads durable
+state and merges live checkpoints instead of saving an older object. A newer
+recovery error or shutdown invalidates pending work. Global running/ready is
+published only after the current watched set has recovered successfully. Persistent
+recoverable errors are retried by the daemon's five-second heartbeat.
+
+Once journal uncertainty is classified fatal, the collector signals the daemon
+without further I/O, and the daemon immediately exits nonzero for supervisor
+restart. Fatal status publication and logging are deliberately omitted: they
+cannot be allowed to block termination. The last status file may consequently
+remain unchanged until the replacement process starts.
 
 ## Canonical v2 Official RPC Recovery Architecture
 
@@ -93,6 +111,10 @@ state with existing journal evidence is refused; a genuinely empty installation
 can initialize. Unknown or incomplete v2 schemas are not treated as fresh state.
 
 ## Evidence and limits
+
+The RPC state-ownership and daemon tests exercise real watchlist callbacks,
+overlapping retry calls, corruption during an awaited snapshot, live checkpoint
+merging, shutdown, and fatal-exit ordering with synthetic local RPC inputs.
 
 Actual native/renderer tests use synthetic Gateway and REST inputs, real journal
 rotation, fresh processes, and injected crashes. They cover first-watch races,

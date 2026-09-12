@@ -148,13 +148,16 @@ export class DiscordRpcCollector extends EventEmitter {
         this.cachedWatchlist = { valid: false, generation: -1, channel_ids: [] };
         this.heartbeatTimer = null;
         this.stopping = false;
-        this.isReconciling = false;
+        this.recoveryQueue = Promise.resolve();
+        this.reconcilePromise = null;
+        this.reconcileRequested = false;
+        this.recoveryEpoch = 0;
     }
 
     /**
      * Enters terminal fail-stop state when journal write uncertainty occurs.
      * Halts further appends in-process and emits fatal_error for supervisor restart.
-     * Guaranteed to emit fatal_error even if status file write fails.
+     * No I/O may precede the production listener's immediate process exit.
      * @param {string} reason
      */
     failStop(reason) {
@@ -162,20 +165,8 @@ export class DiscordRpcCollector extends EventEmitter {
         this.lastError = reason;
         this.collectorState = "error";
         this.stopping = true;
-        try {
-            this.writeStatus("error");
-        } catch (e) {
-            try {
-                console.error(`[RPC Collector] Failed to write status during failStop: ${e.message}`);
-            } catch {}
-        }
-        try {
-            this.emit("fatal_error", new Error(reason));
-        } catch (e) {
-            try {
-                console.error(`[RPC Collector] Error emitting fatal_error: ${e.message}`);
-            } catch {}
-        }
+        this.recoveryEpoch++;
+        this.emit("fatal_error", new Error(reason));
     }
 
     /**
@@ -184,6 +175,8 @@ export class DiscordRpcCollector extends EventEmitter {
      * @param {string|Error} reason
      */
     markRecoveryError(reason) {
+        if (this.stopping || this.fatalError) return;
+        this.recoveryEpoch++;
         const msg = String(reason?.message || reason || "Unknown recovery failure");
         this.collectorState = "error";
         this.recoveryStateStatus = "error";
@@ -193,6 +186,23 @@ export class DiscordRpcCollector extends EventEmitter {
             this.writeStatus("error");
         } catch {}
         this.emit("recovery_error", new Error(msg));
+    }
+
+    // All asynchronous recovery writers share this queue, including direct helper
+    // callers. Live capture remains synchronous and is merged after each RPC wait.
+    queueRecovery(operation) {
+        const result = this.recoveryQueue.then(() => {
+            if (this.stopping || this.fatalError) return 0;
+            return operation();
+        });
+        this.recoveryQueue = result.catch(() => {});
+        return result;
+    }
+
+    assertRecoveryCurrent(epoch) {
+        if (this.stopping || this.fatalError || epoch !== this.recoveryEpoch) {
+            throw new Error("Recovery interrupted by shutdown or a newer recovery error");
+        }
     }
 
     /**
@@ -421,42 +431,27 @@ export class DiscordRpcCollector extends EventEmitter {
      * @param {string} channelId
      * @returns {Promise<object>}
      */
-    async establishFirstWatchBaseline(channelId) {
+    establishFirstWatchBaseline(channelId) {
+        return this.queueRecovery(() => this._establishFirstWatchBaseline(channelId, this.recoveryEpoch));
+    }
+
+    async _establishFirstWatchBaseline(channelId, epoch) {
+        this.assertRecoveryCurrent(epoch);
+        const state = this.loadRecoveryState();
+        if (state.channels[channelId]?.checkpoint_source === "rpc" && state.channels[channelId]?.watch_after) {
+            return state.channels[channelId];
+        }
         if (this.hasPriorCollectionEvidence(channelId)) {
             throw new Error(`Cannot initialize existing journal channel ${channelId} as new first-watch channel`);
         }
-        let state = this.loadRecoveryState();
-        if (state.channels[channelId]?.watch_after && state.channels[channelId]?.checkpoint_message_id && state.channels[channelId]?.checkpoint_source === "rpc") {
-            return state.channels[channelId];
-        }
-
-        let baseline = "0";
-        if (this.client && typeof this.client.getChannel === "function") {
-            const ch = await this.client.getChannel(channelId);
-            const messages = Array.isArray(ch?.messages) ? ch.messages : [];
-            if (messages.length > 0) {
-                messages.sort((a, b) => BigInt(a.id) < BigInt(b.id) ? -1 : 1);
-                const latestMsg = messages[messages.length - 1];
-                baseline = deriveFirstWatchBoundary(latestMsg.id);
-            }
-        }
-
-        state = this.loadRecoveryState();
-        state.channels[channelId] = {
-            checkpoint_message_id: baseline,
-            checkpoint_source: "rpc",
-            watch_after: baseline,
-            initial_baseline: baseline,
-            scan_after: null,
-            scan_until: null,
-            checkpoint_journal_boundary: this.getCurrentJournalBoundary(),
-            last_recovery_at: null,
-            last_result: "pending",
-            last_error: null,
-            recovered_count: 0
-        };
-        this.saveRecoveryState(state);
-        return state.channels[channelId];
+        const ch = await this.client.getChannel(channelId);
+        this.assertRecoveryCurrent(epoch);
+        const messages = Array.isArray(ch?.messages) ? ch.messages : [];
+        const highest = messages.reduce((max, m) => BigInt(m.id) > BigInt(max) ? String(m.id) : max, "0");
+        // This synchronous commit reloads current state and preserves any baseline
+        // already established while Discord was pending.
+        this.beginChannelInitialization(channelId, deriveFirstWatchBoundary(highest));
+        return this.loadRecoveryState().channels[channelId];
     }
 
     /**
@@ -567,11 +562,7 @@ export class DiscordRpcCollector extends EventEmitter {
             }
         }
 
-        if (appendedCount > 0) {
-            if (this.collectorState !== "error") {
-                this.writeStatus("running");
-            }
-        }
+        if (appendedCount > 0) this.writeStatus();
         return appendedCount;
     }
 
@@ -696,208 +687,156 @@ export class DiscordRpcCollector extends EventEmitter {
      * Reconciles active Discord RPC channel subscriptions with the latest watchlist.
      * Transactionally aggregates recovery across all watched channels.
      */
-    async reconcileWatchlist() {
+    reconcileWatchlist() {
+        if (this.stopping || this.fatalError) return Promise.resolve();
+        this.reconcileRequested = true;
+        if (this.reconcilePromise) return this.reconcilePromise;
+        this.reconcilePromise = this.queueRecovery(async () => {
+            try {
+                do {
+                    this.reconcileRequested = false;
+                    await this._reconcileWatchlist();
+                } while (this.reconcileRequested && !this.stopping && !this.fatalError);
+            } finally {
+                this.reconcilePromise = null;
+            }
+        });
+        return this.reconcilePromise;
+    }
+
+    async _reconcileWatchlist() {
+        const epoch = this.recoveryEpoch;
         const wl = this.loadWatchlist();
-        this.watchedGeneration = wl.generation >= 0 ? wl.generation : 0;
         const targetIds = wl.valid ? new Set(wl.channel_ids) : new Set();
+        const needsFullRecovery = this.recoveryStateStatus === "error" || this.collectorState === "error";
+        this.watchedGeneration = wl.generation >= 0 ? wl.generation : 0;
         this.watchedChannelCount = targetIds.size;
-
-        // 1. Channels to unsubscribe
-        for (const chId of Array.from(this.activeSubscriptions)) {
-            if (!targetIds.has(chId)) {
-                try {
-                    await this.client.unsubscribeMessageCreate(chId);
-                } catch {}
-                this.activeSubscriptions.delete(chId);
+        this.collectorState = needsFullRecovery ? "error" : "starting";
+        this.recoveryStateStatus = "recovering";
+        this.writeStatus();
+        try {
+            this.loadRecoveryState();
+            for (const chId of Array.from(this.activeSubscriptions)) {
+                if (!targetIds.has(chId)) {
+                    try { await this.client.unsubscribeMessageCreate(chId); } catch {}
+                    this.assertRecoveryCurrent(epoch);
+                    this.activeSubscriptions.delete(chId);
+                }
             }
-        }
-
-        // 2. Load recovery state fail-closed
-        let recoveryState;
-        try {
-            recoveryState = this.loadRecoveryState();
-        } catch (err) {
-            this.markRecoveryError(`Recovery state error: ${err.message}`);
-            return;
-        }
-
-        this.isReconciling = true;
-        const globalRecoveryNeeded = this.recoveryStateStatus === "error" || this.collectorState === "error";
-
-        try {
-            const failedChannels = [];
-            const channelErrors = [];
-
-            // 3. Process each watched channel
+            const failures = [];
             for (const chId of targetIds) {
-                let chState = recoveryState.channels[chId];
-
-                // Establish durable baseline for newly watched channel BEFORE subscription
-                if (!chState || !chState.watch_after) {
-                    try {
-                        await this.establishFirstWatchBaseline(chId);
-                        recoveryState = this.loadRecoveryState();
-                        chState = recoveryState.channels[chId];
-                    } catch (baseErr) {
-                        failedChannels.push(chId);
-                        channelErrors.push(`Baseline establishment failed for ${chId}: ${baseErr.message}`);
-                        continue;
+                this.assertRecoveryCurrent(epoch);
+                try {
+                    let chState = this.loadRecoveryState().channels[chId];
+                    if (!chState?.watch_after || chState.checkpoint_source === "baseline_pending") {
+                        chState = await this._establishFirstWatchBaseline(chId, epoch);
                     }
-                }
-
-                // Ensure subscription is active
-                const wasSubscribed = this.activeSubscriptions.has(chId);
-                if (!wasSubscribed) {
-                    try {
+                    const wasSubscribed = this.activeSubscriptions.has(chId);
+                    if (!wasSubscribed) {
                         await this.client.subscribeMessageCreate(chId);
+                        this.assertRecoveryCurrent(epoch);
                         this.activeSubscriptions.add(chId);
-                    } catch (err) {
-                        failedChannels.push(chId);
-                        channelErrors.push(`Subscribe failed for ${chId}: ${err?.message || String(err)}`);
-                        continue;
                     }
-                }
-
-                // Perform snapshot recovery if newly subscribed, channel previously failed, or global recovery in error
-                const needsRecovery = !wasSubscribed || chState.last_result !== "success" || globalRecoveryNeeded;
-                if (needsRecovery) {
-                    const recovered = await this.recoverChannelSnapshot(chId);
-                    recoveryState = this.loadRecoveryState();
-                    chState = recoveryState.channels[chId];
-                    if (chState?.last_result !== "success") {
-                        failedChannels.push(chId);
-                        channelErrors.push(chState?.last_error || `Recovery failed for ${chId}`);
+                    if (!wasSubscribed || chState.last_result !== "success" || needsFullRecovery) {
+                        await this._recoverChannelSnapshot(chId, epoch);
                     }
+                } catch (err) {
+                    this.assertRecoveryCurrent(epoch); // A newer live error aborts this old pass.
+                    this.recordChannelRecoveryError(chId, err);
+                    failures.push(`${chId}: ${err.message}`);
                 }
             }
-
-            // 4. Transactionally aggregate global status
-            if (failedChannels.length > 0) {
-                const combinedErr = `Recovery failed for channel(s) [${failedChannels.join(", ")}]: ${channelErrors[0]}`;
-                this.markRecoveryError(combinedErr);
-            } else {
-                this.recoveryStateStatus = "ready";
-                this.recoveryLastError = null;
-                this.recoveryLastAt = new Date().toISOString();
-                if (this.lastError && (this.lastError.startsWith("Recovery") || this.lastError.startsWith("Subscribe failed"))) {
-                    this.lastError = null;
-                }
-                if (this.collectorState === "error" && !this.fatalError) {
-                    this.collectorState = "running";
-                }
-                this.writeStatus(this.collectorState);
+            this.assertRecoveryCurrent(epoch);
+            // Do not publish ready for an old watchlist, even if its watcher has not fired yet.
+            if (JSON.stringify(this.loadWatchlist()) !== JSON.stringify(wl)) this.reconcileRequested = true;
+            if (failures.length) {
+                this.markRecoveryError(`Recovery failed for channel(s): ${failures.join("; ")}`);
+            } else if (!this.reconcileRequested) {
+                this.finishRecovery();
             }
-        } finally {
-            this.isReconciling = false;
+        } catch (err) {
+            if (!this.stopping && !this.fatalError && epoch === this.recoveryEpoch) {
+                this.markRecoveryError(`Recovery state error: ${err.message}`);
+            }
         }
     }
 
-    /**
-     * Bounded recent message recovery via GET_CHANNEL snapshot.
-     * Reconciles messages against the channel's immutable watch_after baseline.
-     * Never derives a newer watch_after boundary.
-     * @param {string} channelId
-     */
-    async recoverChannelSnapshot(channelId) {
+    finishRecovery() {
+        this.recoveryStateStatus = "ready";
+        this.recoveryLastError = null;
+        this.recoveryLastAt = new Date().toISOString();
+        if (this.lastError && (this.lastError.startsWith("Recovery") || this.lastError.startsWith("Subscribe failed"))) {
+            this.lastError = null;
+        }
+        this.collectorState = this.lastError ? "error" : "running";
+        this.writeStatus();
+    }
+
+    recordChannelRecoveryError(channelId, err) {
         try {
-            this.recoveryStateStatus = "recovering";
-            let state = this.loadRecoveryState();
-            let chState = state.channels[channelId];
-
-            if (!chState || (!chState.watch_after && chState.checkpoint_source !== "baseline_pending")) {
-                if (this.hasPriorCollectionEvidence(channelId)) {
-                    throw new Error(`Cannot recover existing channel ${channelId}: channel has durable collection evidence but no valid checkpoint`);
-                }
-                await this.establishFirstWatchBaseline(channelId);
-                state = this.loadRecoveryState();
-                chState = state.channels[channelId];
-            }
-
-            const ch = await this.client.getChannel(channelId);
-            const messages = Array.isArray(ch?.messages) ? ch.messages : [];
-
-            // Sort raw snapshot ascending by snowflake
-            messages.sort((a, b) => BigInt(a.id) < BigInt(b.id) ? -1 : 1);
-
-            // If channel is baseline_pending from beginChannelInitialization:
-            if (chState.checkpoint_source === "baseline_pending") {
-                if (this.hasPriorCollectionEvidence(channelId)) {
-                    throw new Error(`Cannot re-anchor channel ${channelId}: channel has durable collection evidence`);
-                }
-                if (messages.length > 0) {
-                    const latestMsg = messages[messages.length - 1];
-                    chState.watch_after = deriveFirstWatchBoundary(latestMsg.id);
-                } else {
-                    chState.watch_after = "0";
-                }
-                chState.checkpoint_message_id = chState.watch_after;
-                chState.checkpoint_source = "rpc";
+            const state = this.loadRecoveryState();
+            if (state.channels[channelId]) {
+                Object.assign(state.channels[channelId], {
+                    last_result: "error", last_error: err.message, last_recovery_at: new Date().toISOString()
+                });
                 this.saveRecoveryState(state);
             }
+        } catch {} // A failed annotation must never turn a failed RPC into success.
+    }
 
-            // Reconcile strictly against immutable watch_after baseline
-            const watchAfterBig = BigInt(chState.watch_after || "0");
-            const eligibleMessages = messages.filter(m => BigInt(m.id) > watchAfterBig);
-
-            const guildId = this.channelGuildMap.get(channelId) || ch?.guild_id || "";
-            const normalized = eligibleMessages.map(m => normalizeDiscordMessage(m, guildId, channelId));
-
-            const appended = this.appendEvents(normalized);
-
-            // Update checkpoint high-water mark monotonically
-            if (eligibleMessages.length > 0) {
-                const highestMsgId = eligibleMessages[eligibleMessages.length - 1].id;
-                if (BigInt(highestMsgId) > BigInt(chState.checkpoint_message_id || "0")) {
-                    chState.checkpoint_message_id = highestMsgId;
-                }
-            }
-
-            chState.checkpoint_journal_boundary = this.getCurrentJournalBoundary();
-            chState.last_recovery_at = new Date().toISOString();
-            chState.last_result = "success";
-            chState.last_error = null;
-            chState.recovered_count = (chState.recovered_count || 0) + appended;
-
-            this.saveRecoveryState(state);
-
-            // Only transition global status to ready if not currently in a multi-channel reconciliation pass
-            if (!this.isReconciling) {
-                let allHealthy = true;
-                for (const c of Object.values(state.channels)) {
-                    if (c.last_result !== "success") {
-                        allHealthy = false;
-                        break;
-                    }
-                }
-                if (allHealthy && !this.fatalError) {
-                    this.recoveryStateStatus = "ready";
-                    this.recoveryLastError = null;
-                    this.recoveryLastAt = new Date().toISOString();
-                    if (this.lastError && (this.lastError.startsWith("Recovery") || this.lastError.startsWith("Subscribe failed"))) {
-                        this.lastError = null;
-                    }
-                    if (this.collectorState === "error") {
-                        this.collectorState = "running";
-                    }
-                    this.writeStatus(this.collectorState);
-                }
-            }
-
-            return appended;
-        } catch (err) {
-            const errReason = `Recovery failed for ${channelId}: ${err?.message || String(err)}`;
+    // Direct recovery callers use the same owner as the watchlist coordinator.
+    recoverChannelSnapshot(channelId) {
+        return this.queueRecovery(async () => {
+            const epoch = this.recoveryEpoch;
             try {
+                const appended = await this._recoverChannelSnapshot(channelId, epoch);
+                this.assertRecoveryCurrent(epoch);
                 const state = this.loadRecoveryState();
-                if (state.channels[channelId]) {
-                    state.channels[channelId].last_result = "error";
-                    state.channels[channelId].last_error = errReason;
-                    state.channels[channelId].last_recovery_at = new Date().toISOString();
-                    this.saveRecoveryState(state);
+                if (Object.values(state.channels).every(ch => ch.last_result === "success")) this.finishRecovery();
+                return appended;
+            } catch (err) {
+                if (!this.stopping && !this.fatalError && epoch === this.recoveryEpoch) {
+                    this.recordChannelRecoveryError(channelId, err);
+                    this.markRecoveryError(`Recovery failed for ${channelId}: ${err.message}`);
                 }
-            } catch {}
-            this.markRecoveryError(errReason);
-            return 0;
+                return 0;
+            }
+        });
+    }
+
+    async _recoverChannelSnapshot(channelId, epoch) {
+        this.assertRecoveryCurrent(epoch);
+        let state = this.loadRecoveryState();
+        let chState = state.channels[channelId];
+        if (!chState?.watch_after || chState.checkpoint_source === "baseline_pending") {
+            chState = await this._establishFirstWatchBaseline(channelId, epoch);
         }
+        const baseline = chState.watch_after;
+        const ch = await this.client.getChannel(channelId);
+        this.assertRecoveryCurrent(epoch);
+        // Never commit a pre-await object: merge live checkpoints/other channels
+        // from freshly validated durable state, and reject changed baselines.
+        state = this.loadRecoveryState();
+        chState = state.channels[channelId];
+        if (!chState || chState.watch_after !== baseline || chState.checkpoint_source === "baseline_pending") {
+            throw new Error(`Recovery baseline changed while awaiting snapshot for ${channelId}`);
+        }
+        const messages = Array.isArray(ch?.messages) ? ch.messages : [];
+        messages.sort((a, b) => BigInt(a.id) < BigInt(b.id) ? -1 : 1);
+        const eligible = messages.filter(m => BigInt(m.id) > BigInt(baseline));
+        const guildId = this.channelGuildMap.get(channelId) || ch?.guild_id || "";
+        const appended = this.appendEvents(eligible.map(m => normalizeDiscordMessage(m, guildId, channelId)));
+        this.assertRecoveryCurrent(epoch);
+        if (eligible.length && BigInt(eligible.at(-1).id) > BigInt(chState.checkpoint_message_id)) {
+            chState.checkpoint_message_id = String(eligible.at(-1).id);
+        }
+        Object.assign(chState, {
+            checkpoint_journal_boundary: this.getCurrentJournalBoundary(),
+            last_recovery_at: new Date().toISOString(), last_result: "success", last_error: null,
+            recovered_count: (chState.recovered_count || 0) + appended
+        });
+        this.saveRecoveryState(state);
+        return appended;
     }
 
     /**
@@ -905,7 +844,7 @@ export class DiscordRpcCollector extends EventEmitter {
      * @param {object} dispatchData
      */
     handleMessageCreate(dispatchData) {
-        if (!dispatchData) return;
+        if (!dispatchData || this.stopping) return;
         if (this.fatalError) {
             console.error(`[RPC Collector] Refusing live message append: collector is in fail-stop state (${this.fatalError})`);
             return;
@@ -1083,6 +1022,7 @@ export class DiscordRpcCollector extends EventEmitter {
      */
     async stop() {
         this.stopping = true;
+        this.recoveryEpoch++;
         if (this.heartbeatTimer) {
             clearInterval(this.heartbeatTimer);
             this.heartbeatTimer = null;

@@ -224,7 +224,9 @@ export class RpcCollectorDaemon extends EventEmitter {
                     if (colRec.recovery_state === "error") {
                         this.recoveryState = "error";
                     }
-                } else if (this.collectorState === COLLECTOR_STATES.ERROR && colRec.collector_state === "running" && colRec.recovery_state === "ready" && !colRec.last_error) {
+                } else if (colRec.collector_state === "starting" && this.mode === MODES.NORMAL) {
+                    this.collectorState = COLLECTOR_STATES.CATALOG_WATCHLIST_READY;
+                } else if ([COLLECTOR_STATES.ERROR, COLLECTOR_STATES.CATALOG_WATCHLIST_READY].includes(this.collectorState) && colRec.collector_state === "running" && colRec.recovery_state === "ready" && !colRec.last_error) {
                     this.collectorState = COLLECTOR_STATES.NORMAL_OPERATION;
                     this.recoveryState = "ready";
                     this.lastError = null;
@@ -597,24 +599,8 @@ export class RpcCollectorDaemon extends EventEmitter {
             client: this.client
         });
 
-        this.collector.on("fatal_error", (fatalErr) => {
-            try {
-                this.collectorState = COLLECTOR_STATES.ERROR;
-                this.lastError = fatalErr.message;
-                try {
-                    console.error(`[RPC Daemon] Fatal error from collector: ${fatalErr.message}`);
-                } catch {}
-                try {
-                    this.publishStatus({ lastError: this.lastError });
-                } catch (pubErr) {
-                    try {
-                        console.error(`[RPC Daemon] Failed to publish status on fatal error: ${pubErr.message}`);
-                    } catch {}
-                }
-            } finally {
-                process.exit(1);
-            }
-        });
+        // Termination must precede status, logging, cleanup, or any other I/O.
+        this.collector.on("fatal_error", () => process.exit(1));
 
         this.collector.on("recovery_error", (recErr) => {
             console.warn(`[RPC Daemon] Recovery error from collector: ${recErr.message}`);
@@ -672,8 +658,7 @@ export class RpcCollectorDaemon extends EventEmitter {
      * Single-flight: concurrent calls return the in-flight reconciliation promise.
      */
     retryRecovery() {
-        if (!this.collector || this.collector.fatalError) {
-            this.publishStatus();
+        if (this.stopping || !this.collector || this.collector.fatalError) {
             return Promise.resolve(this.collectorState);
         }
 
@@ -691,7 +676,7 @@ export class RpcCollectorDaemon extends EventEmitter {
                 this.retryInProgress = false;
                 this.retryPromise = null;
             }
-            this.publishStatus();
+            if (!this.stopping && !this.collector?.fatalError) this.publishStatus();
             return this.collectorState;
         })();
 

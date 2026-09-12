@@ -8,6 +8,7 @@ import * as fs from "fs";
 import * as path from "path";
 import * as os from "os";
 import { pathToFileURL } from "url";
+import { runStateOwnershipTests } from "./rpc_state_ownership_test.mjs";
 import { MockDiscordRpcServer } from "./mock_discord_rpc.mjs";
 import { RpcCollectorDaemon } from "../rpc/daemon.mjs";
 import { RpcTransport } from "../rpc/transport.mjs";
@@ -453,7 +454,7 @@ async function runDaemonFatalErrorExitTest() {
         const daemon = new RpcCollectorDaemon({
             exchangeDir: ${JSON.stringify(tmpExchange)},
             collectorDataDir: ${JSON.stringify(privateDir)},
-            runtimeDir: ${JSON.stringify(path.join(tmpExchange, "runtime"))},
+            runtimeDir: path.join(${JSON.stringify(tmpExchange)}, "runtime-" + process.argv[2]),
             clientId: "test_daemon_client",
             clientSecret: "test_daemon_secret",
             tokenPath: ${JSON.stringify(path.join(privateDir, "oauth-token.json"))},
@@ -468,61 +469,58 @@ async function runDaemonFatalErrorExitTest() {
         await daemon.start();
         console.log("READY_FOR_FATAL_TEST");
 
-        // Force status publication and collector writeStatus to throw (simulate ENOSPC / unwriteable disk)
-        daemon.publishStatus = () => {
-            throw new Error("ENOSPC: no space left on device (simulated publishStatus failure)");
+        // Reaching an operation that could block is itself a failure: no hung
+        // filesystem/watchdog is needed to prove termination precedes diagnostic I/O.
+        const forbiddenIO = () => {
+            if (process.argv[2] === "throws") throw new Error("ENOSPC: synthetic status failure");
+            process.exit(42);
         };
-        if (daemon.collector) {
-            daemon.collector.writeStatus = () => {
-                throw new Error("ENOSPC: no space left on device (simulated writeStatus failure)");
-            };
-        }
+        daemon.publishStatus = forbiddenIO;
+        daemon.collector.writeStatus = forbiddenIO;
+        console.error = forbiddenIO;
 
         // Trigger collector fatal error
         daemon.collector.failStop("Simulated write uncertainty with broken status publication");
     `);
 
     const { spawn } = await import("child_process");
-    const child = spawn(process.execPath, [harnessScript], { stdio: ["ignore", "pipe", "pipe"] });
+    for (const mode of ["no-io", "throws"]) {
+        const child = spawn(process.execPath, [harnessScript, mode], { stdio: ["ignore", "pipe", "pipe"] });
 
-    let stdoutData = "";
-    let stderrData = "";
-    let readySeen = false;
+        let stdoutData = "";
+        let stderrData = "";
+        let readySeen = false;
 
-    child.stdout.on("data", (chunk) => {
-        stdoutData += chunk.toString();
-        if (stdoutData.includes("READY_FOR_FATAL_TEST")) {
-            readySeen = true;
-        }
-    });
-
-    child.stderr.on("data", (chunk) => {
-        stderrData += chunk.toString();
-    });
-
-    const exitCode = await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => {
-            child.kill();
-            reject(new Error("Daemon failed to exit within 5000ms after fatal_error"));
-        }, 5000);
-
-        child.on("exit", (code) => {
-            clearTimeout(timer);
-            resolve(code);
+        child.stdout.on("data", (chunk) => {
+            stdoutData += chunk.toString();
+            if (stdoutData.includes("READY_FOR_FATAL_TEST")) {
+                readySeen = true;
+            }
         });
-    });
 
-    if (!readySeen) {
-        console.error("DEBUG stdout:", stdoutData);
-        console.error("DEBUG stderr:", stderrData);
+        child.stderr.on("data", (chunk) => {
+            stderrData += chunk.toString();
+        });
+
+        const exitCode = await new Promise((resolve, reject) => {
+            const timer = setTimeout(() => {
+                child.kill();
+                reject(new Error("Daemon failed to exit within 5000ms after fatal_error"));
+            }, 5000);
+
+            child.on("exit", (code) => {
+                clearTimeout(timer);
+                resolve(code);
+            });
+        });
+
+        if (!readySeen) {
+            console.error("DEBUG stdout:", stdoutData);
+            console.error("DEBUG stderr:", stderrData);
+        }
+        assert.ok(readySeen, "Child daemon must signal READY_FOR_FATAL_TEST before fatal error injection");
+        assert.strictEqual(exitCode, 1, "Production daemon process must exit with code 1 even if status I/O throws");
     }
-    assert.ok(readySeen, "Child daemon must signal READY_FOR_FATAL_TEST before fatal error injection");
-    assert.strictEqual(exitCode, 1, "Production daemon process must exit with code 1 even if status I/O throws");
-    const combinedLogs = stdoutData + "\n" + stderrData;
-    assert.ok(
-        combinedLogs.includes("Fatal error from collector") || combinedLogs.includes("Failed to publish status on fatal error"),
-        "Process exit must be from intentional fatal_error path"
-    );
 
     try { fs.rmSync(tmpExchange, { recursive: true, force: true }); } catch {}
     console.log("rpc_daemon_test (fatal error exit code 1 despite status failure) passed");
@@ -625,18 +623,18 @@ async function runDaemonTwoChannelRecoveryTest() {
         // Restore valid recovery state file
         fs.writeFileSync(recoveryStateFile, JSON.stringify(initialValidState));
 
-        // Hook recoverChannelSnapshot to verify global state remains "error" after A finishes, before B finishes
+        // Inspect status before B responds: A alone cannot complete global recovery.
         let stateAfterA = null;
-        const origRecover = daemon.collector.recoverChannelSnapshot.bind(daemon.collector);
-        daemon.collector.recoverChannelSnapshot = async (chId) => {
-            const res = await origRecover(chId);
-            if (chId === "2001") {
+        const origGet = client.getChannel.bind(client);
+        client.getChannel = async chId => {
+            if (chId === "2002") {
+                daemon.publishStatus();
                 stateAfterA = {
                     collectorState: daemon.collectorState,
                     recoveryState: daemon.recoveryState
                 };
             }
-            return res;
+            return origGet(chId);
         };
 
         // Heartbeat triggers retryRecovery automatically
@@ -644,7 +642,8 @@ async function runDaemonTwoChannelRecoveryTest() {
 
         // Verify global state was NOT ready when only channel A had completed
         assert.ok(stateAfterA, "Channel A must have completed first");
-        assert.strictEqual(stateAfterA.recoveryState, "error", "Global recovery_state must NOT become ready before all channels finish");
+        assert.notStrictEqual(stateAfterA.recoveryState, "ready", "Global recovery_state must NOT become ready before all channels finish");
+        assert.notStrictEqual(stateAfterA.collectorState, "running", "Running requires the whole pass");
 
         // After both finish, verify status transitioned to running and ready
         assert.strictEqual(daemon.collectorState, "running");
@@ -882,6 +881,7 @@ async function main() {
     await runDaemonTwoChannelRecoveryTest();
     await runDaemonOneSucceedsOneFailsTest();
     await runDaemonRetrySingleFlightTest();
+    await runStateOwnershipTests();
 }
 
 main().catch(err => {

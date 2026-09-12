@@ -563,10 +563,10 @@ async function runTests() {
             collector1A.appendEvents([evtA]);
         }, /Collector is in fail-stop state/);
 
-        // Verify status file on disk
+        // Fatal classification updates memory without depending on disk status.
         const statusFileA = path.join(tmpExchangeA, "collector-status.json");
-        assert.ok(fs.existsSync(statusFileA));
-        const statusRecordA = JSON.parse(fs.readFileSync(statusFileA, "utf8"));
+        assert.equal(fs.existsSync(statusFileA), false, "Fatal decision must not write status");
+        const statusRecordA = collector1A.getStatusRecord();
         assert.strictEqual(statusRecordA.collector_state, "error");
         assert.ok(statusRecordA.last_error.includes("Fatal journal error"));
 
@@ -637,8 +637,8 @@ async function runTests() {
         }, /Collector is in fail-stop state/);
 
         const statusFileB = path.join(tmpExchangeB, "collector-status.json");
-        assert.ok(fs.existsSync(statusFileB));
-        const statusRecordB = JSON.parse(fs.readFileSync(statusFileB, "utf8"));
+        assert.equal(fs.existsSync(statusFileB), false, "Fatal decision must not write status");
+        const statusRecordB = collector1B.getStatusRecord();
         assert.strictEqual(statusRecordB.collector_state, "error");
 
         const rawRecordsB = readAllJournalRecords(tmpExchangeB);
@@ -784,6 +784,7 @@ async function runTests() {
             pending: null
         }));
         assert.strictEqual(collector.hasPriorCollectionEvidence("3001"), false);
+        await collector.recoverChannelSnapshot("2001"); // Complete recovery of the repaired channel before declaring health.
         const newChRecovered = await collector.recoverChannelSnapshot("3001");
         assert.strictEqual(newChRecovered, 1, "Baseline anchor consumes seed message in anchor millisecond");
         const diskStateAfter = JSON.parse(fs.readFileSync(recoveryStateFile, "utf8"));
