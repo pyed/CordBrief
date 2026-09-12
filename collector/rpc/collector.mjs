@@ -56,19 +56,88 @@ export function safeReplaceJSON(destinationPath, data, mode = 0o644, syncDir = s
     syncDir(dir);
 }
 
+export const PROVENANCE_STATE = Object.freeze({
+    FRESH: "fresh",
+    PRIOR_EPISODE: "prior_episode",
+    UNKNOWN: "unknown"
+});
+
+// Classify recovery provenance into tri-state: FRESH, PRIOR_EPISODE, or UNKNOWN.
+// Unknown provenance (transient I/O error, permission error, malformed JSON) must
+// never be treated as fresh. Status provides only conservative refusal evidence.
+export function classifyRecoveryProvenance(exchangeDir, recoveryStatePath, observedAnchor = false) {
+    for (const p of [recoveryStatePath, recoveryStatePath + ".anchors"]) {
+        try {
+            fs.statSync(p);
+            return { state: PROVENANCE_STATE.FRESH, reason: null };
+        } catch (err) {
+            if (err && err.code === "ENOENT") {
+                continue;
+            }
+            return {
+                state: PROVENANCE_STATE.UNKNOWN,
+                reason: `Recovery provenance unknown: unable to inspect recovery state (${err?.code || err?.message || String(err)})`
+            };
+        }
+    }
+
+    const lostReason = "Recovery provenance lost after prior operation; restore recovery-state and anchors from backup";
+    if (observedAnchor) {
+        return { state: PROVENANCE_STATE.PRIOR_EPISODE, reason: lostReason };
+    }
+
+    const statusPath = path.join(exchangeDir, "collector-status.json");
+    let raw;
+    try {
+        raw = fs.readFileSync(statusPath, "utf8");
+    } catch (err) {
+        if (err && err.code === "ENOENT") {
+            return { state: PROVENANCE_STATE.FRESH, reason: null };
+        }
+        return {
+            state: PROVENANCE_STATE.UNKNOWN,
+            reason: `Recovery provenance unknown: unable to inspect collector status (${err?.code || err?.message || String(err)})`
+        };
+    }
+
+    let prior;
+    try {
+        prior = JSON.parse(raw);
+    } catch (err) {
+        return {
+            state: PROVENANCE_STATE.UNKNOWN,
+            reason: `Recovery provenance unknown: unparseable collector status (${err?.message || String(err)})`
+        };
+    }
+
+    if (!prior || typeof prior !== "object" || Array.isArray(prior) || prior.version !== 1) {
+        return {
+            state: PROVENANCE_STATE.UNKNOWN,
+            reason: "Recovery provenance unknown: invalid collector status schema"
+        };
+    }
+
+    if (prior.recovery_last_error === lostReason ||
+        (prior.recovery_state === "ready" && prior.watched_channel_count > 0 &&
+            typeof prior.recovery_last_at === "string" && Number.isFinite(Date.parse(prior.recovery_last_at)))) {
+        return { state: PROVENANCE_STATE.PRIOR_EPISODE, reason: lostReason };
+    }
+
+    if (typeof prior.recovery_last_error === "string" && prior.recovery_last_error.startsWith("Recovery provenance unknown:")) {
+        return { state: PROVENANCE_STATE.UNKNOWN, reason: prior.recovery_last_error };
+    }
+
+    return { state: PROVENANCE_STATE.FRESH, reason: null };
+}
+
 // Status supplies only a conservative refusal signal, never a baseline. Preserve
 // this diagnosed error in subsequent status publications so restart cannot erase it.
 export function recoveryProvenanceError(exchangeDir, recoveryStatePath, observedAnchor = false) {
-    if (fs.existsSync(recoveryStatePath) || fs.existsSync(recoveryStatePath + ".anchors")) return null;
-    const reason = "Recovery provenance lost after prior operation; restore recovery-state and anchors from backup";
-    if (observedAnchor) return reason;
-    try {
-        const prior = JSON.parse(fs.readFileSync(path.join(exchangeDir, "collector-status.json"), "utf8"));
-        if (prior?.version === 1 && (prior.recovery_last_error === reason ||
-            (prior.recovery_state === "ready" && prior.watched_channel_count > 0 &&
-                typeof prior.recovery_last_at === "string" && Number.isFinite(Date.parse(prior.recovery_last_at))))) return reason;
-    } catch {} // Missing/unreadable telemetry does not prove prior activation.
-    return null;
+    const classification = classifyRecoveryProvenance(exchangeDir, recoveryStatePath, observedAnchor);
+    if (classification.state === PROVENANCE_STATE.FRESH) {
+        return null;
+    }
+    return classification.reason;
 }
 
 export function normalizeDiscordMessage(message, explicitGuildId = "", explicitChannelId = "") {
@@ -995,11 +1064,24 @@ export class DiscordRpcCollector extends EventEmitter {
     writeStatus(state = null) {
         if (state) this.collectorState = state;
         try {
+            const provenance = classifyRecoveryProvenance(this.exchangeDir, this.recoveryStatePath, this.observedRecoveryAnchor);
+            if (provenance.state === PROVENANCE_STATE.UNKNOWN) {
+                this.collectorState = "error";
+                this.recoveryStateStatus = "error";
+                this.lastError = provenance.reason;
+                this.recoveryLastError = provenance.reason;
+                return;
+            }
             const statusRecord = this.getStatusRecord();
-            const lost = recoveryProvenanceError(this.exchangeDir, this.recoveryStatePath, this.observedRecoveryAnchor);
-            if (lost) Object.assign(statusRecord, {
-                collector_state: "error", recovery_state: "error", last_error: lost, recovery_last_error: lost
-            });
+            if (provenance.state === PROVENANCE_STATE.PRIOR_EPISODE) {
+                this.collectorState = "error";
+                this.recoveryStateStatus = "error";
+                this.lastError = provenance.reason;
+                this.recoveryLastError = provenance.reason;
+                Object.assign(statusRecord, {
+                    collector_state: "error", recovery_state: "error", last_error: provenance.reason, recovery_last_error: provenance.reason
+                });
+            }
             const statusPath = path.join(this.exchangeDir, "collector-status.json");
             safeReplaceJSON(statusPath, statusRecord);
         } catch (err) {

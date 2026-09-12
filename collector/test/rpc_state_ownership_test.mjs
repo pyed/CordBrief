@@ -359,6 +359,206 @@ export async function runStateOwnershipTests() {
             assert.equal(JSON.parse(fs.readFileSync(path.join(f.root, "collector-status.json"))).collector_state, "stopped");
         } finally { baseline.resolve({ messages: [] }); await f.close(); }
     }
+
+    // Exact transient provenance-read regression:
+    // When both authoritative recovery files are missing and surviving status encounters
+    // transient EIO on startup provenance read, unreadable evidence must NOT be treated as
+    // absent evidence: startup must not overwrite surviving evidence with default/starting status,
+    // must not query Discord for a fresh baseline, and must remain fail-closed both during EIO
+    // and after readability is recovered.
+    {
+        const f = await fixture();
+        let calls = 0;
+        try {
+            f.client.getChannel = async () => { calls++; return { messages: [] }; };
+            f.watch(["2001"]);
+            await f.daemon.retryRecovery();
+            assert.equal(f.records().length, 0, "Hardest case: zero journal evidence");
+            assert.equal(f.daemon.collectorState, "running");
+            assert.equal(f.collector.recoveryStateStatus, "ready");
+            const statusPath = path.join(f.root, "collector-status.json");
+            const operationalStatus = fs.readFileSync(statusPath, "utf8");
+            const priorCalls = calls;
+
+            fs.unlinkSync(f.collector.recoveryStatePath);
+            fs.unlinkSync(f.collector.recoveryAnchorsPath);
+            f.client.getChannel = async () => { calls++; return { messages: [message(2), message(3)] }; };
+
+            await f.daemon.stop();
+            fs.writeFileSync(statusPath, operationalStatus);
+
+            // Inject EIO on the FIRST read of surviving status used for provenance
+            const origReadFileSync = fs.readFileSync;
+            let readCount = 0;
+            fs.readFileSync = (file, ...args) => {
+                if (file === statusPath && ++readCount === 1) {
+                    const err = new Error("Injected transient EIO on first surviving status read");
+                    err.code = "EIO";
+                    throw err;
+                }
+                return origReadFileSync(file, ...args);
+            };
+            syncBuiltinESMExports();
+
+            try {
+                await f.restart();
+            } finally {
+                fs.readFileSync = origReadFileSync;
+                syncBuiltinESMExports();
+            }
+
+            assert(readCount >= 1, "Must have intercepted status read");
+            // Assertions after the first read failure:
+            assert.equal(calls, priorCalls, "no baseline establishment or GET_CHANNEL call must occur");
+            assert.equal(f.collector.activeSubscriptions.size, 0, "no subscription must occur");
+            assert.notEqual(f.collector.collectorState, "running", "collector must not become running/ready");
+            assert.equal(f.collector.collectorState, "error");
+            assert.equal(f.collector.recoveryStateStatus, "error");
+            assert.equal(f.daemon.collectorState, "error", "state is visibly fail-closed");
+            assert.equal(f.daemon.recoveryState, "error");
+            assert(f.daemon.lastError && (f.daemon.lastError.includes("Recovery provenance lost") || f.daemon.lastError.includes("Recovery provenance unknown")));
+
+            // Then verify: merely recovering filesystem readability does NOT cause automatic fresh initialization.
+            await f.daemon.retryRecovery();
+            assert.equal(calls, priorCalls, "readability recovery must not authorize a new baseline query");
+            assert.equal(f.collector.activeSubscriptions.size, 0);
+            assert.equal(f.daemon.collectorState, "error");
+            assert.equal(f.daemon.recoveryState, "error");
+            assert.equal(f.collector.collectorState, "error");
+            assert.equal(f.collector.recoveryStateStatus, "error");
+
+            // Subsequent restart still fails closed and preserves refusal
+            await f.restart();
+            assert.equal(calls, priorCalls, "restart after readability recovery must still fail closed");
+            assert.equal(f.collector.activeSubscriptions.size, 0);
+            assert.equal(f.daemon.collectorState, "error");
+            assert.equal(f.daemon.recoveryState, "error");
+            const finalStatus = JSON.parse(fs.readFileSync(statusPath, "utf8"));
+            assert.equal(finalStatus.collector_state, "error");
+            assert.equal(finalStatus.recovery_state, "error");
+            assert.equal(finalStatus.recovery_last_error, "Recovery provenance lost after prior operation; restore recovery-state and anchors from backup");
+        } finally {
+            await f.close();
+        }
+    }
+
+    // Control C: Transient EIO persisting through initial startup -> UNKNOWN / fail closed without destroying evidence
+    {
+        const f = await fixture();
+        let calls = 0;
+        try {
+            f.client.getChannel = async () => { calls++; return { messages: [] }; };
+            f.watch(["2001"]);
+            await f.daemon.retryRecovery();
+            assert.equal(f.daemon.collectorState, "running");
+            const statusPath = path.join(f.root, "collector-status.json");
+            const operationalStatus = fs.readFileSync(statusPath, "utf8");
+            const priorCalls = calls;
+
+            fs.unlinkSync(f.collector.recoveryStatePath);
+            fs.unlinkSync(f.collector.recoveryAnchorsPath);
+            f.client.getChannel = async () => { calls++; return { messages: [message(2)] }; };
+
+            await f.daemon.stop();
+            fs.writeFileSync(statusPath, operationalStatus);
+
+            let injectEio = true;
+            const origReadFileSync = fs.readFileSync;
+            fs.readFileSync = (file, ...args) => {
+                if (file === statusPath && injectEio) {
+                    const err = new Error("Injected persistent EIO during startup");
+                    err.code = "EIO";
+                    throw err;
+                }
+                return origReadFileSync(file, ...args);
+            };
+            syncBuiltinESMExports();
+
+            try {
+                await f.restart();
+            } finally {
+                injectEio = false;
+                fs.readFileSync = origReadFileSync;
+                syncBuiltinESMExports();
+            }
+
+            assert.equal(calls, priorCalls);
+            assert.equal(f.collector.activeSubscriptions.size, 0);
+            assert.equal(f.daemon.collectorState, "error");
+            assert.equal(f.daemon.recoveryState, "error");
+            assert(f.daemon.lastError && f.daemon.lastError.includes("Recovery provenance unknown"));
+            assert.equal(fs.readFileSync(statusPath, "utf8"), operationalStatus, "Evidence must be preserved during UNKNOWN state");
+
+            // After readability recovers, retry fails closed because evidence was preserved
+            await f.daemon.retryRecovery();
+            assert.equal(calls, priorCalls);
+            assert.equal(f.daemon.collectorState, "error");
+            assert.equal(f.daemon.recoveryState, "error");
+            assert.equal(f.collector.collectorState, "error");
+            const recStatus = JSON.parse(fs.readFileSync(statusPath, "utf8"));
+            assert.equal(recStatus.collector_state, "error");
+            assert.equal(recStatus.recovery_state, "error");
+            assert.equal(recStatus.recovery_last_error, "Recovery provenance lost after prior operation; restore recovery-state and anchors from backup");
+        } finally {
+            await f.close();
+        }
+    }
+
+    // Control D: Malformed status -> UNKNOWN / fail closed, evidence preserved
+    {
+        const f = await fixture();
+        let calls = 0;
+        try {
+            f.client.getChannel = async () => { calls++; return { messages: [] }; };
+            f.watch(["2001"]);
+            await f.daemon.retryRecovery();
+            assert.equal(f.daemon.collectorState, "running");
+            const statusPath = path.join(f.root, "collector-status.json");
+            const priorCalls = calls;
+
+            fs.unlinkSync(f.collector.recoveryStatePath);
+            fs.unlinkSync(f.collector.recoveryAnchorsPath);
+            await f.daemon.stop();
+
+            for (const malformed of ["{corrupt", JSON.stringify({ version: 2 }), JSON.stringify("not an object")]) {
+                fs.writeFileSync(statusPath, malformed);
+                await f.restart();
+                assert.equal(calls, priorCalls, "Malformed status must not authorize fresh baseline");
+                assert.equal(f.daemon.collectorState, "error");
+                assert.equal(f.daemon.recoveryState, "error");
+                assert.equal(f.collector.activeSubscriptions.size, 0);
+                assert.equal(fs.readFileSync(statusPath, "utf8"), malformed, "Malformed status must not be overwritten");
+            }
+        } finally {
+            await f.close();
+        }
+    }
+
+    // Control F: Multi-channel control - adding a genuinely new channel with intact authoritative provenance
+    {
+        const f = await fixture(["2001"]);
+        let calls = 0;
+        try {
+            f.client.getChannel = async channel => { calls++; return { id: channel, messages: [message(10, channel)] }; };
+            assert.equal(f.daemon.collectorState, "running");
+            assert(fs.existsSync(f.collector.recoveryStatePath));
+            assert(fs.existsSync(f.collector.recoveryAnchorsPath));
+            const initialCalls = calls;
+
+            // Add genuinely new channel 2002
+            f.watch(["2001", "2002"]);
+            await f.daemon.retryRecovery();
+            assert.equal(f.daemon.collectorState, "running");
+            assert.equal(f.collector.recoveryStateStatus, "ready");
+            assert(calls > initialCalls, "Genuinely new channel must establish its baseline");
+            const state = f.collector.loadRecoveryState();
+            assert(state.channels["2001"]);
+            assert(state.channels["2002"]);
+        } finally {
+            await f.close();
+        }
+    }
+
     console.log("rpc_state_ownership_tests_passed");
 }
 

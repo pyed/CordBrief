@@ -11,7 +11,7 @@ import * as child_process from "child_process";
 import { EventEmitter } from "events";
 import { RpcTransport, findDiscordIPCPath } from "./transport.mjs";
 import { DiscordRpcClient, DEFAULT_REDIRECT_URI } from "./protocol.mjs";
-import { DiscordRpcCollector, safeReplaceJSON, recoveryProvenanceError } from "./collector.mjs";
+import { DiscordRpcCollector, safeReplaceJSON, recoveryProvenanceError, classifyRecoveryProvenance, PROVENANCE_STATE } from "./collector.mjs";
 
 function getEnv(name, defaultValue = "") {
     return process.env[name] || defaultValue;
@@ -256,10 +256,23 @@ export class RpcCollectorDaemon extends EventEmitter {
             recovery_pending_channels: this.recoveryPendingChannels,
             recovery_last_error: extra.recoveryLastError !== undefined ? extra.recoveryLastError : this.recoveryLastError
         };
-        const lost = recoveryProvenanceError(this.exchangeDir, this.recoveryStatePath, this.collector?.observedRecoveryAnchor);
-        if (lost) Object.assign(statusRecord, {
-            collector_state: "error", recovery_state: "error", last_error: lost, recovery_last_error: lost
-        });
+        const provenance = classifyRecoveryProvenance(this.exchangeDir, this.recoveryStatePath, this.collector?.observedRecoveryAnchor);
+        if (provenance.state === PROVENANCE_STATE.UNKNOWN) {
+            this.collectorState = COLLECTOR_STATES.ERROR;
+            this.recoveryState = "error";
+            this.lastError = provenance.reason;
+            this.recoveryLastError = provenance.reason;
+            return;
+        }
+        if (provenance.state === PROVENANCE_STATE.PRIOR_EPISODE) {
+            this.collectorState = COLLECTOR_STATES.ERROR;
+            this.recoveryState = "error";
+            this.lastError = provenance.reason;
+            this.recoveryLastError = provenance.reason;
+            Object.assign(statusRecord, {
+                collector_state: "error", recovery_state: "error", last_error: provenance.reason, recovery_last_error: provenance.reason
+            });
+        }
         safeReplaceJSON(path.join(this.exchangeDir, "collector-status.json"), statusRecord);
     }
 

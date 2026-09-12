@@ -59,16 +59,24 @@ but before recovery-state commit also fails closed. The collector does not
 automatically reconstruct recovery-state or query a replacement cutoff. Restore
 valid recovery-state consistent with the anchors; the normal heartbeat retry then
 reconciles against those same baselines. Malformed anchor data is also refused.
-Back up both files together. Simultaneous loss of both authoritative recovery
-files may make recovery impossible. An anchor already observed by the running
-collector, or surviving status showing successful recovery with watched channels,
-is a conservative tripwire: both files missing then means error, not fresh
-initialization. That diagnosed error is retained through subsequent status updates
-and restarts. Status never supplies message IDs, a baseline, or a checkpoint;
-it can only refuse operation. When no such evidence survives, it cannot distinguish
-total historical erasure from a truly fresh installation. Fresh installations
-and genuinely new channels with intact installation provenance still initialize
-normally. No additional authoritative recovery store is used.
+Back up both files together. Recovery-state and recovery anchors are the
+authoritative recovery provenance; simultaneous loss of both authoritative recovery
+files may make recovery impossible. Operational status is only conservative
+prior-episode evidence, never recovery state: it cannot reconstruct a baseline,
+checkpoint, cursor, or Discord message boundary, and can only refuse operation.
+Provenance distinguishes definitely fresh, prior episode, and unknown states.
+Unreadable evidence (such as transient filesystem I/O errors, permission errors,
+or malformed status JSON) means provenance is unknown; unknown provenance fails
+closed and must never be treated as fresh. Before any startup status publication
+can overwrite surviving episode evidence, provenance must be successfully classified;
+unreadable evidence is never overwritten with default startup status. An anchor
+already observed by the running collector, or surviving status showing successful
+recovery with watched channels, is a conservative tripwire: both files missing
+then means error, not fresh initialization. That diagnosed error is retained through
+subsequent status updates and restarts. When definitely no prior episode evidence
+exists, genuinely fresh installations and genuinely new channels with intact
+installation provenance still initialize normally. Discord snapshot recovery
+remains bounded and best-effort. No additional authoritative recovery store is used.
 
 All asynchronous recovery operations share one collector-owned queue. Startup,
 watchlist changes, and daemon retries use the same reconciliation owner; triggers
