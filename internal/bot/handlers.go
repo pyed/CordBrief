@@ -270,21 +270,20 @@ func (b *Bot) handleUnfollow(ctx context.Context, chatID int64, args []string) {
 }
 
 func (b *Bot) handleCallbackQuery(ctx context.Context, q *models.CallbackQuery) {
-	// Always answer callback query to clear Telegram's loading state.
+	// Single-owner authorization: silently ignore callbacks from unauthorized users or non-private chats.
+	if q.From.ID != b.ownerID {
+		return
+	}
+	if q.Message.Message == nil || q.Message.Message.Chat.Type != models.ChatTypePrivate {
+		return
+	}
+
+	// Always answer authorized callback queries to clear Telegram's loading indicator.
 	defer func() {
 		_, _ = b.client.AnswerCallbackQuery(ctx, &bot.AnswerCallbackQueryParams{
 			CallbackQueryID: q.ID,
 		})
 	}()
-
-	// Single-owner authorization for callbacks.
-	if q.From.ID != b.ownerID {
-		return
-	}
-
-	if q.Message.Message == nil || q.Message.Message.Chat.Type != models.ChatTypePrivate {
-		return
-	}
 
 	chatID := q.Message.Message.Chat.ID
 	messageID := q.Message.Message.ID

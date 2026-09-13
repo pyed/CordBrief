@@ -66,6 +66,12 @@ func (f *fakeSender) sentCount() int {
 	return len(f.sent)
 }
 
+func (f *fakeSender) answeredCount() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.answered)
+}
+
 func getInlineKeyboard(params *bot.SendMessageParams) [][]models.InlineKeyboardButton {
 	if params == nil || params.ReplyMarkup == nil {
 		return nil
@@ -544,6 +550,9 @@ func TestAuth_UnauthorizedCallbackCannotMutateState(t *testing.T) {
 	// Unauthorized user clicks it
 	b.HandleUpdate(ctx, nil, makeCallback(99999, "private", nowBtnData))
 
+	if sender.answeredCount() != 0 {
+		t.Errorf("expected 0 answered callbacks for unauthorized user, got %d", sender.answeredCount())
+	}
 	cfg, _ := store.LoadConfig()
 	if len(cfg.Channels) != 0 {
 		t.Error("unauthorized user caused config to be modified!")
@@ -620,5 +629,29 @@ func TestUnfollow_NoArgsShowsChannelButtons(t *testing.T) {
 	}
 	if !strings.Contains(kb[0][0].Text, "One") {
 		t.Errorf("expected first button to mention 'One', got %q", kb[0][0].Text)
+	}
+}
+
+// Additional test: Authorized callbacks on all paths (valid, cancel, expired, malformed) trigger AnswerCallbackQuery
+func TestCallback_AuthorizedPathsAlwaysAnswered(t *testing.T) {
+	b, sender, _, _ := setupTestBot(t)
+	ctx := context.Background()
+
+	callbacks := []string{
+		"action=status",
+		"action=channels",
+		"action=help_follow",
+		"action=unfollow_menu",
+		"f:now:expired123",
+		"u:cancel",
+		"garbage-callback",
+	}
+
+	for i, cb := range callbacks {
+		sender.answered = nil
+		b.HandleUpdate(ctx, nil, makeCallback(12345, "private", cb))
+		if sender.answeredCount() != 1 {
+			t.Errorf("[%d] expected 1 AnswerCallbackQuery for %q, got %d", i, cb, sender.answeredCount())
+		}
 	}
 }

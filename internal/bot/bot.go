@@ -78,6 +78,7 @@ func New(cfg *EnvConfig, store *state.Store, opts ...Option) (*Bot, error) {
 	if b.client == nil {
 		tgBot, err := bot.New(cfg.BotToken,
 			bot.WithDefaultHandler(b.HandleUpdate),
+			bot.WithNotAsyncHandlers(),
 			bot.WithAllowedUpdates(bot.AllowedUpdates{
 				"message",
 				"callback_query",
