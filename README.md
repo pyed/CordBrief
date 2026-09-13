@@ -14,6 +14,14 @@ At idle, CordBrief is a single Go process running Telegram long polling and an i
 - **Independent Channel Delivery:** Each followed channel produces its own separate Telegram brief and fails independently.
 - **LLM Abstraction:** Built on standard Go `net/http` targeting OpenAI-compatible chat completion APIs, with Google Gemini via its OpenAI-compatible endpoint as the default. Configurable base URL, model, and API key.
 
+## Persistence & State Contract
+
+- **Config (`config.json`):** Declarative user intent (followed channels, brief schedule, timezone, non-secret LLM configuration). Contains no secrets or cursors.
+- **State (`state.json`):** Durable operational facts learned at runtime, strictly keyed by Discord channel ID. Contains per-channel cursors, last success timestamps, and error history.
+- **Cursor Lifecycle:** A newly followed channel initially begins with an explicit `timestamp` cursor (RFC3339). Once messages are processed, it advances to a Discord `message_id` snowflake cursor.
+- **Advance Invariant:** A channel's cursor advances *only after* its brief has been successfully delivered to Telegram. If any step fails, the cursor remains untouched so the next run retries the interval.
+- **Disposable Working Data:** Raw Discord message exports are temporary working files deleted immediately after brief generation. They are never retained as durable state.
+
 ## Project Structure
 
 ```text

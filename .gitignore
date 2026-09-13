@@ -15,9 +15,9 @@ build/
 
 # Local configs, state, and secrets (must never be committed)
 *.env
-cordbrief.env
-config.json
-state.json
+/cordbrief.env
+/config.json
+/state.json
 
 # Runtime working directories and temporary data
 work/
