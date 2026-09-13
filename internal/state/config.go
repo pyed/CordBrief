@@ -93,7 +93,7 @@ func (c *Config) Validate() error {
 		if ch.ID == "" {
 			return fmt.Errorf("channel [%d]: id cannot be empty", i)
 		}
-		if !isDecimalString(ch.ID) {
+		if !IsDecimalString(ch.ID) {
 			return fmt.Errorf("channel [%d]: id %q must contain only decimal digits", i, ch.ID)
 		}
 		if _, exists := seen[ch.ID]; exists {

@@ -49,7 +49,7 @@ func (s *State) Validate() error {
 		if channelID == "" {
 			return errors.New("channel id cannot be empty")
 		}
-		if !isDecimalString(channelID) {
+		if !IsDecimalString(channelID) {
 			return fmt.Errorf("channel id %q must contain only decimal digits", channelID)
 		}
 
@@ -67,7 +67,7 @@ func (s *State) Validate() error {
 				return fmt.Errorf("channel %s: invalid timestamp cursor %q: %w", channelID, ch.Cursor.Value, err)
 			}
 		case CursorKindMessageID:
-			if !isDecimalString(ch.Cursor.Value) {
+			if !IsDecimalString(ch.Cursor.Value) {
 				return fmt.Errorf("channel %s: invalid message_id cursor %q: must contain only decimal digits", channelID, ch.Cursor.Value)
 			}
 		}
@@ -82,10 +82,10 @@ func (s *State) Validate() error {
 	return nil
 }
 
-// isDecimalString returns true if s is non-empty and consists only of digits '0'-'9'.
+// IsDecimalString returns true if s is non-empty and consists only of digits '0'-'9'.
 // Discord snowflakes and channel IDs are treated as decimal strings without integer
 // parsing to prevent overflow or truncation of signed 64-bit integers.
-func isDecimalString(s string) bool {
+func IsDecimalString(s string) bool {
 	if s == "" {
 		return false
 	}

@@ -22,6 +22,24 @@ At idle, CordBrief is a single Go process running Telegram long polling and an i
 - **Advance Invariant:** A channel's cursor advances *only after* its brief has been successfully delivered to Telegram. If any step fails, the cursor remains untouched so the next run retries the interval.
 - **Disposable Working Data:** Raw Discord message exports are temporary working files deleted immediately after brief generation. They are never retained as durable state.
 
+## Telegram Control Plane
+
+CordBrief operates as an owner-only, private Telegram bot. Interactions from unauthorized users or non-private chats are silently ignored.
+
+### Environment Configuration
+
+- `TELEGRAM_BOT_TOKEN`: Telegram bot token from @BotFather (required).
+- `TELEGRAM_OWNER_ID`: Telegram user ID of the authorized owner (required, positive integer).
+- `CORDBRIEF_DATA_DIR`: Directory path for `config.json` and `state.json` (optional, defaults to `./data`).
+
+### Commands
+
+- `/start`: Display the main menu and overview.
+- `/status`: Show current followed channel count, schedule, timezone, and LLM model.
+- `/channels`: List followed Discord channels with interactive follow and unfollow controls.
+- `/follow <channel_id> [display name]`: Follow a new channel with interactive start mode selection (`From now` or `Last 24 hours`).
+- `/unfollow [channel_id]`: Remove a channel from followed configuration and purge its operational state after confirmation.
+
 ## Project Structure
 
 ```text
