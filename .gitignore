@@ -13,47 +13,18 @@ build/
 *.out
 *.test
 
-# Node / JS dependencies and build products
-node_modules/
-
-# Local configs and secrets (must never be committed)
+# Local configs, state, and secrets (must never be committed)
+*.env
+cordbrief.env
 config.json
-.env
-.env.*
-!.env.example
+state.json
 
-# State, journals, and runtime data
-cordbrief-state*.json
-*.ndjson
-*.log
+# Runtime working directories and temporary data
+work/
+briefs/
 *.tmp
 *.temp
-
-# Discord and Desktop runtime state (if mounted or dropped locally)
-.config/
-keyrings/
-Crashpad/
-Local Storage/
-Session Storage/
-Cache/
-GPUCache/
-Cookies*
-
-# Keep local runtime secrets and snapshots out of source control.
-credentials.json
-oauth-token*.json
-secrets.json
-core-ack.json
-recovery-state.json
-collector-status.json
-collector-runtime-status.json
-retention-manifest.json
-*.ids.json
-/data/
-/exchange/
-/backups/
-*.tar
-*.tar.gz
+*.log
 
 # Editor and IDE caches
 .idea/

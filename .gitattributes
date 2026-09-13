@@ -1,2 +1,0 @@
-# Container entrypoints must stay runnable from Windows checkouts too.
-*.sh text eol=lf
