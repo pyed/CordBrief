@@ -44,6 +44,18 @@ CordBrief itself does not implement Discord protocols (no Gateway, REST, RPC, sc
 - `CORDBRIEF_DATA_DIR`: Directory path for `config.json` and `state.json` (optional, defaults to `./data`).
 - `CORDBRIEF_DCE_PATH`: Path to the pinned `DiscordChatExporter.Cli` executable (required for collection).
 - `DISCORD_TOKEN`: Discord authentication token passed directly to child DCE process via environment without appearing in command-line arguments (required for collection).
+- `LLM_API_KEY`: Secret API key for OpenAI-compatible LLM endpoint (required for brief generation).
+
+## LLM & Brief Engine
+
+CordBrief transforms raw normalized Discord messages into concise executive summaries without heavy frameworks or vendor lock-in:
+
+- **OpenAI-Compatible Chat Completions:** Built entirely on standard library `net/http`. Compatible with Google Gemini (default), OpenAI, Groq, Ollama, vLLM, llama.cpp, or any OpenAI-compatible API.
+- **Zero Provider SDKs:** No third-party AI SDKs, external tokenizers, or python sidecars. Only the Telegram bot library is an external Go module.
+- **Gemini Default:** Pre-configured with Google Gemini (`gemini-3.8-flash`) via `https://generativelanguage.googleapis.com/v1beta/openai/`.
+- **Character-Based Chunking:** Conservative 80,000-character budget per chunk without splitting individual message blocks. If active discussions exceed budget, a 3-stage hierarchical pipeline generates chronological notes per chunk before final synthesis.
+- **Prompt Injection Defense:** Discord chat transcripts are treated as untrusted user data. They are structurally delimited in the `user` role and never placed into the `system` role. Strict system instructions enforce factual summarization and order the model to ignore user-supplied instructions embedded in the transcript.
+- **Pure Transformation:** The brief engine is completely isolated from state and scheduling. It never mutates `state.json` cursors or initiates network calls outside its explicit context.
 
 ### Commands
 

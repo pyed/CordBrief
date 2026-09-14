@@ -10,7 +10,7 @@ import (
 // Default non-secret configuration values.
 const (
 	DefaultLLMBaseURL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-	DefaultLLMModel   = "gemini-2.5-flash"
+	DefaultLLMModel   = "gemini-3.8-flash"
 	DefaultTimezone   = "UTC"
 	DefaultSchedule   = "08:00"
 )
