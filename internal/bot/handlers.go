@@ -103,8 +103,13 @@ func (b *Bot) handleStatus(ctx context.Context, chatID int64) {
 		schedEnabled = "enabled"
 	}
 
-	text := fmt.Sprintf("CordBrief status\n\nChannels: %d\nSchedule: %s · %s · %s\nLLM: %s\nBrief engine: not implemented yet",
-		len(cfg.Channels), schedEnabled, cfg.Schedule.Time, cfg.Timezone, cfg.LLM.Model)
+	dceStatus := "not configured"
+	if b.dceClient != nil && b.dceClient.IsConfigured() {
+		dceStatus = "configured"
+	}
+
+	text := fmt.Sprintf("CordBrief status\n\nChannels: %d\nSchedule: %s · %s · %s\nLLM: %s\nDiscord exporter: %s\nBrief engine: not implemented yet",
+		len(cfg.Channels), schedEnabled, cfg.Schedule.Time, cfg.Timezone, cfg.LLM.Model, dceStatus)
 
 	markup := &models.InlineKeyboardMarkup{
 		InlineKeyboard: [][]models.InlineKeyboardButton{

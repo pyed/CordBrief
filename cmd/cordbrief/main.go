@@ -36,6 +36,11 @@ func main() {
 	}
 
 	log.Printf("Telegram bot initialized for owner ID %d (data directory: %s)", env.OwnerID, env.DataDir)
+	if env.DCEPath != "" && env.DiscordToken != "" {
+		log.Printf("Discord exporter configured (DCE binary: %s)", env.DCEPath)
+	} else {
+		log.Println("Discord exporter not configured (DISCORD_TOKEN or CORDBRIEF_DCE_PATH missing)")
+	}
 
 	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer cancel()

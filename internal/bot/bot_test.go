@@ -10,6 +10,7 @@ import (
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
+	"github.com/pyed/CordBrief/internal/dce"
 	"github.com/pyed/CordBrief/internal/state"
 )
 
@@ -653,5 +654,26 @@ func TestCallback_AuthorizedPathsAlwaysAnswered(t *testing.T) {
 		if sender.answeredCount() != 1 {
 			t.Errorf("[%d] expected 1 AnswerCallbackQuery for %q, got %d", i, cb, sender.answeredCount())
 		}
+	}
+}
+
+func TestStatus_ReportsDiscordExporterState(t *testing.T) {
+	b, sender, _, _ := setupTestBot(t)
+	ctx := context.Background()
+
+	// Without DCE client configured
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/status"))
+	msg := sender.lastSent()
+	if !strings.Contains(msg.Text, "Discord exporter: not configured") {
+		t.Errorf("expected 'Discord exporter: not configured', got: %s", msg.Text)
+	}
+
+	// With DCE client configured
+	client := dce.NewMockClient("dce.exe", "test-token", nil)
+	b.dceClient = client
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/status"))
+	msg = sender.lastSent()
+	if !strings.Contains(msg.Text, "Discord exporter: configured") {
+		t.Errorf("expected 'Discord exporter: configured', got: %s", msg.Text)
 	}
 }

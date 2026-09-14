@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
+	"github.com/pyed/CordBrief/internal/dce"
 	"github.com/pyed/CordBrief/internal/state"
 )
 
@@ -30,6 +31,7 @@ type Bot struct {
 	client         Sender
 	rawBot         *bot.Bot
 	store          *state.Store
+	dceClient      *dce.Client
 	ownerID        int64
 	now            func() time.Time
 	mu             sync.Mutex
@@ -54,6 +56,13 @@ func WithNow(now func() time.Time) Option {
 	}
 }
 
+// WithDCEClient sets a custom DCE client (used for testing or pre-configured clients).
+func WithDCEClient(client *dce.Client) Option {
+	return func(b *Bot) {
+		b.dceClient = client
+	}
+}
+
 // New constructs a Bot instance with the provided environment config and state store.
 func New(cfg *EnvConfig, store *state.Store, opts ...Option) (*Bot, error) {
 	if cfg == nil {
@@ -68,6 +77,13 @@ func New(cfg *EnvConfig, store *state.Store, opts ...Option) (*Bot, error) {
 		ownerID:        cfg.OwnerID,
 		now:            time.Now,
 		pendingFollows: make(map[string]PendingFollow),
+	}
+
+	// If DCE path and token are provided, initialize client fail-open (does not prevent bot startup)
+	if cfg.DCEPath != "" && cfg.DiscordToken != "" {
+		if dceClient, err := dce.NewClient(cfg.DCEPath, cfg.DiscordToken); err == nil {
+			b.dceClient = dceClient
+		}
 	}
 
 	for _, opt := range opts {

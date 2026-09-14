@@ -26,11 +26,24 @@ At idle, CordBrief is a single Go process running Telegram long polling and an i
 
 CordBrief operates as an owner-only, private Telegram bot. Interactions from unauthorized users or non-private chats are silently ignored.
 
+## Discord Collection Boundary
+
+Discord collection is performed strictly through [`DiscordChatExporter.Cli`](https://github.com/Tyrrrz/DiscordChatExporter) (pinned and validated on version 2.48).
+
+CordBrief itself does not implement Discord protocols (no Gateway, REST, RPC, scraping, or browser automation). It delegates collection entirely to the external DCE executable:
+
+- **Bounded Collection:** Invoked strictly with `--after` (persisted cursor) and `--before` (fixed UTC cutoff) to guarantee bounded intervals without message loss.
+- **Disposable Working Files:** Raw JSON exports are written to temporary files, parsed into normalized domain types, and deleted immediately. Raw exports are never retained as durable state or application history.
+- **On-Demand Invocation:** DCE is executed only during active collection jobs, never on status checks or idle polling.
+- **Collection Only:** The collection adapter is strictly read-only and never mutates cursors or durable state.
+
 ### Environment Configuration
 
-- `TELEGRAM_BOT_TOKEN`: Telegram bot token from @BotFather (required).
-- `TELEGRAM_OWNER_ID`: Telegram user ID of the authorized owner (required, positive integer).
+- `TELEGRAM_BOT_TOKEN`: Telegram bot token from @BotFather (required for bot).
+- `TELEGRAM_OWNER_ID`: Telegram user ID of the authorized owner (required for bot, positive integer).
 - `CORDBRIEF_DATA_DIR`: Directory path for `config.json` and `state.json` (optional, defaults to `./data`).
+- `CORDBRIEF_DCE_PATH`: Path to the pinned `DiscordChatExporter.Cli` executable (required for collection).
+- `DISCORD_TOKEN`: Discord authentication token passed directly to child DCE process via environment without appearing in command-line arguments (required for collection).
 
 ### Commands
 

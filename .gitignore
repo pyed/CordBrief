@@ -15,7 +15,9 @@ build/
 
 # Local configs, state, and secrets (must never be committed)
 *.env
+*.env.sh
 /cordbrief.env
+/cordbrief.env.sh
 /config.json
 /state.json
 
@@ -44,3 +46,4 @@ ehthumbs.db
 .unlazy/
 .unlazy-hook-state.json
 .claude/
+.tools/

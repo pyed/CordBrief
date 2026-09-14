@@ -9,9 +9,11 @@ import (
 
 // EnvConfig holds configuration loaded from process environment variables.
 type EnvConfig struct {
-	BotToken string
-	OwnerID  int64
-	DataDir  string
+	BotToken     string
+	OwnerID      int64
+	DataDir      string
+	DiscordToken string
+	DCEPath      string
 }
 
 // LoadEnv reads and validates required environment variables for CordBrief.
@@ -38,9 +40,14 @@ func LoadEnv() (*EnvConfig, error) {
 		dataDir = "./data"
 	}
 
+	discordToken := strings.TrimSpace(os.Getenv("DISCORD_TOKEN"))
+	dcePath := strings.TrimSpace(os.Getenv("CORDBRIEF_DCE_PATH"))
+
 	return &EnvConfig{
-		BotToken: token,
-		OwnerID:  ownerID,
-		DataDir:  dataDir,
+		BotToken:     token,
+		OwnerID:      ownerID,
+		DataDir:      dataDir,
+		DiscordToken: discordToken,
+		DCEPath:      dcePath,
 	}, nil
 }
