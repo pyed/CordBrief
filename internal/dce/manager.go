@@ -28,6 +28,7 @@ type Manager struct {
 	statePath string
 	state     *UpdaterState
 	mu        sync.Mutex
+	opMu      sync.Mutex // Serialize install/export so candidate files cannot change during use.
 }
 
 // ManagerOption configures a Manager instance.
@@ -102,9 +103,6 @@ func NewManager(dataDir, bootstrapPath, token string, opts ...ManagerOption) (*M
 		}
 		cancel()
 	}
-	if m.bootstrapVersion == "" {
-		m.bootstrapVersion = "2.48.0"
-	}
 
 	dceDir := filepath.Join(dataDir, "dce")
 	m.statePath = filepath.Join(dceDir, "updater.json")
@@ -114,13 +112,6 @@ func NewManager(dataDir, bootstrapPath, token string, opts ...ManagerOption) (*M
 		return nil, err
 	}
 	m.state = st
-
-	// If newly created or active was empty, save initial state
-	if m.state.ActivePath == "" && m.bootstrapPath != "" {
-		m.state.ActivePath = m.bootstrapPath
-		m.state.ActiveVersion = m.bootstrapVersion
-		_ = SaveUpdaterState(m.statePath, m.state)
-	}
 
 	return m, nil
 }
@@ -132,7 +123,7 @@ func (m *Manager) IsConfigured() bool {
 	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	return m.state != nil && (m.state.ActivePath != "" || m.bootstrapPath != "")
+	return m.state != nil && (m.state.ActivePath != "" || m.state.CandidatePath != "")
 }
 
 // State returns a snapshot copy of the current updater state.
@@ -161,13 +152,16 @@ func (m *Manager) Status() string {
 		activeVer = "unknown"
 	}
 
+	status := fmt.Sprintf("%s · active", activeVer)
 	if m.state.CandidateVersion != "" {
-		return fmt.Sprintf("%s · candidate %s pending", activeVer, m.state.CandidateVersion)
+		status = fmt.Sprintf("%s · candidate %s pending", activeVer, m.state.CandidateVersion)
+	} else if m.state.RejectedVersion != "" {
+		status = fmt.Sprintf("%s · %s rejected", activeVer, m.state.RejectedVersion)
 	}
-	if m.state.RejectedVersion != "" {
-		return fmt.Sprintf("%s · %s rejected", activeVer, m.state.RejectedVersion)
+	if m.state.PinnedVersion != "" {
+		status += " · pinned to " + m.state.PinnedVersion
 	}
-	return fmt.Sprintf("%s · up to date", activeVer)
+	return status
 }
 
 // NextCheckDuration returns the duration until the next weekly check is due.
@@ -191,6 +185,8 @@ func (m *Manager) NextCheckDuration() time.Duration {
 // On candidate failure: candidate is rejected and rollback retries once with active known-good.
 // On caller cancellation: candidate remains pending without promotion or rejection.
 func (m *Manager) Export(ctx context.Context, req ExportRequest) (*ExportResult, error) {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
 	if !m.IsConfigured() {
 		return nil, errors.New("dce is not configured")
 	}
@@ -207,7 +203,9 @@ func (m *Manager) Export(ctx context.Context, req ExportRequest) (*ExportResult,
 		res, err := candClient.Export(ctx, req)
 		if err == nil {
 			// Candidate succeeded! Promote candidate.
-			m.promoteCandidate(candVer, candPath)
+			if err := m.promoteCandidate(candVer, candPath); err != nil {
+				return nil, err
+			}
 			return res, nil
 		}
 
@@ -217,7 +215,9 @@ func (m *Manager) Export(ctx context.Context, req ExportRequest) (*ExportResult,
 		}
 
 		// Candidate failed under normal execution. Reject candidate and rollback.
-		m.rejectCandidate(candVer, candPath)
+		if err := m.rejectCandidate(candVer, candPath); err != nil {
+			return nil, err
+		}
 
 		// Retry requested operation once with active known-good if context alive
 		if ctx.Err() == nil && activePath != "" {
@@ -235,140 +235,217 @@ func (m *Manager) Export(ctx context.Context, req ExportRequest) (*ExportResult,
 	return activeClient.Export(ctx, req)
 }
 
-func (m *Manager) promoteCandidate(candVer, candPath string) {
+// saveState commits a snapshot before exposing it to exports or deleting old files.
+func (m *Manager) saveState(next UpdaterState) error {
+	if err := SaveUpdaterState(m.statePath, &next); err != nil {
+		return fmt.Errorf("save DCE updater state: %w", err)
+	}
 	m.mu.Lock()
-	oldActivePath := m.state.ActivePath
-	m.state.ActiveVersion = candVer
-	m.state.ActivePath = candPath
-	m.state.CandidateVersion = ""
-	m.state.CandidatePath = ""
-	_ = SaveUpdaterState(m.statePath, m.state)
+	m.state = &next
 	m.mu.Unlock()
+	return nil
+}
 
-	// Clean up obsolete updater-managed previous version
-	versionsDir := filepath.Join(m.dataDir, "dce", "versions")
-	if oldActivePath != "" && isManagedPath(versionsDir, oldActivePath) {
-		if filepath.Clean(oldActivePath) != filepath.Clean(m.bootstrapPath) {
-			oldDir := filepath.Dir(oldActivePath)
-			_ = os.RemoveAll(oldDir)
-		}
+func (m *Manager) removeVersion(path string) {
+	if path != "" && filepath.Clean(path) != filepath.Clean(m.bootstrapPath) &&
+		isManagedPath(filepath.Join(m.dataDir, "dce", "versions"), filepath.Dir(path)) {
+		_ = os.RemoveAll(filepath.Dir(path))
 	}
 }
 
-func (m *Manager) rejectCandidate(candVer, candPath string) {
-	m.mu.Lock()
-	m.state.RejectedVersion = candVer
-	m.state.CandidateVersion = ""
-	m.state.CandidatePath = ""
-	_ = SaveUpdaterState(m.statePath, m.state)
-	m.mu.Unlock()
-
-	// Clean up rejected candidate files
-	versionsDir := filepath.Join(m.dataDir, "dce", "versions")
-	if candPath != "" && isManagedPath(versionsDir, candPath) {
-		if filepath.Clean(candPath) != filepath.Clean(m.bootstrapPath) {
-			candDir := filepath.Dir(candPath)
-			_ = os.RemoveAll(candDir)
-		}
+func (m *Manager) promoteCandidate(candVer, candPath string) error {
+	next := m.State()
+	oldActivePath := next.ActivePath
+	next.ActiveVersion, next.ActivePath = candVer, candPath
+	next.CandidateVersion, next.CandidatePath = "", ""
+	if err := m.saveState(next); err != nil {
+		return err
 	}
+	if oldActivePath != candPath {
+		m.removeVersion(oldActivePath)
+	}
+	return nil
 }
 
-// CheckForUpdates contacts the official GitHub latest stable release endpoint.
-// Returns (true, nil) if a newer version was discovered and installed as candidate.
+func (m *Manager) rejectCandidate(candVer, candPath string) error {
+	next := m.State()
+	next.RejectedVersion = candVer
+	next.CandidateVersion, next.CandidatePath = "", ""
+	if err := m.saveState(next); err != nil {
+		return err
+	}
+	if candPath != next.ActivePath {
+		m.removeVersion(candPath)
+	}
+	return nil
+}
+
+// Ensure installs a first candidate if necessary, without executing it. A requested
+// official tag pins updates; "latest" removes the pin. Empty keeps the saved policy.
+func (m *Manager) Ensure(ctx context.Context, requested string) error {
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	if m.token == "" {
+		return errors.New("DISCORD_TOKEN is required")
+	}
+	next := m.State()
+	// Recover missing installed files; never promote an untested download to active.
+	for _, entry := range []struct{ path, version *string }{
+		{&next.ActivePath, &next.ActiveVersion}, {&next.CandidatePath, &next.CandidateVersion},
+	} {
+		if *entry.path == "" {
+			continue
+		}
+		fi, err := os.Stat(*entry.path)
+		if errors.Is(err, os.ErrNotExist) {
+			*entry.path, *entry.version = "", ""
+		} else if err != nil || !fi.Mode().IsRegular() {
+			return errors.New("DCE executable is not accessible as a regular file")
+		}
+	}
+	if next != m.State() {
+		if err := m.saveState(next); err != nil {
+			return err
+		}
+	}
+	if requested == "" && m.IsConfigured() {
+		return nil
+	}
+	pin := next.PinnedVersion
+	if requested != "" {
+		pin = requested
+		if requested == "latest" {
+			pin = ""
+		}
+	}
+	if _, err := m.checkForUpdates(ctx, pin, requested != ""); err != nil {
+		return err
+	}
+	if !m.IsConfigured() {
+		return errors.New("no usable DCE release; retry with --dce-version and another official tag")
+	}
+	return nil
+}
+
+// CheckForUpdates shares the same verified installer as first launch and version pins.
 func (m *Manager) CheckForUpdates(ctx context.Context) (bool, error) {
-	m.mu.Lock()
-	m.state.LastCheck = m.now().UTC()
-	_ = SaveUpdaterState(m.statePath, m.state)
-	activeVerStr := m.state.ActiveVersion
-	candVerStr := m.state.CandidateVersion
-	candPathStr := m.state.CandidatePath
-	rejVerStr := m.state.RejectedVersion
-	m.mu.Unlock()
+	m.opMu.Lock()
+	defer m.opMu.Unlock()
+	return m.checkForUpdates(ctx, m.State().PinnedVersion, false)
+}
 
-	rel, err := m.releaseClient.FetchLatestRelease(ctx)
-	if err != nil {
-		return false, fmt.Errorf("fetch latest release: %w", err)
-	}
-
-	relVer, err := ParseVersion(rel.TagName)
-	if err != nil {
-		return false, fmt.Errorf("parse release tag %q: %w", rel.TagName, err)
-	}
-
-	activeVer, err := ParseVersion(activeVerStr)
-	if err != nil {
-		activeVer, _ = ParseVersion(m.bootstrapVersion)
-	}
-
-	// No downgrade from active version
-	if CompareVersions(relVer, activeVer) <= 0 {
-		return false, nil
-	}
-
-	// If latest release equals already-rejected version, do nothing
-	if rejVerStr != "" {
-		if rejVer, err := ParseVersion(rejVerStr); err == nil && CompareVersions(relVer, rejVer) == 0 {
+func (m *Manager) checkForUpdates(ctx context.Context, pin string, explicit bool) (bool, error) {
+	next := m.State()
+	if pin != "" {
+		if _, err := ParseVersion(pin); err != nil {
+			return false, errors.New("DCE version must be an official numeric release tag, or latest")
+		}
+		if sameVersion(pin, next.ActiveVersion) || sameVersion(pin, next.CandidateVersion) {
+			oldCandidate := next.CandidatePath
+			next.LastCheck = m.now().UTC()
+			if sameVersion(pin, next.ActiveVersion) {
+				next.CandidateVersion, next.CandidatePath = "", ""
+			}
+			next.PinnedVersion = pin
+			if err := m.saveState(next); err != nil {
+				return false, err
+			}
+			if oldCandidate != next.CandidatePath && oldCandidate != next.ActivePath {
+				m.removeVersion(oldCandidate)
+			}
 			return false, nil
 		}
 	}
-
-	// If latest release equals existing candidate, do nothing
-	if candVerStr != "" {
-		if candVer, err := ParseVersion(candVerStr); err == nil {
-			if CompareVersions(relVer, candVer) == 0 {
-				return false, nil
+	// Record attempts too, so a failed weekly check does not spin.
+	next.LastCheck = m.now().UTC()
+	if err := m.saveState(next); err != nil {
+		return false, err
+	}
+	rel, err := m.releaseClient.FetchRelease(ctx, pin)
+	if err != nil {
+		return false, fmt.Errorf("fetch official DCE release: %w", err)
+	}
+	relVer, err := ParseVersion(rel.TagName)
+	if err != nil {
+		return false, fmt.Errorf("parse release tag: %w", err)
+	}
+	if sameVersion(rel.TagName, next.RejectedVersion) {
+		if explicit && pin != "" {
+			return false, errors.New("requested DCE version was rejected; choose another official tag")
+		}
+		if explicit {
+			next.PinnedVersion = ""
+			return false, m.saveState(next)
+		}
+		return false, nil
+	}
+	if pin == "" && next.ActivePath != "" {
+		active, err := ParseVersion(next.ActiveVersion)
+		if err != nil {
+			return false, errors.New("cannot automatically replace DCE with an unknown active version; use --dce-version to choose explicitly")
+		}
+		if relVer.Compare(active) <= 0 {
+			oldCandidate := next.CandidatePath
+			if explicit {
+				next.CandidatePath, next.CandidateVersion = "", ""
 			}
-			if CompareVersions(relVer, candVer) < 0 {
-				return false, nil
+			next.PinnedVersion = ""
+			if err := m.saveState(next); err != nil {
+				return false, err
 			}
-			// Newer version than current candidate: clean up older untested candidate
-			versionsDir := filepath.Join(m.dataDir, "dce", "versions")
-			if isManagedPath(versionsDir, candPathStr) {
-				_ = os.RemoveAll(filepath.Dir(candPathStr))
+			if explicit && oldCandidate != next.ActivePath {
+				m.removeVersion(oldCandidate)
 			}
+			return false, nil
 		}
 	}
-
-	// Find platform asset
+	if next.CandidatePath != "" {
+		candidate, err := ParseVersion(next.CandidateVersion)
+		if err == nil && (relVer.Compare(candidate) == 0 || (pin == "" && relVer.Compare(candidate) < 0)) {
+			next.PinnedVersion = pin
+			return false, m.saveState(next)
+		}
+	}
 	asset, err := m.releaseClient.FindAsset(rel, m.goos, m.goarch)
 	if err != nil {
-		return false, fmt.Errorf("find asset for %s/%s: %w", m.goos, m.goarch, err)
+		return false, err
 	}
-
-	// Download to temp file
 	tmpFile, err := os.CreateTemp("", "cordbrief-dce-*.zip")
 	if err != nil {
-		return false, fmt.Errorf("create temp zip file: %w", err)
+		return false, err
 	}
 	tmpZipPath := tmpFile.Name()
 	_ = tmpFile.Close()
 	defer os.Remove(tmpZipPath)
-
 	if err := m.releaseClient.DownloadAndVerify(ctx, *asset, tmpZipPath); err != nil {
-		return false, fmt.Errorf("download and verify asset: %w", err)
+		return false, fmt.Errorf("download and verify DCE: %w", err)
 	}
-
-	// Extract into target directory
 	targetDir := filepath.Join(m.dataDir, "dce", "versions", relVer.String())
-	if err := ExtractReleaseZip(tmpZipPath, targetDir, m.goos); err != nil {
-		_ = os.RemoveAll(targetDir)
-		return false, fmt.Errorf("extract release zip: %w", err)
-	}
 	exePath := filepath.Join(targetDir, ExpectedExecutableName(m.goos))
-
-	// Update state
-	m.mu.Lock()
-	m.state.CandidateVersion = relVer.String()
-	m.state.CandidatePath = exePath
-	err = SaveUpdaterState(m.statePath, m.state)
-	m.mu.Unlock()
-
-	if err != nil {
-		_ = os.RemoveAll(targetDir)
-		return false, fmt.Errorf("save state after install: %w", err)
+	// An explicitly selected active version only changes policy, never overwrites its files.
+	if filepath.Clean(exePath) == filepath.Clean(next.ActivePath) {
+		return false, errors.New("refusing to overwrite the active DCE executable")
 	}
-
+	if err := ExtractReleaseZip(tmpZipPath, targetDir, m.goos); err != nil {
+		return false, fmt.Errorf("extract DCE: %w", err)
+	}
+	oldCandidate := next.CandidatePath
+	next.CandidateVersion, next.CandidatePath = relVer.String(), exePath
+	next.PinnedVersion = pin
+	if err := m.saveState(next); err != nil {
+		m.removeVersion(exePath)
+		return false, err
+	}
+	if oldCandidate != exePath && oldCandidate != next.ActivePath {
+		m.removeVersion(oldCandidate)
+	}
 	return true, nil
+}
+
+func sameVersion(a, b string) bool {
+	x, errA := ParseVersion(a)
+	y, errB := ParseVersion(b)
+	return errA == nil && errB == nil && x.Compare(y) == 0
 }
 
 // Start launches the background weekly update checker.

@@ -2,6 +2,9 @@ package main
 
 import (
 	"context"
+	"errors"
+	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -14,12 +17,31 @@ import (
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.LUTC)
-	log.Println("CordBrief starting...")
+	setup := flag.Bool("setup", false, "configure saved credentials and exit (interactive terminal required)")
+	dceVersion := flag.String("dce-version", "", "pin an official DCE release tag, or latest to resume automatic updates")
+	flag.Parse()
+	if flag.NArg() != 0 {
+		log.Fatal("unexpected arguments; use --help (credentials are entered only through --setup or environment variables)")
+	}
 
 	env, err := bot.LoadEnv()
+	if *setup || (errors.Is(err, bot.ErrCredentialsMissing) && bot.Interactive()) {
+		if err := bot.Configure(); err != nil {
+			log.Fatal(err)
+		}
+		fmt.Println("Credentials saved. Environment variables still override saved values.")
+		if *setup {
+			return
+		}
+		env, err = bot.LoadEnv()
+	}
 	if err != nil {
 		log.Fatalf("configuration error: %v", err)
 	}
+	if *dceVersion != "" {
+		env.DCEVersion = *dceVersion
+	}
+	log.Println("CordBrief starting; preparing DiscordChatExporter if needed...")
 
 	store := state.NewStore(env.DataDir)
 
@@ -40,15 +62,15 @@ func main() {
 	}
 
 	log.Printf("Telegram bot initialized (data directory: %s)", env.DataDir)
-	if env.DCEPath != "" && env.DiscordToken != "" {
-		log.Printf("Discord exporter configured (DCE binary: %s)", env.DCEPath)
+	if appBot.DCEManager() != nil {
+		log.Printf("Discord exporter: %s", appBot.DCEManager().Status())
 	} else {
-		log.Println("Discord exporter not configured (DISCORD_TOKEN or CORDBRIEF_DCE_PATH missing)")
+		log.Println("Discord exporter not configured (DISCORD_TOKEN missing; run --setup)")
 	}
 	if env.LLMAPIKey != "" {
 		log.Println("LLM provider configured")
 	} else {
-		log.Println("LLM provider not configured (LLM_API_KEY missing)")
+		log.Println("LLM API key unset (only unauthenticated endpoints will work)")
 	}
 
 	log.Println("Starting Telegram long polling...")

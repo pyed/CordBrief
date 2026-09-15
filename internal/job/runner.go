@@ -180,7 +180,7 @@ func (r *Runner) run(ctx context.Context, targetChannelID string) error {
 
 	// 3. Check collector readiness
 	if r.dceClient == nil || !r.dceClient.IsConfigured() {
-		msg := "Discord exporter is not configured (CORDBRIEF_DCE_PATH or DISCORD_TOKEN missing)."
+		msg := "Discord exporter is not ready. Run cordbrief --setup and restart; use --dce-version to recover a rejected release."
 		_ = r.deliverer.Deliver(ctx, msg)
 		return errors.New("dce not configured")
 	}

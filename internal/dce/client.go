@@ -99,7 +99,7 @@ func (c *Client) Version(ctx context.Context) (string, error) {
 	stdout.limit = MaxDiagnosticBuffer
 	stderr.limit = MaxDiagnosticBuffer
 
-	err := c.runner(ctx, c.dcePath, []string{"--version"}, os.Environ(), &stdout, &stderr)
+	err := c.runner(ctx, c.dcePath, []string{"--version"}, commandEnv(), &stdout, &stderr)
 	if err != nil {
 		return "", c.sanitizeError(fmt.Errorf("failed to query dce version: %w (stderr: %s)", err, stderr.String()))
 	}
@@ -187,7 +187,7 @@ func (c *Client) Export(ctx context.Context, req ExportRequest) (*ExportResult, 
 
 	// Construct environment containing DISCORD_TOKEN.
 	// DISCORD_TOKEN is NEVER added to args/argv.
-	env := append(os.Environ(), "DISCORD_TOKEN="+c.token, "FUCK_RUSSIA=true")
+	env := append(commandEnv(), "DISCORD_TOKEN="+c.token, "FUCK_RUSSIA=true")
 
 	var stdout, stderr cappedBuffer
 	stdout.limit = MaxDiagnosticBuffer
@@ -212,6 +212,20 @@ func (c *Client) Export(ctx context.Context, req ExportRequest) (*ExportResult, 
 	}
 
 	return parseDCEExport(data)
+}
+
+// DCE only receives its own credential, never inherited Telegram or AI credentials.
+func commandEnv() []string {
+	var env []string
+	for _, entry := range os.Environ() {
+		key, _, _ := strings.Cut(entry, "=")
+		switch strings.ToUpper(key) {
+		case "TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID", "LLM_API_KEY", "DISCORD_TOKEN":
+			continue
+		}
+		env = append(env, entry)
+	}
+	return env
 }
 
 // sanitizeError replaces any occurrence of the sensitive token in error messages with [REDACTED].

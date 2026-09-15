@@ -31,6 +31,17 @@ func TestCappedBufferConsumesEntireWrite(t *testing.T) {
 	}
 }
 
+func TestCommandEnvironmentExcludesUnrelatedCredentials(t *testing.T) {
+	for _, key := range []string{"TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID", "LLM_API_KEY", "DISCORD_TOKEN"} {
+		t.Setenv(key, "credential-sentinel")
+	}
+	t.Setenv("CORDBRIEF_TEST_KEEP", "keep-this")
+	env := strings.Join(commandEnv(), "\n")
+	if strings.Contains(env, "credential-sentinel") || !strings.Contains(env, "CORDBRIEF_TEST_KEEP=keep-this") {
+		t.Fatal("child environment filtering failed")
+	}
+}
+
 // sampleValidJSON provides a realistic fixture matching observed DCE 2.48 output.
 const sampleValidJSON = `{
   "guild": {

@@ -26,8 +26,10 @@ const (
 
 // GitHubRelease represents the subset of GitHub release metadata needed by the updater.
 type GitHubRelease struct {
-	TagName string        `json:"tag_name"`
-	Assets  []GitHubAsset `json:"assets"`
+	TagName    string        `json:"tag_name"`
+	Assets     []GitHubAsset `json:"assets"`
+	Prerelease bool          `json:"prerelease"`
+	Draft      bool          `json:"draft"`
 }
 
 // GitHubAsset represents a single downloadable artifact published with a release.
@@ -49,7 +51,7 @@ type ReleaseClient struct {
 // NewReleaseClient constructs a standard ReleaseClient.
 func NewReleaseClient() *ReleaseClient {
 	return &ReleaseClient{
-		HTTPClient: &http.Client{Timeout: 30 * time.Second},
+		HTTPClient: &http.Client{Timeout: 2 * time.Minute},
 		Endpoint:   DefaultGitHubLatestReleaseURL,
 		UserAgent:  DefaultUserAgent,
 	}
@@ -85,9 +87,20 @@ func ExpectedAssetPattern(goos, goarch string) (string, error) {
 
 // FetchLatestRelease queries the GitHub latest stable release endpoint.
 func (c *ReleaseClient) FetchLatestRelease(ctx context.Context) (*GitHubRelease, error) {
+	return c.FetchRelease(ctx, "")
+}
+
+// FetchRelease uses the official latest endpoint or an exact official release tag.
+func (c *ReleaseClient) FetchRelease(ctx context.Context, tag string) (*GitHubRelease, error) {
 	endpoint := c.Endpoint
 	if endpoint == "" {
 		endpoint = DefaultGitHubLatestReleaseURL
+	}
+	if tag != "" {
+		if _, err := ParseVersion(tag); err != nil {
+			return nil, errors.New("DCE version must be an official numeric release tag")
+		}
+		endpoint = strings.TrimSuffix(endpoint, "/latest") + "/tags/" + url.PathEscape(tag)
 	}
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
@@ -125,6 +138,12 @@ func (c *ReleaseClient) FetchLatestRelease(ctx context.Context) (*GitHubRelease,
 
 	if strings.TrimSpace(rel.TagName) == "" {
 		return nil, errors.New("release response missing tag_name")
+	}
+	if rel.Draft || (tag == "" && rel.Prerelease) {
+		return nil, errors.New("release is not a published stable release")
+	}
+	if tag != "" && rel.TagName != tag {
+		return nil, errors.New("release response does not match the requested tag")
 	}
 
 	return &rel, nil

@@ -21,6 +21,8 @@ build/
 /config.json
 /state.json
 /data/
+credentials.json
+.credentials-*.tmp
 
 # Runtime working directories and temporary data
 work/

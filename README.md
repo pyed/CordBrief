@@ -2,47 +2,32 @@
 
 Discord catch-up briefs, delivered to your private Telegram chat. Follow channels, choose an AI model, and request a summary on demand or schedule one each day.
 
-CordBrief runs on your computer or server. It uses DiscordChatExporter to collect messages, an OpenAI-compatible API to summarize them, and Telegram to deliver the result.
+## Install and start
 
-## 1. Install
+1. Download and extract your archive from [Releases](https://github.com/pyed/CordBrief/releases). Choose `windows`, `linux`, or `darwin` (macOS), then `amd64` for Intel/AMD or `arm64` for Apple Silicon/ARM.
+2. Open a terminal in the extracted folder and run CordBrief:
 
-Download and extract the archive for your system from [Releases](https://github.com/pyed/CordBrief/releases):
+   **Windows PowerShell:**
+   ```powershell
+   .\cordbrief.exe
+   ```
 
-- `linux`, `darwin` (macOS), or `windows`.
-- `amd64` for Intel/AMD; `arm64` for Apple Silicon and ARM machines.
+   **Linux / macOS:**
+   ```sh
+   ./cordbrief
+   ```
 
-Also download the matching **CLI** archive from [DiscordChatExporter](https://github.com/Tyrrrz/DiscordChatExporter/releases) and extract the entire archive into a permanent folder. Run its executable with `--version` to check that it works. See its [setup documentation](https://github.com/Tyrrrz/DiscordChatExporter/tree/master/.docs) for platform requirements, Discord tokens, and channel IDs.
+3. On first launch, follow the setup prompts. You need:
+   - A Telegram bot token from [BotFather](https://t.me/BotFather).
+   - Your numeric Telegram user ID.
+   - A Discord token with access to your channels. See the [DiscordChatExporter documentation](https://github.com/Tyrrrz/DiscordChatExporter/tree/master/.docs) for token and channel-ID instructions.
+   - An AI API key. The default provider is Google's Gemini; a local server without authentication can leave this blank.
 
-## 2. Set credentials and start
+Input is hidden. CordBrief saves your credentials and automatically downloads the appropriate official DiscordChatExporter CLI. Keep CordBrief running for scheduled briefs. Ctrl+C stops it.
 
-You need a Telegram bot token from [BotFather](https://t.me/BotFather), your numeric Telegram user ID, a Discord token with access to the channels, and an API key for your AI provider.
+The first installation needs access to GitHub. Later starts reuse the downloaded copy, so GitHub being unavailable does not prevent startup. The exporter may still require the system libraries listed in its platform documentation.
 
-**Linux / macOS**: replace the example values, then run from the extracted CordBrief folder:
-
-```sh
-export TELEGRAM_BOT_TOKEN='your-bot-token'
-export TELEGRAM_OWNER_ID='123456789'
-export DISCORD_TOKEN='your-discord-token'
-export CORDBRIEF_DCE_PATH='/absolute/path/to/DiscordChatExporter.Cli'
-export LLM_API_KEY='your-api-key'
-chmod +x cordbrief
-./cordbrief
-```
-
-**Windows PowerShell:**
-
-```powershell
-$env:TELEGRAM_BOT_TOKEN = 'your-bot-token'
-$env:TELEGRAM_OWNER_ID = '123456789'
-$env:DISCORD_TOKEN = 'your-discord-token'
-$env:CORDBRIEF_DCE_PATH = 'C:\Tools\DCE\DiscordChatExporter.Cli.exe'
-$env:LLM_API_KEY = 'your-api-key'
-.\cordbrief.exe
-```
-
-These variables apply to the current terminal. CordBrief does not load `.env` files. Keep the process running for scheduled briefs; press Ctrl+C to stop. Only the configured Telegram owner can control it, in a private chat.
-
-## 3. Follow a channel
+## Get your first brief
 
 Open your Telegram bot and send:
 
@@ -51,51 +36,57 @@ Open your Telegram bot and send:
 /follow 123456789012345678 general
 ```
 
-Choose **From now** or **Last 24 hours** using the buttons. Then send `/model` to choose an available chat model and `/brief` to get your first summary.
+Replace the example with your channel ID. Choose **From now** or **Last 24 hours**, then use `/model` to select an available chat model and `/brief` to summarize new messages.
 
 | Command | What it does |
 | --- | --- |
-| `/brief [channel_id]` | Summarize new messages from all followed channels, or one channel. |
+| `/brief [channel_id]` | Summarize all followed channels, or one channel. |
 | `/channels` | List followed channels. |
 | `/unfollow [channel_id]` | Stop following a channel after confirmation. |
 | `/schedule 08:00 Asia/Riyadh` | Enable a daily brief at that local time. |
 | `/schedule off` | Disable daily briefs; `/schedule` shows the current setting. |
-| `/model [model_id]` | Browse available models or set one directly. |
-| `/prompt` | View or edit the summary instructions; `/prompt reset` restores the default. |
-| `/status` | Show configuration, exporter status, and whether a brief is running. |
+| `/model [model_id]` | Browse models or set one directly. |
+| `/prompt` | View/edit instructions; `/prompt reset` restores the default. |
+| `/status` | Show settings, exporter version, and current job status. |
 
-Scheduling starts disabled. Without a timezone argument, `/schedule` keeps the current timezone, initially UTC.
+Scheduling starts disabled, with UTC as the initial timezone. Only the configured owner can control CordBrief, in a private Telegram chat.
 
-## Settings and data
+## Credentials and headless operation
 
-Settings and channel progress are saved under `./data`. Set `CORDBRIEF_DATA_DIR` to use another folder. Back it up and run only one CordBrief instance per data folder.
+To change credentials, stop CordBrief and run `./cordbrief --setup` (Windows: `.\cordbrief.exe --setup`). Enter keeps an existing value; `-` clears the optional AI key. Setup saves and exits without contacting Discord or testing exports.
 
-The default AI endpoint is Google's Gemini OpenAI-compatible API. To use another provider, first save a setting with `/model model-id`, stop CordBrief, and edit `llm.base_url` and `llm.model` in `data/config.json`. Restart with that provider's `LLM_API_KEY`; a local server that needs no authentication can leave the key unset.
+Credentials live in `data/credentials.json`, separate from `config.json` and `state.json`. The file is **not encrypted**: Unix permissions restrict it to the owner (`0600`), and Windows uses a protected ACL granting access only to the current account. Windows storage must support ACLs, such as NTFS. Administrators, software running as your account, and anyone with access to an unprotected disk/backup can still read it.
 
-Messages go to your configured AI provider for summarization. Temporary exports are deleted after collection. Channel progress advances only after every summary part reaches Telegram, so failures can be retried. A partially delivered brief may repeat on retry.
+For a headless service, run setup once as the service account. Use the same working directory on subsequent starts, or set `CORDBRIEF_DATA_DIR` to a permanent data folder. Noninteractive launches never prompt: missing required credentials produce an error and exit.
 
-CordBrief checks weekly for DiscordChatExporter updates, verifies download checksums, and tries a new version on the next export. If it fails, it retries with the previous version.
+Existing environment deployments still work. `TELEGRAM_BOT_TOKEN`, `TELEGRAM_OWNER_ID`, `DISCORD_TOKEN`, and `LLM_API_KEY` override saved values; an explicitly empty variable clears its saved value for that run. Environment-only startup does not save credentials. CordBrief does not load `.env` files or accept secrets as command-line arguments.
 
-## Build and release
+To change AI providers, save a setting with `/model model-id`, stop CordBrief, and edit `llm.base_url` and `llm.model` in `data/config.json`. Use `--setup` to change the API key, then restart.
 
-With Go 1.26 or newer installed:
+Back up the data folder securely and run only one instance per folder. Messages are sent to your configured AI provider. Temporary exports are deleted, and channel progress advances only after every summary part reaches Telegram. A partly delivered brief may repeat on retry.
+
+## DCE versions and recovery
+
+CordBrief normally uses the latest stable official release and checks weekly for updates. Downloads must pass SHA-256 verification before extraction. New versions remain candidates until the next real brief succeeds; a failed candidate is rejected and the previous working version is retried. A first installation has no previous version to fall back to.
+
+To request a particular official release, stop the app and launch with `./cordbrief --dce-version TAG` (Windows: `.\cordbrief.exe --dce-version TAG`), replacing `TAG` with the exact release tag. The choice is saved and automatic upgrades remain paused. To resume them, launch with `./cordbrief --dce-version latest`. `CORDBRIEF_DCE_VERSION` provides the same override for services.
+
+Older releases without a published SHA-256 digest are refused. Choose another official tag; verification is never bypassed. A rejected version is not automatically retried. A failed download keeps the existing active/candidate files and version selection.
+
+Existing `CORDBRIEF_DCE_PATH` installations can still provide a bootstrap executable. Leave it unset for automatic installation. No exporter is executed as a setup probe; manually supplied bootstrap binaries may be queried with `--version`.
+
+## Development and releases
+
+With Go 1.26 or newer:
 
 ```sh
 git clone https://github.com/pyed/CordBrief.git
 cd CordBrief
 go test ./...
+go vet ./...
 go build ./cmd/cordbrief
 ```
 
-The default tests run without credentials or live services. GitHub Actions runs tests, race checks, static analysis, and a build on Linux, macOS, and Windows for pushes and pull requests.
-
-After committing and pushing your changes, push a new tag to publish a release. For example, using an unused version:
-
-```sh
-git tag v3.0.0
-git push origin v3.0.0
-```
-
-Every pushed tag triggers a release after CI passes, with Linux, macOS, and Windows archives for both architectures and a `checksums.txt` file. GitHub Actions uses its built-in token; no extra release secret is needed.
+Default tests use local fixtures and fake process runners; live-service tests are opt-in. CI runs tests with race detection, static analysis, and builds on Linux, macOS, and Windows. Every pushed tag publishes a release after checks pass, with six platform archives and SHA-256 checksums.
 
 [MIT License](LICENSE)

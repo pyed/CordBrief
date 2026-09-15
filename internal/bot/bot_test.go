@@ -670,13 +670,12 @@ func TestStatus_ReportsDiscordExporterState(t *testing.T) {
 		t.Errorf("expected 'Discord exporter: not configured', got: %s", msg.Text)
 	}
 
-	// With DCE client configured
-	client := dce.NewMockClient("dce.exe", "test-token", nil)
-	b.dceClient = client
+	// With the DCE manager configured; no executable is run.
+	b.dceManager, _ = dce.NewManager(t.TempDir(), "dce.exe", "test-token", dce.WithBootstrapVersion("2.48"))
 	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/status"))
 	msg = sender.lastSent()
-	if !strings.Contains(msg.Text, "Discord exporter: configured") {
-		t.Errorf("expected 'Discord exporter: configured', got: %s", msg.Text)
+	if !strings.Contains(msg.Text, "Discord exporter: 2.48") {
+		t.Errorf("expected configured DCE version, got: %s", msg.Text)
 	}
 }
 

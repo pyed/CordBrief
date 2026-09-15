@@ -2,55 +2,61 @@ package bot
 
 import (
 	"errors"
+	"fmt"
+	"net/url"
 	"os"
 	"strconv"
 	"strings"
 )
 
-// EnvConfig holds configuration loaded from process environment variables.
+// EnvConfig holds startup settings after environment overrides saved credentials.
 type EnvConfig struct {
 	BotToken     string
 	OwnerID      int64
 	DataDir      string
 	DiscordToken string
 	DCEPath      string
+	DCEVersion   string
 	LLMAPIKey    string
 }
 
-// LoadEnv reads and validates required environment variables for CordBrief.
-// Returns an error if TELEGRAM_BOT_TOKEN or TELEGRAM_OWNER_ID is missing or invalid.
-// Never includes the bot token in error messages.
+// Redact also covers URL-escaped tokens in HTTP transport errors.
+func (c *EnvConfig) Redact(text string) string {
+	for _, secret := range []string{c.BotToken, c.DiscordToken, c.LLMAPIKey} {
+		if secret != "" {
+			for _, value := range []string{secret, url.PathEscape(secret), url.QueryEscape(secret)} {
+				text = strings.ReplaceAll(text, value, "[REDACTED]")
+			}
+		}
+	}
+	return text
+}
+
+var ErrCredentialsMissing = errors.New("credentials are incomplete; run cordbrief --setup in a terminal")
+
+// LoadEnv reads private credentials and applies environment overrides without prompting.
+// Telegram credentials remain mandatory; Discord and the AI key are optional for
+// compatibility with existing environment-only deployments and local AI servers.
 func LoadEnv() (*EnvConfig, error) {
-	token := strings.TrimSpace(os.Getenv("TELEGRAM_BOT_TOKEN"))
-	if token == "" {
-		return nil, errors.New("TELEGRAM_BOT_TOKEN environment variable is required")
+	c, err := loadCredentials()
+	if err != nil {
+		return nil, err
 	}
-
-	ownerStr := strings.TrimSpace(os.Getenv("TELEGRAM_OWNER_ID"))
-	if ownerStr == "" {
-		return nil, errors.New("TELEGRAM_OWNER_ID environment variable is required")
+	if c.BotToken == "" {
+		return nil, fmt.Errorf("TELEGRAM_BOT_TOKEN is required: %w", ErrCredentialsMissing)
 	}
-
-	ownerID, err := strconv.ParseInt(ownerStr, 10, 64)
+	ownerID, err := strconv.ParseInt(c.OwnerID, 10, 64)
 	if err != nil || ownerID <= 0 {
-		return nil, errors.New("TELEGRAM_OWNER_ID must be a positive integer")
+		return nil, fmt.Errorf("TELEGRAM_OWNER_ID must be a positive integer: %w", ErrCredentialsMissing)
 	}
-
-	dataDir := strings.TrimSpace(os.Getenv("CORDBRIEF_DATA_DIR"))
-	if dataDir == "" {
-		dataDir = "./data"
-	}
-
-	discordToken := strings.TrimSpace(os.Getenv("DISCORD_TOKEN"))
-	dcePath := strings.TrimSpace(os.Getenv("CORDBRIEF_DCE_PATH"))
-	llmAPIKey := strings.TrimSpace(os.Getenv("LLM_API_KEY"))
 
 	return &EnvConfig{
-		BotToken:     token,
+		BotToken:     c.BotToken,
 		OwnerID:      ownerID,
-		DataDir:      dataDir,
-		DiscordToken: discordToken,
-		DCEPath:      dcePath,
-		LLMAPIKey:    llmAPIKey,
+		DataDir:      credentialDataDir(),
+		DiscordToken: c.DiscordToken,
+		DCEPath:      strings.TrimSpace(os.Getenv("CORDBRIEF_DCE_PATH")),
+		DCEVersion:   strings.TrimSpace(os.Getenv("CORDBRIEF_DCE_VERSION")),
+		LLMAPIKey:    c.LLMAPIKey,
 	}, nil
 }

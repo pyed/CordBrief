@@ -26,7 +26,7 @@ func TestDCEStatus(t *testing.T) {
 		}
 	})
 
-	t.Run("up to date reports active version up to date", func(t *testing.T) {
+	t.Run("status reports active version without assuming it is latest", func(t *testing.T) {
 		dir := t.TempDir()
 		store := state.NewStore(dir)
 		sender := &fakeSender{}
@@ -52,8 +52,8 @@ func TestDCEStatus(t *testing.T) {
 		if last == nil {
 			t.Fatal("expected message sent, got nil")
 		}
-		if !strings.Contains(last.Text, "Discord exporter: 2.48.0 · up to date") {
-			t.Fatalf("expected 'Discord exporter: 2.48.0 · up to date' in status, got:\n%s", last.Text)
+		if !strings.Contains(last.Text, "Discord exporter: 2.48.0 · active") {
+			t.Fatalf("expected 'Discord exporter: 2.48.0 · active' in status, got:\n%s", last.Text)
 		}
 	})
 

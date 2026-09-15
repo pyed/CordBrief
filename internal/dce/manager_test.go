@@ -114,8 +114,8 @@ func TestManager_CandidateSuccess(t *testing.T) {
 	if st.CandidateVersion != "" || st.CandidatePath != "" {
 		t.Fatalf("expected cleared candidate, got %+v", st)
 	}
-	if mgr.Status() != "2.49.0 · up to date" {
-		t.Fatalf("expected status '2.49.0 · up to date', got %q", mgr.Status())
+	if mgr.Status() != "2.49.0 · active" {
+		t.Fatalf("expected status '2.49.0 · active', got %q", mgr.Status())
 	}
 
 	// Verify bootstrap binary was NOT deleted
@@ -496,4 +496,43 @@ func TestManager_CheckForUpdates(t *testing.T) {
 			t.Fatalf("expected 0 duration when checked >7 days ago, got %v", mgr.NextCheckDuration())
 		}
 	})
+}
+
+func TestManager_PinnedCheckRefreshesLastCheckWithoutRequest(t *testing.T) {
+	requests := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests++
+	}))
+	defer ts.Close()
+
+	now := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+	mgr, err := NewManager(t.TempDir(), "/bootstrap/dce", "token",
+		WithReleaseClient(&ReleaseClient{Endpoint: ts.URL + "/latest", HTTPClient: ts.Client(), AllowHTTP: true}),
+		WithBootstrapVersion("2.48.0"),
+		WithClock(func() time.Time { return now }),
+		WithCommandRunner(func(context.Context, string, []string, []string, io.Writer, io.Writer) error {
+			return errors.New("probe disabled")
+		}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.mu.Lock()
+	mgr.state.PinnedVersion = "2.48.0"
+	mgr.state.LastCheck = now.Add(-8 * 24 * time.Hour)
+	mgr.mu.Unlock()
+	if mgr.NextCheckDuration() != 0 {
+		t.Fatal("pinned updater should initially be due")
+	}
+
+	updated, err := mgr.CheckForUpdates(context.Background())
+	if err != nil || updated {
+		t.Fatalf("pinned active check should be a local no-op, updated=%v err=%v", updated, err)
+	}
+	if requests != 0 {
+		t.Fatalf("pinned active check made %d GitHub requests", requests)
+	}
+	if got := mgr.NextCheckDuration(); got != 7*24*time.Hour {
+		t.Fatalf("pinned check did not advance schedule: got %v", got)
+	}
 }

@@ -3,6 +3,7 @@ package bot
 import (
 	"context"
 	"fmt"
+	"log"
 	"sync"
 	"time"
 
@@ -39,8 +40,8 @@ type Bot struct {
 	client            Sender
 	rawBot            *bot.Bot
 	store             *state.Store
-	dceClient         *dce.Client
 	dceManager        *dce.Manager
+	redact            func(string) string
 	runner            *job.Runner
 	scheduler         *scheduler.Scheduler
 	ownerID           int64
@@ -68,13 +69,6 @@ func WithSender(s Sender) Option {
 func WithNow(now func() time.Time) Option {
 	return func(b *Bot) {
 		b.now = now
-	}
-}
-
-// WithDCEClient sets a custom DCE client (used for testing or pre-configured clients).
-func WithDCEClient(client *dce.Client) Option {
-	return func(b *Bot) {
-		b.dceClient = client
 	}
 }
 
@@ -133,25 +127,30 @@ func New(appCtx context.Context, cfg *EnvConfig, store *state.Store, opts ...Opt
 		pendingFollows: make(map[string]PendingFollow),
 		llmAPIKey:      cfg.LLMAPIKey,
 		modelCache:     NewModelCache(),
-	}
-
-	// If DCE path and token are provided, initialize manager and client fail-open (does not prevent bot startup)
-	if cfg.DCEPath != "" && cfg.DiscordToken != "" {
-		if dceMgr, err := dce.NewManager(cfg.DataDir, cfg.DCEPath, cfg.DiscordToken); err == nil {
-			b.dceManager = dceMgr
-		}
-		if dceClient, err := dce.NewClient(cfg.DCEPath, cfg.DiscordToken); err == nil {
-			b.dceClient = dceClient
-		}
+		redact:         cfg.Redact,
 	}
 
 	for _, opt := range opts {
 		opt(b)
 	}
+	if b.dceManager == nil && cfg.DiscordToken != "" {
+		mgr, err := dce.NewManager(cfg.DataDir, cfg.DCEPath, cfg.DiscordToken)
+		if err != nil {
+			return nil, fmt.Errorf("initialize DCE: %s", cfg.Redact(err.Error()))
+		}
+		installCtx, cancel := context.WithTimeout(appCtx, 3*time.Minute)
+		err = mgr.Ensure(installCtx, cfg.DCEVersion)
+		cancel()
+		if err != nil {
+			return nil, fmt.Errorf("prepare DCE: %s", cfg.Redact(err.Error()))
+		}
+		b.dceManager = mgr
+	}
 
 	// If no custom sender was provided, initialize the real Telegram client.
 	if b.client == nil {
 		tgBot, err := bot.New(cfg.BotToken,
+			bot.WithErrorsHandler(func(err error) { log.Print(cfg.Redact(err.Error())) }),
 			bot.WithDefaultHandler(b.HandleUpdate),
 			bot.WithNotAsyncHandlers(),
 			bot.WithAllowedUpdates(bot.AllowedUpdates{
@@ -160,7 +159,7 @@ func New(appCtx context.Context, cfg *EnvConfig, store *state.Store, opts ...Opt
 			}),
 		)
 		if err != nil {
-			return nil, fmt.Errorf("initialize telegram bot: %w", err)
+			return nil, fmt.Errorf("initialize telegram bot: %s", cfg.Redact(err.Error()))
 		}
 		b.rawBot = tgBot
 		b.client = tgBot
@@ -171,8 +170,6 @@ func New(appCtx context.Context, cfg *EnvConfig, store *state.Store, opts ...Opt
 		var exporter job.DCEExporter
 		if b.dceManager != nil {
 			exporter = b.dceManager
-		} else if b.dceClient != nil {
-			exporter = b.dceClient
 		}
 		r, err := job.NewRunner(store,
 			job.WithDCEClient(exporter),
@@ -222,6 +219,9 @@ func (b *Bot) Deliver(ctx context.Context, text string) error {
 		Text:   text,
 	}
 	_, err := b.client.SendMessage(ctx, params)
+	if err != nil {
+		return fmt.Errorf("Telegram delivery: %s", b.redact(err.Error()))
+	}
 	return err
 }
 

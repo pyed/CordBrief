@@ -24,6 +24,7 @@ type UpdaterState struct {
 	CandidatePath    string    `json:"candidate_path,omitempty"`
 	RejectedVersion  string    `json:"rejected_version,omitempty"`
 	LastCheck        time.Time `json:"last_check"`
+	PinnedVersion    string    `json:"pinned_version,omitempty"`
 }
 
 // LoadUpdaterState reads the updater state file. If missing, it initializes a state pointing
