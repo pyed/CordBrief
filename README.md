@@ -2,7 +2,7 @@
 
 CordBrief is a lightweight, background Telegram-controlled Discord briefing bot.
 
-At idle, CordBrief is a single Go process running Telegram long polling and an internal timer. It operates with zero inbound ports and requires no Web UI, no Docker, no database server, and no browser or Discord runtime.
+At idle, CordBrief is a single Go process running Telegram long polling. M5 supports manual briefs; scheduled execution is not implemented yet. It operates with zero inbound ports and requires no Web UI, no Docker, no database server, and no browser or Discord runtime.
 
 ## Architecture
 
@@ -59,11 +59,24 @@ CordBrief transforms raw normalized Discord messages into concise executive summ
 
 ### Commands
 
-- `/start`: Display the main menu and overview.
-- `/status`: Show current followed channel count, schedule, timezone, and LLM model.
+- `/start`: Display the main menu, overview, and quick action buttons.
+- `/status`: Show current followed channel count, schedule, timezone, LLM model, Discord exporter status, and brief job status (`idle` or `running`).
+- `/brief [channel_id]`: Trigger an immediate brief job for all followed channels or a single specified channel. Runs in background with immediate acknowledgement.
 - `/channels`: List followed Discord channels with interactive follow and unfollow controls.
 - `/follow <channel_id> [display name]`: Follow a new channel with interactive start mode selection (`From now` or `Last 24 hours`).
 - `/unfollow [channel_id]`: Remove a channel from followed configuration and purge its operational state after confirmation.
+
+## Brief Orchestration & Delivery
+
+CordBrief coordinates the end-to-end briefing pipeline with strict transactional safety:
+
+- **Single Active Job:** Only one brief job runs at any time. Triggering while active returns an immediate notice.
+- **Concurrent Mutation Protection:** Follow and unfollow confirmations are safely blocked while a brief job is running to preserve snapshot consistency.
+- **Sequential Channel Processing:** Followed channels are processed sequentially with a shared fixed cutoff timestamp. A failure on one channel does not abort others.
+- **Plain-Text Telegram Delivery:** Briefs preserve text across paragraph and line boundaries, with `#channel · X/Y` headers and a conservative 3,900 UTF-16-unit limit per message.
+- **Shutdown:** SIGINT/SIGTERM cancels the application context shared by the job, DCE child and network requests, then waits for the job to exit.
+- **Completion Retry:** Each LLM completion gets at most two attempts, two seconds apart; cancellation stops retrying. DCE and Telegram sends are not retried automatically.
+- **At-Least-Once Delivery Guarantee:** A channel's durable cursor in `state.json` advances to the new message ID *only after* all message parts have been successfully delivered to Telegram.
 
 ## Project Structure
 
@@ -75,10 +88,9 @@ CordBrief/
 │   ├── bot/           # Telegram bot control plane
 │   ├── brief/         # Transcript compaction & brief assembly
 │   ├── dce/           # DiscordChatExporter execution & parsing
+│   ├── job/           # End-to-end brief orchestration & message delivery
 │   ├── llm/           # OpenAI-compatible LLM client
-│   ├── scheduler/     # Timing & job scheduling
 │   └── state/         # Configuration & cursor persistence
-├── deploy/            # Systemd service & deployment assets
 ├── go.mod
 ├── README.md
 ├── LICENSE

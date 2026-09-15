@@ -11,6 +11,7 @@ import (
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 	"github.com/pyed/CordBrief/internal/dce"
+	"github.com/pyed/CordBrief/internal/job"
 	"github.com/pyed/CordBrief/internal/state"
 )
 
@@ -102,7 +103,7 @@ func setupTestBot(t *testing.T) (*Bot, *fakeSender, *state.Store, func() time.Ti
 	fixedTime := time.Date(2026, 9, 13, 12, 0, 0, 0, time.UTC)
 	nowFunc := func() time.Time { return fixedTime }
 
-	b, err := New(&EnvConfig{
+	b, err := New(context.Background(), &EnvConfig{
 		BotToken: "test-token",
 		OwnerID:  12345,
 		DataDir:  dir,
@@ -676,4 +677,285 @@ func TestStatus_ReportsDiscordExporterState(t *testing.T) {
 	if !strings.Contains(msg.Text, "Discord exporter: configured") {
 		t.Errorf("expected 'Discord exporter: configured', got: %s", msg.Text)
 	}
+}
+
+type botFakeDCE struct {
+	sync.Mutex
+	delay   time.Duration
+	entered chan context.Context
+}
+
+func (f *botFakeDCE) IsConfigured() bool { return true }
+func (f *botFakeDCE) Export(ctx context.Context, req dce.ExportRequest) (*dce.ExportResult, error) {
+	if f.entered != nil {
+		f.entered <- ctx
+		<-ctx.Done()
+		return nil, ctx.Err()
+	}
+	if f.delay > 0 {
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-time.After(f.delay):
+		}
+	}
+	return &dce.ExportResult{
+		Channel:  dce.ChannelInfo{ID: req.ChannelID, Name: "general"},
+		Messages: []dce.Message{},
+	}, nil
+}
+
+func TestBrief_UsesApplicationContextAndCancelsOnShutdown(t *testing.T) {
+	b, sender, store, _ := setupTestBot(t)
+	appCtx, shutdown := context.WithCancel(context.Background())
+	defer shutdown()
+	b.appCtx = appCtx
+	cfg := state.DefaultConfig()
+	cfg.Channels = []state.ChannelConfig{{ID: "10001", Name: "general"}}
+	if err := store.SaveConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	st := state.NewEmptyState()
+	st.Channels["10001"] = state.ChannelState{Cursor: state.Cursor{Kind: state.CursorKindMessageID, Value: "100"}}
+	if err := store.SaveState(st); err != nil {
+		t.Fatal(err)
+	}
+	fakeDCE := &botFakeDCE{entered: make(chan context.Context, 1)}
+	b.runner, _ = job.NewRunner(store, job.WithDCEClient(fakeDCE), job.WithDeliverer(b))
+	handlerCtx, cancelHandler := context.WithCancel(appCtx)
+	b.HandleUpdate(handlerCtx, nil, makeMsg(12345, "private", "/brief"))
+	cancelHandler()
+	var jobCtx context.Context
+	select {
+	case jobCtx = <-fakeDCE.entered:
+	case <-time.After(time.Second):
+		t.Fatal("background job never started")
+	}
+	if jobCtx.Err() != nil {
+		t.Fatal("handler return canceled job")
+	}
+	b.HandleUpdate(appCtx, nil, makeMsg(12345, "private", "/status"))
+	if !strings.Contains(sender.lastSent().Text, "Brief job: running") {
+		t.Fatal("status unresponsive during job")
+	}
+	b.HandleUpdate(appCtx, nil, makeMsg(12345, "private", "/channels"))
+	if !strings.Contains(sender.lastSent().Text, "#general") {
+		t.Fatal("channels unresponsive during job")
+	}
+	shutdown()
+	done := make(chan struct{})
+	go func() { b.runner.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("shutdown did not stop job")
+	}
+	if jobCtx.Err() != context.Canceled || b.runner.IsRunning() {
+		t.Fatal("application cancellation did not release job")
+	}
+	after, err := store.LoadState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Channels["10001"].Cursor != st.Channels["10001"].Cursor {
+		t.Fatal("canceled export consumed cursor")
+	}
+}
+
+func TestBrief_NoChannelsFollowed(t *testing.T) {
+	b, sender, _, _ := setupTestBot(t)
+	ctx := context.Background()
+
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/brief"))
+	msg := sender.lastSent()
+	if msg == nil || !strings.Contains(msg.Text, "No channels are currently followed") {
+		t.Errorf("expected 'No channels are currently followed', got: %v", msg)
+	}
+}
+
+func TestBrief_NoRunnerConfigured(t *testing.T) {
+	b, sender, store, _ := setupTestBot(t)
+	ctx := context.Background()
+
+	cfg, _ := store.LoadConfig()
+	cfg.Channels = []state.ChannelConfig{{ID: "10001", Name: "general"}}
+	_ = store.SaveConfig(cfg)
+
+	b.runner = nil
+
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/brief"))
+	msg := sender.lastSent()
+	if msg == nil || !strings.Contains(msg.Text, "Brief engine is not initialized") {
+		t.Errorf("expected 'Brief engine is not initialized', got: %v", msg)
+	}
+}
+
+func TestBrief_Trigger_AndBlocksConcurrentRun(t *testing.T) {
+	b, sender, store, _ := setupTestBot(t)
+	ctx := context.Background()
+
+	cfg, _ := store.LoadConfig()
+	cfg.Channels = []state.ChannelConfig{{ID: "10001", Name: "general"}}
+	_ = store.SaveConfig(cfg)
+	st := state.NewEmptyState()
+	st.Channels["10001"] = state.ChannelState{Cursor: state.Cursor{Kind: state.CursorKindTimestamp, Value: "2026-09-14T00:00:00Z"}}
+	_ = store.SaveState(st)
+
+	fakeDCE := &botFakeDCE{delay: 200 * time.Millisecond}
+	runner, err := job.NewRunner(store,
+		job.WithDCEClient(fakeDCE),
+		job.WithDeliverer(b),
+	)
+	if err != nil {
+		t.Fatalf("NewRunner: %v", err)
+	}
+	b.runner = runner
+
+	// Send /brief
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/brief"))
+	msg := sender.lastSent()
+	if msg == nil || !strings.Contains(msg.Text, "Starting brief for 1 channel...") {
+		t.Errorf("expected 'Starting brief for 1 channel...', got: %v", msg)
+	}
+
+	// Immediate second /brief while running
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/brief"))
+	msg2 := sender.lastSent()
+	if msg2 == nil || !strings.Contains(msg2.Text, "Brief already running") {
+		t.Errorf("expected 'Brief already running', got: %v", msg2)
+	}
+
+	// Wait for runner to finish
+	runner.Wait()
+}
+
+func TestBrief_ButtonCallback(t *testing.T) {
+	b, sender, store, _ := setupTestBot(t)
+	ctx := context.Background()
+
+	cfg, _ := store.LoadConfig()
+	cfg.Channels = []state.ChannelConfig{{ID: "10001", Name: "general"}}
+	_ = store.SaveConfig(cfg)
+	st := state.NewEmptyState()
+	st.Channels["10001"] = state.ChannelState{Cursor: state.Cursor{Kind: state.CursorKindTimestamp, Value: "2026-09-14T00:00:00Z"}}
+	_ = store.SaveState(st)
+
+	fakeDCE := &botFakeDCE{}
+	runner, _ := job.NewRunner(store,
+		job.WithDCEClient(fakeDCE),
+		job.WithDeliverer(b),
+	)
+	b.runner = runner
+
+	b.HandleUpdate(ctx, nil, makeCallback(12345, "private", "action=brief"))
+	runner.Wait()
+
+	if sender.answeredCount() < 1 {
+		t.Errorf("expected callback answered")
+	}
+	sentFound := false
+	for _, m := range sender.sent {
+		if strings.Contains(m.Text, "Starting brief for 1 channel...") {
+			sentFound = true
+			break
+		}
+	}
+	if !sentFound {
+		t.Errorf("expected 'Starting brief for 1 channel...' in sent messages")
+	}
+}
+
+func TestStatus_ReportsBriefJobState(t *testing.T) {
+	b, sender, store, _ := setupTestBot(t)
+	ctx := context.Background()
+
+	// 1. Idle runner
+	fakeDCE := &botFakeDCE{delay: 300 * time.Millisecond}
+	runner, _ := job.NewRunner(store,
+		job.WithDCEClient(fakeDCE),
+		job.WithDeliverer(b),
+	)
+	b.runner = runner
+
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/status"))
+	msg := sender.lastSent()
+	if msg == nil || !strings.Contains(msg.Text, "Brief job: idle") {
+		t.Errorf("expected 'Brief job: idle', got: %v", msg)
+	}
+
+	// 2. Running
+	cfg, _ := store.LoadConfig()
+	cfg.Channels = []state.ChannelConfig{{ID: "10001", Name: "general"}}
+	_ = store.SaveConfig(cfg)
+	st := state.NewEmptyState()
+	st.Channels["10001"] = state.ChannelState{Cursor: state.Cursor{Kind: state.CursorKindTimestamp, Value: "2026-09-14T00:00:00Z"}}
+	_ = store.SaveState(st)
+
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/brief"))
+
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/status"))
+	msg = sender.lastSent()
+	if msg == nil || !strings.Contains(msg.Text, "Brief job: running") {
+		t.Errorf("expected 'Brief job: running', got: %v", msg)
+	}
+
+	runner.Wait()
+}
+
+func TestFollowAndUnfollow_BlockedWhileBriefRunning(t *testing.T) {
+	b, sender, store, _ := setupTestBot(t)
+	ctx := context.Background()
+
+	cfg, _ := store.LoadConfig()
+	cfg.Channels = []state.ChannelConfig{{ID: "10001", Name: "general"}}
+	_ = store.SaveConfig(cfg)
+	st := state.NewEmptyState()
+	st.Channels["10001"] = state.ChannelState{Cursor: state.Cursor{Kind: state.CursorKindTimestamp, Value: "2026-09-14T00:00:00Z"}}
+	_ = store.SaveState(st)
+
+	fakeDCE := &botFakeDCE{delay: 300 * time.Millisecond}
+	runner, _ := job.NewRunner(store,
+		job.WithDCEClient(fakeDCE),
+		job.WithDeliverer(b),
+	)
+	b.runner = runner
+
+	// Start brief
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/brief"))
+
+	// Try confirming a follow while brief is running
+	b.mu.Lock()
+	b.pendingFollows["temp_pending"] = PendingFollow{
+		ChannelID:   "20002",
+		DisplayName: "dev",
+		CreatedAt:   time.Now(),
+	}
+	b.mu.Unlock()
+
+	b.HandleUpdate(ctx, nil, makeCallback(12345, "private", "f:now:temp_pending"))
+	edited := sender.lastEdited()
+	if edited == nil || !strings.Contains(edited.Text, "A brief is currently running. Try again when it finishes.") {
+		t.Errorf("expected follow blocked message, got %v", edited)
+	}
+
+	// Verify channel was NOT added to config
+	cfgAfter, _ := store.LoadConfig()
+	if len(cfgAfter.Channels) != 1 {
+		t.Errorf("channel was added to config despite brief running: %v", cfgAfter.Channels)
+	}
+
+	// Try confirming an unfollow while brief is running
+	b.HandleUpdate(ctx, nil, makeCallback(12345, "private", "u:confirm:10001"))
+	edited = sender.lastEdited()
+	if edited == nil || !strings.Contains(edited.Text, "A brief is currently running. Try again when it finishes.") {
+		t.Errorf("expected unfollow blocked message, got %v", edited)
+	}
+
+	// Verify channel was NOT removed from config
+	cfgAfter2, _ := store.LoadConfig()
+	if len(cfgAfter2.Channels) != 1 {
+		t.Errorf("channel was removed from config despite brief running: %v", cfgAfter2.Channels)
+	}
+
+	runner.Wait()
 }

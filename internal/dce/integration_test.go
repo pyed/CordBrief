@@ -12,8 +12,12 @@ import (
 )
 
 // TestLiveIntegration exercises the production dce.Client against real Discord channels.
-// It is automatically skipped if CORDBRIEF_DCE_PATH or DISCORD_TOKEN is not set.
+// It is explicitly gated by CORDBRIEF_LIVE_TESTS=1 and requires CORDBRIEF_DCE_PATH and DISCORD_TOKEN.
 func TestLiveIntegration(t *testing.T) {
+	if os.Getenv("CORDBRIEF_LIVE_TESTS") != "1" {
+		t.Skip("skipping live integration test: CORDBRIEF_LIVE_TESTS=1 not set")
+	}
+
 	dcePath := os.Getenv("CORDBRIEF_DCE_PATH")
 	token := os.Getenv("DISCORD_TOKEN")
 	if dcePath == "" || token == "" {

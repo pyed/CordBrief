@@ -14,6 +14,7 @@ type EnvConfig struct {
 	DataDir      string
 	DiscordToken string
 	DCEPath      string
+	LLMAPIKey    string
 }
 
 // LoadEnv reads and validates required environment variables for CordBrief.
@@ -42,6 +43,7 @@ func LoadEnv() (*EnvConfig, error) {
 
 	discordToken := strings.TrimSpace(os.Getenv("DISCORD_TOKEN"))
 	dcePath := strings.TrimSpace(os.Getenv("CORDBRIEF_DCE_PATH"))
+	llmAPIKey := strings.TrimSpace(os.Getenv("LLM_API_KEY"))
 
 	return &EnvConfig{
 		BotToken:     token,
@@ -49,5 +51,6 @@ func LoadEnv() (*EnvConfig, error) {
 		DataDir:      dataDir,
 		DiscordToken: discordToken,
 		DCEPath:      dcePath,
+		LLMAPIKey:    llmAPIKey,
 	}, nil
 }

@@ -47,3 +47,4 @@ ehthumbs.db
 .unlazy-hook-state.json
 .claude/
 .tools/
+/m5-live-data/

@@ -30,23 +30,33 @@ func main() {
 		log.Fatalf("failed to initialize state store: %v", err)
 	}
 
-	appBot, err := bot.New(env, store)
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+
+	appBot, err := bot.New(ctx, env, store)
 	if err != nil {
 		log.Fatalf("failed to initialize telegram bot: %v", err)
 	}
 
-	log.Printf("Telegram bot initialized for owner ID %d (data directory: %s)", env.OwnerID, env.DataDir)
+	log.Printf("Telegram bot initialized (data directory: %s)", env.DataDir)
 	if env.DCEPath != "" && env.DiscordToken != "" {
 		log.Printf("Discord exporter configured (DCE binary: %s)", env.DCEPath)
 	} else {
 		log.Println("Discord exporter not configured (DISCORD_TOKEN or CORDBRIEF_DCE_PATH missing)")
 	}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-	defer cancel()
+	if env.LLMAPIKey != "" {
+		log.Println("LLM provider configured")
+	} else {
+		log.Println("LLM provider not configured (LLM_API_KEY missing)")
+	}
 
 	log.Println("Starting Telegram long polling...")
-	appBot.Start(ctx)
+	appBot.Start()
 
 	log.Println("Shutting down CordBrief...")
+	if r := appBot.Runner(); r != nil {
+		log.Println("Waiting for active brief to complete...")
+		r.Wait()
+	}
+	log.Println("CordBrief shutdown complete.")
 }

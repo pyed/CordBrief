@@ -9,6 +9,7 @@ import (
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
 	"github.com/pyed/CordBrief/internal/dce"
+	"github.com/pyed/CordBrief/internal/job"
 	"github.com/pyed/CordBrief/internal/state"
 )
 
@@ -28,10 +29,12 @@ type PendingFollow struct {
 
 // Bot is the Telegram control plane for CordBrief.
 type Bot struct {
+	appCtx         context.Context
 	client         Sender
 	rawBot         *bot.Bot
 	store          *state.Store
 	dceClient      *dce.Client
+	runner         *job.Runner
 	ownerID        int64
 	now            func() time.Time
 	mu             sync.Mutex
@@ -63,8 +66,18 @@ func WithDCEClient(client *dce.Client) Option {
 	}
 }
 
+// WithRunner sets a custom job Runner (used for testing).
+func WithRunner(r *job.Runner) Option {
+	return func(b *Bot) {
+		b.runner = r
+	}
+}
+
 // New constructs a Bot instance with the provided environment config and state store.
-func New(cfg *EnvConfig, store *state.Store, opts ...Option) (*Bot, error) {
+func New(appCtx context.Context, cfg *EnvConfig, store *state.Store, opts ...Option) (*Bot, error) {
+	if appCtx == nil {
+		return nil, fmt.Errorf("application context is required")
+	}
 	if cfg == nil {
 		return nil, fmt.Errorf("env config is required")
 	}
@@ -73,6 +86,7 @@ func New(cfg *EnvConfig, store *state.Store, opts ...Option) (*Bot, error) {
 	}
 
 	b := &Bot{
+		appCtx:         appCtx,
 		store:          store,
 		ownerID:        cfg.OwnerID,
 		now:            time.Now,
@@ -107,19 +121,46 @@ func New(cfg *EnvConfig, store *state.Store, opts ...Option) (*Bot, error) {
 		b.client = tgBot
 	}
 
+	// Initialize runner if not set via WithRunner
+	if b.runner == nil {
+		r, err := job.NewRunner(store,
+			job.WithDCEClient(b.dceClient),
+			job.WithDeliverer(b),
+			job.WithLLMAPIKey(cfg.LLMAPIKey),
+		)
+		if err == nil {
+			b.runner = r
+		}
+	}
+
 	return b, nil
 }
 
-// Start launches Telegram long polling and blocks until ctx is canceled.
-func (b *Bot) Start(ctx context.Context) {
+// Start launches Telegram long polling until the application context is canceled.
+func (b *Bot) Start() {
 	if b.rawBot != nil {
-		b.rawBot.Start(ctx)
+		b.rawBot.Start(b.appCtx)
 	}
 }
 
 // OwnerID returns the authorized owner's Telegram ID.
 func (b *Bot) OwnerID() int64 {
 	return b.ownerID
+}
+
+// Deliver implements job.Deliverer by delivering plain-text messages directly to the owner.
+func (b *Bot) Deliver(ctx context.Context, text string) error {
+	params := &bot.SendMessageParams{
+		ChatID: b.ownerID,
+		Text:   text,
+	}
+	_, err := b.client.SendMessage(ctx, params)
+	return err
+}
+
+// Runner returns the active brief runner.
+func (b *Bot) Runner() *job.Runner {
+	return b.runner
 }
 
 func (b *Bot) sendTextMessage(ctx context.Context, chatID int64, text string) {

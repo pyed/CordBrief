@@ -9,8 +9,12 @@ import (
 )
 
 // TestLiveGeminiProof verifies our Go llm.Client against the official Gemini OpenAI-compatible endpoint.
-// It is automatically skipped if LLM_API_KEY is not set.
+// It is explicitly gated by CORDBRIEF_LIVE_TESTS=1 and requires LLM_API_KEY.
 func TestLiveGeminiProof(t *testing.T) {
+	if os.Getenv("CORDBRIEF_LIVE_TESTS") != "1" {
+		t.Skip("skipping live Gemini proof: CORDBRIEF_LIVE_TESTS=1 not set")
+	}
+
 	apiKey := os.Getenv("LLM_API_KEY")
 	if apiKey == "" {
 		t.Skip("skipping live Gemini proof: LLM_API_KEY not set in environment")

@@ -63,7 +63,12 @@ func (rt *liveRetryTransport) RoundTrip(req *http.Request) (*http.Response, erro
 
 // TestLiveBrief_EndToEnd proves the full real pipeline:
 // DCE export -> map to brief.Message -> brief.Engine -> Gemini 3.8 Flash -> final brief.
+// It is explicitly gated by CORDBRIEF_LIVE_TESTS=1 and requires LLM_API_KEY, CORDBRIEF_DCE_PATH, and DISCORD_TOKEN.
 func TestLiveBrief_EndToEnd(t *testing.T) {
+	if os.Getenv("CORDBRIEF_LIVE_TESTS") != "1" {
+		t.Skip("skipping live brief test: CORDBRIEF_LIVE_TESTS=1 not set")
+	}
+
 	apiKey := os.Getenv("LLM_API_KEY")
 	if apiKey == "" {
 		t.Skip("skipping live brief test: LLM_API_KEY not set")
@@ -169,7 +174,12 @@ func TestLiveBrief_EndToEnd(t *testing.T) {
 
 // TestLiveBrief_ForcedChunking proves the multi-chunk hierarchical summarization path with a real LLM.
 // Uses a modest 2-chunk split to verify chunk notes generation and final synthesis without excessive API calls.
+// It is explicitly gated by CORDBRIEF_LIVE_TESTS=1 and requires LLM_API_KEY.
 func TestLiveBrief_ForcedChunking(t *testing.T) {
+	if os.Getenv("CORDBRIEF_LIVE_TESTS") != "1" {
+		t.Skip("skipping live chunking test: CORDBRIEF_LIVE_TESTS=1 not set")
+	}
+
 	apiKey := os.Getenv("LLM_API_KEY")
 	if apiKey == "" {
 		t.Skip("skipping live chunking test: LLM_API_KEY not set")
@@ -234,7 +244,12 @@ func TestLiveBrief_ForcedChunking(t *testing.T) {
 }
 
 // TestLiveBrief_PromptInjectionProbe proves the system prompt resists untrusted instruction overrides.
+// It is explicitly gated by CORDBRIEF_LIVE_TESTS=1 and requires LLM_API_KEY.
 func TestLiveBrief_PromptInjectionProbe(t *testing.T) {
+	if os.Getenv("CORDBRIEF_LIVE_TESTS") != "1" {
+		t.Skip("skipping live prompt injection probe: CORDBRIEF_LIVE_TESTS=1 not set")
+	}
+
 	apiKey := os.Getenv("LLM_API_KEY")
 	if apiKey == "" {
 		t.Skip("skipping live prompt injection probe: LLM_API_KEY not set")

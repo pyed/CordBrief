@@ -61,6 +61,8 @@ func (b *Bot) handleMessage(ctx context.Context, msg *models.Message) {
 		b.handleFollow(ctx, msg.Chat.ID, parts[1:])
 	case "/unfollow":
 		b.handleUnfollow(ctx, msg.Chat.ID, parts[1:])
+	case "/brief":
+		b.handleBrief(ctx, msg.Chat.ID, parts[1:])
 	}
 }
 
@@ -81,6 +83,9 @@ func (b *Bot) handleStart(ctx context.Context, chatID int64) {
 
 	markup := &models.InlineKeyboardMarkup{
 		InlineKeyboard: [][]models.InlineKeyboardButton{
+			{
+				{Text: "Run brief now", CallbackData: "action=brief"},
+			},
 			{
 				{Text: "Status", CallbackData: "action=status"},
 				{Text: "Channels", CallbackData: "action=channels"},
@@ -108,12 +113,18 @@ func (b *Bot) handleStatus(ctx context.Context, chatID int64) {
 		dceStatus = "configured"
 	}
 
-	text := fmt.Sprintf("CordBrief status\n\nChannels: %d\nSchedule: %s · %s · %s\nLLM: %s\nDiscord exporter: %s\nBrief engine: not implemented yet",
-		len(cfg.Channels), schedEnabled, cfg.Schedule.Time, cfg.Timezone, cfg.LLM.Model, dceStatus)
+	jobStatus := "idle"
+	if b.runner != nil && b.runner.IsRunning() {
+		jobStatus = "running"
+	}
+
+	text := fmt.Sprintf("CordBrief status\n\nChannels: %d\nSchedule: %s · %s · %s\nLLM: %s\nDiscord exporter: %s\nBrief job: %s",
+		len(cfg.Channels), schedEnabled, cfg.Schedule.Time, cfg.Timezone, cfg.LLM.Model, dceStatus, jobStatus)
 
 	markup := &models.InlineKeyboardMarkup{
 		InlineKeyboard: [][]models.InlineKeyboardButton{
 			{
+				{Text: "Run brief now", CallbackData: "action=brief"},
 				{Text: "Channels", CallbackData: "action=channels"},
 			},
 		},
@@ -295,6 +306,8 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, q *models.CallbackQuery) 
 	data := q.Data
 
 	switch {
+	case data == "action=brief":
+		b.handleBrief(ctx, chatID, nil)
 	case data == "action=status":
 		b.handleStatus(ctx, chatID)
 	case data == "action=channels":
@@ -331,6 +344,11 @@ func (b *Bot) handleFollowCallback(ctx context.Context, chatID int64, messageID 
 
 	if action == "cancel" {
 		b.editMessage(ctx, chatID, messageID, "Follow cancelled.", nil)
+		return
+	}
+
+	if b.runner != nil && b.runner.IsRunning() {
+		b.editMessage(ctx, chatID, messageID, "A brief is currently running. Try again when it finishes.", nil)
 		return
 	}
 
@@ -453,6 +471,11 @@ func (b *Bot) handleUnfollowCallback(ctx context.Context, chatID int64, messageI
 		}
 		channelID := parts[2]
 
+		if b.runner != nil && b.runner.IsRunning() {
+			b.editMessage(ctx, chatID, messageID, "A brief is currently running. Try again when it finishes.", nil)
+			return
+		}
+
 		// Safe Unfollow Persistence Order:
 		// 1. Load latest config & state
 		cfg, err := b.store.LoadConfig()
@@ -498,5 +521,58 @@ func (b *Bot) handleUnfollowCallback(ctx context.Context, chatID int64, messageI
 		}
 
 		b.editMessage(ctx, chatID, messageID, fmt.Sprintf("Unfollowed channel %s.", channelID), nil)
+	}
+}
+
+func (b *Bot) handleBrief(ctx context.Context, chatID int64, args []string) {
+	cfg, err := b.store.LoadConfig()
+	if err != nil {
+		b.sendTextMessage(ctx, chatID, "Error loading configuration: "+err.Error())
+		return
+	}
+
+	if len(cfg.Channels) == 0 {
+		b.sendTextMessage(ctx, chatID, "No channels are currently followed.")
+		return
+	}
+
+	var targetChannelID string
+	var targetName string
+	if len(args) > 0 {
+		targetChannelID = args[0]
+		found := false
+		for _, ch := range cfg.Channels {
+			if ch.ID == targetChannelID {
+				found = true
+				targetName = ch.Name
+				break
+			}
+		}
+		if !found {
+			b.sendTextMessage(ctx, chatID, fmt.Sprintf("Channel %s is not currently followed.", targetChannelID))
+			return
+		}
+	}
+
+	if b.runner == nil {
+		b.sendTextMessage(ctx, chatID, "Brief engine is not initialized.")
+		return
+	}
+
+	if !b.runner.Start(b.appCtx, targetChannelID) {
+		b.sendTextMessage(ctx, chatID, "Brief already running.")
+		return
+	}
+
+	// Immediate acknowledgement
+	if targetChannelID != "" {
+		b.sendTextMessage(ctx, chatID, fmt.Sprintf("Starting brief for #%s...", targetName))
+	} else {
+		count := len(cfg.Channels)
+		if count == 1 {
+			b.sendTextMessage(ctx, chatID, "Starting brief for 1 channel...")
+		} else {
+			b.sendTextMessage(ctx, chatID, fmt.Sprintf("Starting brief for %d channels...", count))
+		}
 	}
 }
