@@ -10,6 +10,7 @@ import (
 	"github.com/go-telegram/bot/models"
 	"github.com/pyed/CordBrief/internal/dce"
 	"github.com/pyed/CordBrief/internal/job"
+	"github.com/pyed/CordBrief/internal/llm"
 	"github.com/pyed/CordBrief/internal/scheduler"
 	"github.com/pyed/CordBrief/internal/state"
 )
@@ -28,6 +29,11 @@ type PendingFollow struct {
 	CreatedAt   time.Time
 }
 
+// ModelLister defines the capability to discover available LLM models.
+type ModelLister interface {
+	ListModels(ctx context.Context) ([]llm.ModelInfo, error)
+}
+
 // Bot is the Telegram control plane for CordBrief.
 type Bot struct {
 	appCtx         context.Context
@@ -42,6 +48,9 @@ type Bot struct {
 	mu             sync.Mutex
 	pendingFollows map[string]PendingFollow
 	nextFollowID   int64
+	llmAPIKey      string
+	modelCache     *ModelCache
+	modelLister    ModelLister
 }
 
 // Option configures Bot instances.
@@ -82,6 +91,20 @@ func WithScheduler(s *scheduler.Scheduler) Option {
 	}
 }
 
+// WithModelLister sets a custom ModelLister (used for testing without real network calls).
+func WithModelLister(lister ModelLister) Option {
+	return func(b *Bot) {
+		b.modelLister = lister
+	}
+}
+
+// WithModelCache sets a custom ModelCache (used for testing).
+func WithModelCache(cache *ModelCache) Option {
+	return func(b *Bot) {
+		b.modelCache = cache
+	}
+}
+
 // New constructs a Bot instance with the provided environment config and state store.
 func New(appCtx context.Context, cfg *EnvConfig, store *state.Store, opts ...Option) (*Bot, error) {
 	if appCtx == nil {
@@ -100,6 +123,8 @@ func New(appCtx context.Context, cfg *EnvConfig, store *state.Store, opts ...Opt
 		ownerID:        cfg.OwnerID,
 		now:            time.Now,
 		pendingFollows: make(map[string]PendingFollow),
+		llmAPIKey:      cfg.LLMAPIKey,
+		modelCache:     NewModelCache(),
 	}
 
 	// If DCE path and token are provided, initialize client fail-open (does not prevent bot startup)

@@ -350,3 +350,26 @@ func TestClient_PreservesBasePath(t *testing.T) {
 		_ = capturedPath
 	}
 }
+
+func TestIsGeminiEndpoint(t *testing.T) {
+	tests := []struct {
+		url      string
+		expected bool
+	}{
+		{"https://generativelanguage.googleapis.com/v1beta/openai", true},
+		{"https://GENERATIVELANGUAGE.GOOGLEAPIS.COM/v1beta/openai", true},
+		{"https://generativelanguage.googleapis.com:443/v1beta/openai", true},
+		{"https://api.openai.com/v1", false},
+		{"https://openrouter.ai/api/v1", false},
+		{"http://localhost:11434/v1", false},
+		{"invalid://url%%", false},
+		{"", false},
+	}
+
+	for _, tc := range tests {
+		got := isGeminiEndpoint(tc.url)
+		if got != tc.expected {
+			t.Errorf("isGeminiEndpoint(%q) = %v, expected %v", tc.url, got, tc.expected)
+		}
+	}
+}

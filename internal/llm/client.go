@@ -175,3 +175,102 @@ func (c *Client) sanitizeError(err error) error {
 	msg := strings.ReplaceAll(err.Error(), c.apiKey, "[REDACTED]")
 	return errors.New(msg)
 }
+
+// isGeminiEndpoint reports whether baseURL points to the Google Gemini OpenAI-compatible API.
+func isGeminiEndpoint(baseURL string) bool {
+	u, err := url.Parse(baseURL)
+	if err != nil {
+		return false
+	}
+	return strings.EqualFold(u.Hostname(), "generativelanguage.googleapis.com")
+}
+
+// ModelInfo holds identity metadata for an available LLM model.
+type ModelInfo struct {
+	ProviderID string `json:"provider_id"`
+	ModelID    string `json:"model_id"`
+}
+
+// ListModels queries the provider's OpenAI-compatible /models endpoint.
+// Custom URL paths are preserved, API keys are kept out of query strings,
+// and sensitive keys are redacted from all returned errors.
+// Model IDs are treated as opaque, except for the verified Google Gemini endpoint
+// where the "models/" prefix is stripped to match CordBrief configuration.
+func (c *Client) ListModels(ctx context.Context) ([]ModelInfo, error) {
+	if c == nil || c.baseURL == "" {
+		return nil, errors.New("llm client is not initialized")
+	}
+
+	endpoint := strings.TrimRight(c.baseURL, "/") + "/models"
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create http request: %w", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, c.sanitizeError(fmt.Errorf("llm transport error: %w", err))
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		diagReader := io.LimitReader(resp.Body, MaxErrorBytes)
+		diagBody, _ := io.ReadAll(diagReader)
+		diagText := strings.TrimSpace(string(diagBody))
+		if diagText != "" {
+			return nil, c.sanitizeError(fmt.Errorf("llm models request failed with status %d: %s", resp.StatusCode, diagText))
+		}
+		return nil, c.sanitizeError(fmt.Errorf("llm models request failed with status %d", resp.StatusCode))
+	}
+
+	limitedReader := io.LimitReader(resp.Body, MaxResponseBytes+1)
+	body, err := io.ReadAll(limitedReader)
+	if err != nil {
+		return nil, c.sanitizeError(fmt.Errorf("failed to read llm response body: %w", err))
+	}
+	if int64(len(body)) > MaxResponseBytes {
+		return nil, errors.New("llm response exceeded maximum allowed size (4 MiB)")
+	}
+
+	var respPayload struct {
+		Data []struct {
+			ID string `json:"id"`
+		} `json:"data"`
+	}
+
+	if err := json.Unmarshal(body, &respPayload); err != nil {
+		return nil, c.sanitizeError(fmt.Errorf("failed to parse llm models JSON: %w", err))
+	}
+
+	var models []ModelInfo
+	seen := make(map[string]bool)
+	for _, item := range respPayload.Data {
+		rawID := strings.TrimSpace(item.ID)
+		if rawID == "" {
+			continue
+		}
+		modelID := rawID
+		if isGeminiEndpoint(c.baseURL) {
+			modelID = strings.TrimPrefix(rawID, "models/")
+		}
+		if modelID == "" {
+			continue
+		}
+		if seen[modelID] {
+			continue
+		}
+		seen[modelID] = true
+		models = append(models, ModelInfo{
+			ProviderID: rawID,
+			ModelID:    modelID,
+		})
+	}
+
+	return models, nil
+}

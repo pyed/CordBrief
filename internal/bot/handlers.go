@@ -66,6 +66,8 @@ func (b *Bot) handleMessage(ctx context.Context, msg *models.Message) {
 		b.handleBrief(ctx, msg.Chat.ID, parts[1:])
 	case "/schedule":
 		b.handleSchedule(ctx, msg.Chat.ID, parts[1:])
+	case "/model":
+		b.handleModel(ctx, msg.Chat.ID, parts[1:])
 	}
 }
 
@@ -323,6 +325,10 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, q *models.CallbackQuery) 
 		b.handleFollowCallback(ctx, chatID, messageID, data)
 	case strings.HasPrefix(data, "u:"):
 		b.handleUnfollowCallback(ctx, chatID, messageID, data)
+	case strings.HasPrefix(data, "m:"):
+		b.handleModelCallback(ctx, chatID, messageID, data)
+	case data == "noop":
+		// No-op (e.g. page indicator)
 	}
 }
 
