@@ -43,14 +43,19 @@ type Config struct {
 	LLM      LLMConfig       `json:"llm"`
 }
 
+// CurrentConfigVersion defines the active config.json schema version.
+// Version 2 introduces the automatic daily scheduler with explicit operator opt-in.
+const CurrentConfigVersion = 2
+
 // DefaultConfig returns the standard initial configuration.
 // Timezone defaults to UTC for portability. LLM defaults to the Gemini OpenAI-compatible endpoint.
+// Schedule defaults to disabled until explicitly configured by the operator.
 func DefaultConfig() *Config {
 	return &Config{
-		Version:  1,
+		Version:  CurrentConfigVersion,
 		Channels: []ChannelConfig{},
 		Schedule: ScheduleConfig{
-			Enabled: true,
+			Enabled: false,
 			Time:    DefaultSchedule,
 		},
 		Timezone: DefaultTimezone,
@@ -63,8 +68,8 @@ func DefaultConfig() *Config {
 
 // Validate ensures all config fields satisfy required invariants.
 func (c *Config) Validate() error {
-	if c.Version != 1 {
-		return fmt.Errorf("unsupported config version: %d (expected 1)", c.Version)
+	if c.Version != CurrentConfigVersion {
+		return fmt.Errorf("unsupported config version: %d (expected %d)", c.Version, CurrentConfigVersion)
 	}
 
 	if strings.TrimSpace(c.Timezone) == "" {

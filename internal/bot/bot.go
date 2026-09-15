@@ -10,6 +10,7 @@ import (
 	"github.com/go-telegram/bot/models"
 	"github.com/pyed/CordBrief/internal/dce"
 	"github.com/pyed/CordBrief/internal/job"
+	"github.com/pyed/CordBrief/internal/scheduler"
 	"github.com/pyed/CordBrief/internal/state"
 )
 
@@ -35,6 +36,7 @@ type Bot struct {
 	store          *state.Store
 	dceClient      *dce.Client
 	runner         *job.Runner
+	scheduler      *scheduler.Scheduler
 	ownerID        int64
 	now            func() time.Time
 	mu             sync.Mutex
@@ -70,6 +72,13 @@ func WithDCEClient(client *dce.Client) Option {
 func WithRunner(r *job.Runner) Option {
 	return func(b *Bot) {
 		b.runner = r
+	}
+}
+
+// WithScheduler sets a custom Scheduler (used for testing).
+func WithScheduler(s *scheduler.Scheduler) Option {
+	return func(b *Bot) {
+		b.scheduler = s
 	}
 }
 
@@ -133,11 +142,24 @@ func New(appCtx context.Context, cfg *EnvConfig, store *state.Store, opts ...Opt
 		}
 	}
 
+	// Initialize scheduler if not set via WithScheduler
+	if b.scheduler == nil {
+		b.scheduler = scheduler.New(store, func(ctx context.Context) bool {
+			if b.runner == nil {
+				return false
+			}
+			return b.runner.Start(ctx, "")
+		}, scheduler.WithNow(b.now))
+	}
+
 	return b, nil
 }
 
-// Start launches Telegram long polling until the application context is canceled.
+// Start launches Telegram long polling and the background scheduler until the application context is canceled.
 func (b *Bot) Start() {
+	if b.scheduler != nil {
+		go b.scheduler.Run(b.appCtx)
+	}
 	if b.rawBot != nil {
 		b.rawBot.Start(b.appCtx)
 	}
@@ -161,6 +183,11 @@ func (b *Bot) Deliver(ctx context.Context, text string) error {
 // Runner returns the active brief runner.
 func (b *Bot) Runner() *job.Runner {
 	return b.runner
+}
+
+// Scheduler returns the active brief scheduler.
+func (b *Bot) Scheduler() *scheduler.Scheduler {
+	return b.scheduler
 }
 
 func (b *Bot) sendTextMessage(ctx context.Context, chatID int64, text string) {

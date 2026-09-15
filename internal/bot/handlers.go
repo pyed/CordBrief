@@ -8,6 +8,7 @@ import (
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
+	"github.com/pyed/CordBrief/internal/scheduler"
 	"github.com/pyed/CordBrief/internal/state"
 )
 
@@ -63,6 +64,8 @@ func (b *Bot) handleMessage(ctx context.Context, msg *models.Message) {
 		b.handleUnfollow(ctx, msg.Chat.ID, parts[1:])
 	case "/brief":
 		b.handleBrief(ctx, msg.Chat.ID, parts[1:])
+	case "/schedule":
+		b.handleSchedule(ctx, msg.Chat.ID, parts[1:])
 	}
 }
 
@@ -575,4 +578,116 @@ func (b *Bot) handleBrief(ctx context.Context, chatID int64, args []string) {
 			b.sendTextMessage(ctx, chatID, fmt.Sprintf("Starting brief for %d channels...", count))
 		}
 	}
+}
+
+func (b *Bot) handleSchedule(ctx context.Context, chatID int64, args []string) {
+	if len(args) == 0 {
+		// View current schedule state
+		cfg, err := b.store.LoadConfig()
+		if err != nil {
+			b.sendTextMessage(ctx, chatID, "Error loading configuration: "+err.Error())
+			return
+		}
+
+		schedState := "disabled"
+		nextRunStr := "none"
+		if cfg.Schedule.Enabled {
+			schedState = "enabled"
+			nextTime, _, err := scheduler.NextRunForConfig(cfg, b.now())
+			if err != nil {
+				nextRunStr = "error: " + err.Error()
+			} else {
+				nextRunStr = nextTime.Format("2006-01-02 15:04 -07")
+			}
+		}
+
+		text := fmt.Sprintf("Daily brief: %s\nTime: %s\nTimezone: %s\nNext run: %s",
+			schedState, cfg.Schedule.Time, cfg.Timezone, nextRunStr)
+		b.sendTextMessage(ctx, chatID, text)
+		return
+	}
+
+	// Schedule mutation requested
+	if b.runner != nil && b.runner.IsRunning() {
+		b.sendTextMessage(ctx, chatID, "A brief is currently running. Configuration changes are frozen until it finishes.")
+		return
+	}
+
+	cfg, err := b.store.LoadConfig()
+	if err != nil {
+		b.sendTextMessage(ctx, chatID, "Error loading configuration: "+err.Error())
+		return
+	}
+
+	// /schedule off
+	if len(args) == 1 && strings.EqualFold(args[0], "off") {
+		cfg.Schedule.Enabled = false
+		if err := cfg.Validate(); err != nil {
+			b.sendTextMessage(ctx, chatID, "Invalid schedule configuration: "+err.Error())
+			return
+		}
+		if err := b.store.SaveConfig(cfg); err != nil {
+			b.sendTextMessage(ctx, chatID, "Failed to save configuration: "+err.Error())
+			return
+		}
+		if b.scheduler != nil {
+			b.scheduler.Wake()
+		}
+		text := fmt.Sprintf("Daily brief: disabled\nTime: %s\nTimezone: %s\nNext run: none",
+			cfg.Schedule.Time, cfg.Timezone)
+		b.sendTextMessage(ctx, chatID, text)
+		return
+	}
+
+	// /schedule HH:MM
+	if len(args) == 1 {
+		cfg.Schedule.Time = args[0]
+		cfg.Schedule.Enabled = true
+		if err := cfg.Validate(); err != nil {
+			b.sendTextMessage(ctx, chatID, fmt.Sprintf("Invalid schedule time %q: must be HH:MM format (e.g. 08:00).", args[0]))
+			return
+		}
+		if err := b.store.SaveConfig(cfg); err != nil {
+			b.sendTextMessage(ctx, chatID, "Failed to save configuration: "+err.Error())
+			return
+		}
+		if b.scheduler != nil {
+			b.scheduler.Wake()
+		}
+		nextTime, _, err := scheduler.NextRunForConfig(cfg, b.now())
+		nextRunStr := "none"
+		if err == nil {
+			nextRunStr = nextTime.Format("2006-01-02 15:04 -07")
+		}
+		text := fmt.Sprintf("Daily brief: enabled\nTime: %s\nTimezone: %s\nNext run: %s",
+			cfg.Schedule.Time, cfg.Timezone, nextRunStr)
+		b.sendTextMessage(ctx, chatID, text)
+		return
+	}
+
+	// /schedule HH:MM <timezone>
+	timeVal := args[0]
+	tzVal := strings.Join(args[1:], " ")
+	cfg.Schedule.Time = timeVal
+	cfg.Timezone = tzVal
+	cfg.Schedule.Enabled = true
+	if err := cfg.Validate(); err != nil {
+		b.sendTextMessage(ctx, chatID, fmt.Sprintf("Invalid schedule parameters: %v\nUsage: /schedule HH:MM [timezone] (e.g. /schedule 08:00 Asia/Riyadh)", err))
+		return
+	}
+	if err := b.store.SaveConfig(cfg); err != nil {
+		b.sendTextMessage(ctx, chatID, "Failed to save configuration: "+err.Error())
+		return
+	}
+	if b.scheduler != nil {
+		b.scheduler.Wake()
+	}
+	nextTime, _, err := scheduler.NextRunForConfig(cfg, b.now())
+	nextRunStr := "none"
+	if err == nil {
+		nextRunStr = nextTime.Format("2006-01-02 15:04 -07")
+	}
+	text := fmt.Sprintf("Daily brief: enabled\nTime: %s\nTimezone: %s\nNext run: %s",
+		cfg.Schedule.Time, cfg.Timezone, nextRunStr)
+	b.sendTextMessage(ctx, chatID, text)
 }

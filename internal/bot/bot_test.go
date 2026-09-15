@@ -12,6 +12,7 @@ import (
 	"github.com/go-telegram/bot/models"
 	"github.com/pyed/CordBrief/internal/dce"
 	"github.com/pyed/CordBrief/internal/job"
+	"github.com/pyed/CordBrief/internal/scheduler"
 	"github.com/pyed/CordBrief/internal/state"
 )
 
@@ -958,4 +959,337 @@ func TestFollowAndUnfollow_BlockedWhileBriefRunning(t *testing.T) {
 	}
 
 	runner.Wait()
+}
+
+func TestSchedule_View(t *testing.T) {
+	b, sender, store, _ := setupTestBot(t)
+	ctx := context.Background()
+
+	// Fixed time: 2026-09-15 06:00:00 UTC
+	loc, _ := time.LoadLocation("UTC")
+	fixedTime := time.Date(2026, 9, 15, 6, 0, 0, 0, loc)
+	b.now = func() time.Time { return fixedTime }
+
+	// 1. Enabled schedule
+	cfg, _ := store.LoadConfig()
+	cfg.Schedule.Enabled = true
+	cfg.Schedule.Time = "08:00"
+	cfg.Timezone = "UTC"
+	_ = store.SaveConfig(cfg)
+
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/schedule"))
+	msg := sender.lastSent()
+	if msg == nil {
+		t.Fatal("expected message sent for /schedule")
+	}
+	expected := "Daily brief: enabled\nTime: 08:00\nTimezone: UTC\nNext run: 2026-09-15 08:00 +00"
+	if msg.Text != expected {
+		t.Errorf("got:\n%s\nwant:\n%s", msg.Text, expected)
+	}
+
+	// 2. Disabled schedule
+	cfg.Schedule.Enabled = false
+	_ = store.SaveConfig(cfg)
+
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/schedule"))
+	msg = sender.lastSent()
+	expectedDisabled := "Daily brief: disabled\nTime: 08:00\nTimezone: UTC\nNext run: none"
+	if msg.Text != expectedDisabled {
+		t.Errorf("got:\n%s\nwant:\n%s", msg.Text, expectedDisabled)
+	}
+}
+
+func TestSchedule_Off(t *testing.T) {
+	b, sender, store, _ := setupTestBot(t)
+	ctx := context.Background()
+
+	cfg, _ := store.LoadConfig()
+	cfg.Schedule.Enabled = true
+	_ = store.SaveConfig(cfg)
+
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/schedule off"))
+	msg := sender.lastSent()
+	if msg == nil || !strings.Contains(msg.Text, "Daily brief: disabled") {
+		t.Fatalf("expected disabled response, got %v", msg)
+	}
+
+	// Verify persisted config
+	savedCfg, _ := store.LoadConfig()
+	if savedCfg.Schedule.Enabled {
+		t.Errorf("expected schedule to be disabled in config")
+	}
+}
+
+func TestSchedule_SetTime(t *testing.T) {
+	b, sender, store, _ := setupTestBot(t)
+	ctx := context.Background()
+
+	loc, _ := time.LoadLocation("UTC")
+	fixedTime := time.Date(2026, 9, 15, 6, 0, 0, 0, loc)
+	b.now = func() time.Time { return fixedTime }
+
+	cfg, _ := store.LoadConfig()
+	cfg.Schedule.Enabled = false
+	cfg.Schedule.Time = "08:00"
+	cfg.Timezone = "UTC"
+	_ = store.SaveConfig(cfg)
+
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/schedule 09:30"))
+	msg := sender.lastSent()
+	if msg == nil || !strings.Contains(msg.Text, "Daily brief: enabled") || !strings.Contains(msg.Text, "Time: 09:30") {
+		t.Fatalf("expected enabled 09:30, got %v", msg)
+	}
+
+	savedCfg, _ := store.LoadConfig()
+	if !savedCfg.Schedule.Enabled || savedCfg.Schedule.Time != "09:30" || savedCfg.Timezone != "UTC" {
+		t.Errorf("unexpected saved config: %+v", savedCfg)
+	}
+}
+
+func TestSchedule_SetTimeAndTimezone(t *testing.T) {
+	b, sender, store, _ := setupTestBot(t)
+	ctx := context.Background()
+
+	locRiyadh, _ := time.LoadLocation("Asia/Riyadh")
+	fixedTime := time.Date(2026, 9, 15, 6, 0, 0, 0, locRiyadh)
+	b.now = func() time.Time { return fixedTime }
+
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/schedule 08:00 Asia/Riyadh"))
+	msg := sender.lastSent()
+	if msg == nil || !strings.Contains(msg.Text, "Daily brief: enabled") {
+		t.Fatalf("expected enabled, got %v", msg)
+	}
+	if !strings.Contains(msg.Text, "Timezone: Asia/Riyadh") {
+		t.Errorf("expected timezone Asia/Riyadh in response, got %s", msg.Text)
+	}
+
+	savedCfg, _ := store.LoadConfig()
+	if !savedCfg.Schedule.Enabled || savedCfg.Schedule.Time != "08:00" || savedCfg.Timezone != "Asia/Riyadh" {
+		t.Errorf("unexpected saved config: %+v", savedCfg)
+	}
+}
+
+func TestSchedule_InvalidInputs(t *testing.T) {
+	b, sender, store, _ := setupTestBot(t)
+	ctx := context.Background()
+
+	cfg, _ := store.LoadConfig()
+	originalTime := cfg.Schedule.Time
+	originalTz := cfg.Timezone
+
+	// 1. Invalid time format
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/schedule 25:00"))
+	msg := sender.lastSent()
+	if msg == nil || !strings.Contains(msg.Text, "Invalid schedule time") {
+		t.Fatalf("expected invalid schedule time error, got: %v", msg)
+	}
+
+	// 2. Invalid timezone
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/schedule 08:00 NonExistent/Timezone"))
+	msg = sender.lastSent()
+	if msg == nil || !strings.Contains(msg.Text, "Invalid schedule") {
+		t.Fatalf("expected invalid schedule error, got: %v", msg)
+	}
+
+	// Verify config was not altered
+	savedCfg, _ := store.LoadConfig()
+	if savedCfg.Schedule.Time != originalTime || savedCfg.Timezone != originalTz {
+		t.Errorf("config mutated on invalid input: %+v", savedCfg)
+	}
+}
+
+func TestSchedule_BlockedWhileBriefRunning(t *testing.T) {
+	b, sender, store, _ := setupTestBot(t)
+	ctx := context.Background()
+
+	cfg, _ := store.LoadConfig()
+	cfg.Channels = []state.ChannelConfig{{ID: "10001", Name: "general"}}
+	cfg.Schedule.Enabled = true
+	_ = store.SaveConfig(cfg)
+	st := state.NewEmptyState()
+	st.Channels["10001"] = state.ChannelState{Cursor: state.Cursor{Kind: state.CursorKindTimestamp, Value: "2026-09-14T00:00:00Z"}}
+	_ = store.SaveState(st)
+
+	fakeDCE := &botFakeDCE{delay: 300 * time.Millisecond}
+	runner, _ := job.NewRunner(store,
+		job.WithDCEClient(fakeDCE),
+		job.WithDeliverer(b),
+	)
+	b.runner = runner
+
+	// Start brief
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/brief"))
+
+	// Attempt schedule mutation while brief is running
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/schedule off"))
+	msg := sender.lastSent()
+	if msg == nil || !strings.Contains(msg.Text, "A brief is currently running. Configuration changes are frozen until it finishes.") {
+		t.Errorf("expected schedule mutation blocked message, got: %v", msg)
+	}
+
+	// Verify config was not mutated
+	savedCfg, _ := store.LoadConfig()
+	if !savedCfg.Schedule.Enabled {
+		t.Errorf("schedule was disabled despite brief running")
+	}
+
+	runner.Wait()
+}
+
+func TestSchedule_LegacyM5Upgrade_SafeByDefaultAndExplicitOptIn(t *testing.T) {
+	tmpDir := t.TempDir()
+	store := state.NewStore(tmpDir)
+
+	// Write exact legacy M5 config file (version: 1, schedule.enabled: true)
+	legacyM5JSON := `{
+  "version": 1,
+  "channels": [
+    {
+      "id": "1391912303376728155",
+      "name": "general"
+    }
+  ],
+  "schedule": {
+    "enabled": true,
+    "time": "08:00"
+  },
+  "timezone": "UTC",
+  "llm": {
+    "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "model": "gemini-3.5-flash"
+  }
+}`
+	if err := os.WriteFile(store.ConfigPath(), []byte(legacyM5JSON), 0600); err != nil {
+		t.Fatalf("failed to write legacy M5 config: %v", err)
+	}
+
+	// 1. Legacy M5 config loads safely
+	cfg, err := store.LoadConfig()
+	if err != nil {
+		t.Fatalf("LoadConfig failed on legacy M5 config: %v", err)
+	}
+	if cfg.Version != state.CurrentConfigVersion {
+		t.Errorf("expected upgraded version %d, got %d", state.CurrentConfigVersion, cfg.Version)
+	}
+
+	// 2. Scheduler is inactive (NextRunForConfig returns enabled=false)
+	loc, _ := time.LoadLocation("UTC")
+	now := time.Date(2026, 9, 15, 6, 0, 0, 0, loc)
+	_, enabled, err := scheduler.NextRunForConfig(cfg, now)
+	if err != nil {
+		t.Fatalf("NextRunForConfig error: %v", err)
+	}
+	if enabled {
+		t.Fatal("CRITICAL INVARIANT VIOLATION: scheduler is active on untouched legacy M5 config!")
+	}
+
+	// Build test bot with this store
+	sender := &fakeSender{}
+	b, err := New(context.Background(),
+		&EnvConfig{BotToken: "test-token", OwnerID: 12345},
+		store,
+		WithSender(sender),
+		WithNow(func() time.Time { return now }),
+	)
+	if err != nil {
+		t.Fatalf("New bot: %v", err)
+	}
+
+	ctx := context.Background()
+
+	// 3. /schedule reports disabled
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/schedule"))
+	msg := sender.lastSent()
+	if msg == nil || !strings.Contains(msg.Text, "Daily brief: disabled") || !strings.Contains(msg.Text, "Next run: none") {
+		t.Fatalf("expected /schedule to report disabled, got: %v", msg)
+	}
+
+	// /start and /status also report disabled
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/start"))
+	msg = sender.lastSent()
+	if msg == nil || !strings.Contains(msg.Text, "Schedule: disabled") {
+		t.Errorf("expected /start to report disabled schedule, got: %v", msg)
+	}
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/status"))
+	msg = sender.lastSent()
+	if msg == nil || !strings.Contains(msg.Text, "Schedule: disabled") {
+		t.Errorf("expected /status to report disabled schedule, got: %v", msg)
+	}
+
+	// 3b. Invalid /schedule input cannot accidentally mark scheduling as explicitly enabled
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/schedule 25:00"))
+	msg = sender.lastSent()
+	if msg == nil || !strings.Contains(msg.Text, "Invalid schedule time") {
+		t.Errorf("expected invalid time error, got: %v", msg)
+	}
+	cfgCheck, _ := store.LoadConfig()
+	if cfgCheck.Schedule.Enabled {
+		t.Fatal("invalid input enabled scheduling")
+	}
+
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/schedule 08:00 Invalid/Timezone"))
+	msg = sender.lastSent()
+	if msg == nil || !strings.Contains(msg.Text, "Invalid schedule") {
+		t.Errorf("expected invalid timezone error, got: %v", msg)
+	}
+	cfgCheck, _ = store.LoadConfig()
+	if cfgCheck.Schedule.Enabled {
+		t.Fatal("invalid timezone enabled scheduling")
+	}
+
+	// 4. /schedule HH:MM <timezone> explicitly enables it
+	locRiyadh, _ := time.LoadLocation("Asia/Riyadh")
+	nowRiyadh := time.Date(2026, 9, 15, 6, 0, 0, 0, locRiyadh)
+	b.now = func() time.Time { return nowRiyadh }
+
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/schedule 08:00 Asia/Riyadh"))
+	msg = sender.lastSent()
+	if msg == nil || !strings.Contains(msg.Text, "Daily brief: enabled") || !strings.Contains(msg.Text, "2026-09-15 08:00 +03") {
+		t.Fatalf("expected enabled in Asia/Riyadh, got: %v", msg)
+	}
+
+	// 5. The resulting persisted config survives reload/restart semantics
+	restartedStore := state.NewStore(tmpDir)
+	restartedCfg, err := restartedStore.LoadConfig()
+	if err != nil {
+		t.Fatalf("reloaded store LoadConfig failed: %v", err)
+	}
+	if restartedCfg.Version != state.CurrentConfigVersion {
+		t.Errorf("expected version %d after restart, got %d", state.CurrentConfigVersion, restartedCfg.Version)
+	}
+	if !restartedCfg.Schedule.Enabled {
+		t.Fatal("explicit opt-in did not survive restart")
+	}
+	if restartedCfg.Schedule.Time != "08:00" || restartedCfg.Timezone != "Asia/Riyadh" {
+		t.Errorf("unexpected restarted config: %+v", restartedCfg)
+	}
+	if len(restartedCfg.Channels) != 1 || restartedCfg.Channels[0].ID != "1391912303376728155" {
+		t.Errorf("followed channel was lost during upgrade/restart: %+v", restartedCfg.Channels)
+	}
+
+	// 6. Scheduler then computes/fires normally from that explicitly enabled state
+	nextRun, enabledAfter, err := scheduler.NextRunForConfig(restartedCfg, nowRiyadh)
+	if err != nil {
+		t.Fatalf("NextRunForConfig failed after restart: %v", err)
+	}
+	if !enabledAfter {
+		t.Fatal("scheduler reported disabled after restart")
+	}
+	expectedNext := time.Date(2026, 9, 15, 8, 0, 0, 0, locRiyadh)
+	if !nextRun.Equal(expectedNext) {
+		t.Errorf("expected next run %v, got %v", expectedNext, nextRun)
+	}
+
+	// 7. /schedule off disables it durably
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/schedule off"))
+	msg = sender.lastSent()
+	if msg == nil || !strings.Contains(msg.Text, "Daily brief: disabled") || !strings.Contains(msg.Text, "Next run: none") {
+		t.Fatalf("expected /schedule off to report disabled, got: %v", msg)
+	}
+
+	offStore := state.NewStore(tmpDir)
+	offCfg, _ := offStore.LoadConfig()
+	if offCfg.Schedule.Enabled {
+		t.Fatal("schedule off did not persist to disk")
+	}
 }

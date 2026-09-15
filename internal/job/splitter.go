@@ -10,28 +10,36 @@ import (
 // DefaultMaxTelegramRunes also bounds UTF-16 units, keeping non-BMP emoji safely within the limit.
 const DefaultMaxTelegramRunes = 3900
 
-// FormatNoMessages returns the standard notice when a channel has zero new messages.
-func FormatNoMessages(channelName string) string {
-	name := strings.TrimSpace(channelName)
-	if name == "" {
-		name = "unknown-channel"
+// FormatHeading returns the standard Telegram brief heading for a server and channel.
+// If serverName is non-empty, it formats as "<serverName> · #<channelName>".
+// If serverName is empty, it formats as "#<channelName>".
+func FormatHeading(serverName, channelName string) string {
+	s := strings.TrimSpace(serverName)
+	c := strings.TrimSpace(channelName)
+	if c == "" {
+		c = "unknown-channel"
 	}
-	return fmt.Sprintf("#%s\nNo new messages.", name)
+	if s != "" {
+		return fmt.Sprintf("%s · #%s", s, c)
+	}
+	return fmt.Sprintf("#%s", c)
+}
+
+// FormatNoMessages returns the standard notice when a channel has zero new messages.
+func FormatNoMessages(serverName, channelName string) string {
+	return fmt.Sprintf("%s\nNo new messages.", FormatHeading(serverName, channelName))
 }
 
 // SplitBrief formats a channel brief into one or more Telegram messages strictly bounded by maxRunes.
 // It never truncates text, never splits UTF-8 runes incorrectly, and prefers paragraph/line boundaries.
-func SplitBrief(channelName string, messageCount int, body string, maxRunes int) []string {
+func SplitBrief(serverName, channelName string, messageCount int, body string, maxRunes int) []string {
 	if maxRunes < 2 {
 		maxRunes = DefaultMaxTelegramRunes
 	}
 
-	name := strings.TrimSpace(channelName)
-	if name == "" {
-		name = "unknown-channel"
-	}
+	heading := FormatHeading(serverName, channelName)
 	if strings.TrimSpace(body) == "" {
-		return sliceText(FormatNoMessages(name), maxRunes, maxRunes)
+		return sliceText(FormatNoMessages(serverName, channelName), maxRunes, maxRunes)
 	}
 
 	countLabel := fmt.Sprintf("%d message", messageCount)
@@ -40,7 +48,7 @@ func SplitBrief(channelName string, messageCount int, body string, maxRunes int)
 	}
 
 	// 1. Single part check
-	singleHeader := fmt.Sprintf("#%s\n%s\n\n", name, countLabel)
+	singleHeader := fmt.Sprintf("%s\n%s\n\n", heading, countLabel)
 	singleMsg := singleHeader + body
 	if telegramUnits(singleMsg) <= maxRunes {
 		return []string{singleMsg}
@@ -49,8 +57,8 @@ func SplitBrief(channelName string, messageCount int, body string, maxRunes int)
 	// 2. Multi-part splitting
 	// A part contains at least one rune, so len(body) bounds the part-number width.
 	upperBound := len(body)
-	estPart1HeaderLen := telegramUnits(fmt.Sprintf("#%s · %d/%d\n%s\n\n", name, upperBound, upperBound, countLabel))
-	estSubHeaderLen := telegramUnits(fmt.Sprintf("#%s · %d/%d\n\n", name, upperBound, upperBound))
+	estPart1HeaderLen := telegramUnits(fmt.Sprintf("%s · %d/%d\n%s\n\n", heading, upperBound, upperBound, countLabel))
+	estSubHeaderLen := telegramUnits(fmt.Sprintf("%s · %d/%d\n\n", heading, upperBound, upperBound))
 	if maxRunes-estPart1HeaderLen < 2 {
 		return sliceText(singleMsg, maxRunes, maxRunes)
 	}
@@ -67,9 +75,9 @@ func SplitBrief(channelName string, messageCount int, body string, maxRunes int)
 	for i, chunk := range rawChunks {
 		var header string
 		if i == 0 {
-			header = fmt.Sprintf("#%s · %d/%d\n%s\n\n", name, i+1, totalParts, countLabel)
+			header = fmt.Sprintf("%s · %d/%d\n%s\n\n", heading, i+1, totalParts, countLabel)
 		} else {
-			header = fmt.Sprintf("#%s · %d/%d\n\n", name, i+1, totalParts)
+			header = fmt.Sprintf("%s · %d/%d\n\n", heading, i+1, totalParts)
 		}
 		result[i] = header + chunk
 	}

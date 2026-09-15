@@ -38,6 +38,7 @@ func (s *Store) StatePath() string {
 
 // LoadConfig reads config.json. If the file does not exist, DefaultConfig is returned.
 // Corrupted or invalid files return an error fail-closed.
+// Legacy v1 configs are safely migrated to v2 with scheduling disabled by default.
 func (s *Store) LoadConfig() (*Config, error) {
 	data, err := os.ReadFile(s.ConfigPath())
 	if err != nil {
@@ -50,6 +51,16 @@ func (s *Store) LoadConfig() (*Config, error) {
 	var cfg Config
 	if err := decodeStrictJSON(data, &cfg); err != nil {
 		return nil, fmt.Errorf("decode config: %w", err)
+	}
+
+	// Upgrade migration from legacy v1 (M1-M5):
+	// In v1, schedule.enabled defaulted to true as an inert placeholder before any scheduler existed.
+	// In v2 (M6), automatic scheduling requires explicit operator configuration.
+	if cfg.Version == 1 {
+		cfg.Version = CurrentConfigVersion
+		cfg.Schedule.Enabled = false
+		// Persist the migrated config best-effort so disk is updated to v2
+		_ = s.SaveConfig(&cfg)
 	}
 
 	if err := cfg.Validate(); err != nil {

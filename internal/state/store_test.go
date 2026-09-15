@@ -62,7 +62,7 @@ func TestSaveAndLoadConfig_RoundTrip(t *testing.T) {
 	store := NewStore(dir)
 
 	orig := &Config{
-		Version: 1,
+		Version: CurrentConfigVersion,
 		Channels: []ChannelConfig{
 			{ID: "178281233233608705", Name: "general"},
 			{ID: "987654321098765432", Name: "announcements"},
@@ -303,12 +303,131 @@ func TestValidateConfig_MalformedTimezoneRejected(t *testing.T) {
 
 // 10. Unsupported config schema rejected
 func TestValidateConfig_UnsupportedVersionRejected(t *testing.T) {
-	for _, v := range []int{0, 2, -1, 99} {
+	for _, v := range []int{0, 1, -1, 3, 99} {
 		cfg := DefaultConfig()
 		cfg.Version = v
 		if err := cfg.Validate(); err == nil {
 			t.Errorf("expected error for config version %d, got nil", v)
 		}
+	}
+}
+
+// 10b. Legacy M5 config (version 1 with dormant enabled=true) migrates to version 2 with enabled=false
+func TestLoadConfig_LegacyM5Migration(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+
+	legacyJSON := `{
+  "version": 1,
+  "channels": [
+    {
+      "id": "1391912303376728155",
+      "name": "general"
+    }
+  ],
+  "schedule": {
+    "enabled": true,
+    "time": "08:00"
+  },
+  "timezone": "UTC",
+  "llm": {
+    "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+    "model": "gemini-3.5-flash"
+  }
+}`
+	if err := os.WriteFile(store.ConfigPath(), []byte(legacyJSON), 0600); err != nil {
+		t.Fatalf("failed to write legacy config: %v", err)
+	}
+
+	// 1. Legacy M5 config loads safely
+	cfg, err := store.LoadConfig()
+	if err != nil {
+		t.Fatalf("expected legacy M5 config to load safely, got: %v", err)
+	}
+
+	// 2. Version is upgraded to 2
+	if cfg.Version != CurrentConfigVersion {
+		t.Errorf("expected version %d, got %d", CurrentConfigVersion, cfg.Version)
+	}
+
+	// 3. Dormant legacy schedule.enabled=true is migrated to false (safe by default)
+	if cfg.Schedule.Enabled {
+		t.Errorf("CRITICAL: legacy M5 enabled=true was not migrated to false!")
+	}
+
+	// 4. Other fields are strictly preserved
+	if cfg.Schedule.Time != "08:00" {
+		t.Errorf("expected time 08:00 preserved, got: %s", cfg.Schedule.Time)
+	}
+	if cfg.Timezone != "UTC" {
+		t.Errorf("expected timezone UTC preserved, got: %s", cfg.Timezone)
+	}
+	if len(cfg.Channels) != 1 || cfg.Channels[0].ID != "1391912303376728155" || cfg.Channels[0].Name != "general" {
+		t.Errorf("channels not preserved: %+v", cfg.Channels)
+	}
+	if cfg.LLM.Model != "gemini-3.5-flash" {
+		t.Errorf("llm model not preserved: %s", cfg.LLM.Model)
+	}
+
+	// 5. Config on disk is upgraded to version 2 with enabled=false
+	diskBytes, err := os.ReadFile(store.ConfigPath())
+	if err != nil {
+		t.Fatalf("failed to read migrated config from disk: %v", err)
+	}
+	reloaded, err := store.LoadConfig()
+	if err != nil {
+		t.Fatalf("failed to reload migrated config: %v", err)
+	}
+	if reloaded.Version != CurrentConfigVersion || reloaded.Schedule.Enabled != false {
+		t.Errorf("reloaded config mismatch: version=%d enabled=%v (raw JSON: %s)",
+			reloaded.Version, reloaded.Schedule.Enabled, string(diskBytes))
+	}
+}
+
+// 10c. SaveConfig strictly rejects unsupported versions and preserves existing disk file byte-for-byte
+func TestSaveConfig_StrictVersionValidation(t *testing.T) {
+	dir := t.TempDir()
+	store := NewStore(dir)
+
+	// Establish a valid v2 config on disk
+	validCfg := DefaultConfig()
+	validCfg.Timezone = "Asia/Riyadh"
+	if err := store.SaveConfig(validCfg); err != nil {
+		t.Fatalf("initial SaveConfig failed: %v", err)
+	}
+	expectedDiskBytes, err := os.ReadFile(store.ConfigPath())
+	if err != nil {
+		t.Fatalf("failed to read initial config: %v", err)
+	}
+
+	// 1. SaveConfig rejects Version: 1
+	v1Cfg := DefaultConfig()
+	v1Cfg.Version = 1
+	if err := store.SaveConfig(v1Cfg); err == nil {
+		t.Fatal("expected error saving Version: 1, got nil")
+	}
+	// Caller's struct must NOT be mutated by failed save
+	if v1Cfg.Version != 1 {
+		t.Errorf("caller struct version was mutated: got %d, want 1", v1Cfg.Version)
+	}
+
+	// 2. SaveConfig rejects unknown Version: 999
+	v999Cfg := DefaultConfig()
+	v999Cfg.Version = 999
+	if err := store.SaveConfig(v999Cfg); err == nil {
+		t.Fatal("expected error saving Version: 999, got nil")
+	}
+	if v999Cfg.Version != 999 {
+		t.Errorf("caller struct version was mutated: got %d, want 999", v999Cfg.Version)
+	}
+
+	// 3. Existing valid durable config remains byte-for-byte identical on disk
+	currentDiskBytes, err := os.ReadFile(store.ConfigPath())
+	if err != nil {
+		t.Fatalf("failed to read config after rejected saves: %v", err)
+	}
+	if !bytes.Equal(expectedDiskBytes, currentDiskBytes) {
+		t.Fatal("durable config on disk was modified by rejected SaveConfig!")
 	}
 }
 

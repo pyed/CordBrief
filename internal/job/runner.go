@@ -249,9 +249,15 @@ func (r *Runner) processChannel(ctx context.Context, ch state.ChannelConfig, cut
 		return
 	}
 
+	serverName := strings.TrimSpace(dceRes.Guild.Name)
+	chName := ch.Name
+	if dceRes.Channel.ID == ch.ID && strings.TrimSpace(dceRes.Channel.Name) != "" {
+		chName = strings.TrimSpace(dceRes.Channel.Name)
+	}
+
 	// C. Zero-message export is success: no LLM call, no cursor change
 	if len(dceRes.Messages) == 0 {
-		_ = r.deliverer.Deliver(ctx, FormatNoMessages(ch.Name))
+		_ = r.deliverer.Deliver(ctx, FormatNoMessages(serverName, chName))
 		return
 	}
 
@@ -283,20 +289,20 @@ func (r *Runner) processChannel(ctx context.Context, ch state.ChannelConfig, cut
 	}
 
 	// E. Synthesize brief with bounded LLM retry
-	briefText, err := engine.Summarize(ctx, brief.Channel{ID: ch.ID, Name: ch.Name}, briefMessages)
+	briefText, err := engine.Summarize(ctx, brief.Channel{ID: ch.ID, Name: chName}, briefMessages)
 	if err != nil {
-		log.Printf("[job] summarization failed for #%s (%s): %v", ch.Name, ch.ID, err)
+		log.Printf("[job] summarization failed for #%s (%s): %v", chName, ch.ID, err)
 		chState.LastError = r.sanitize(err.Error())
 		st.Channels[ch.ID] = chState
 		_ = r.store.SaveState(st)
 
-		notice := fmt.Sprintf("#%s\nBrief failed during summarization.\nNothing was consumed; it will be retried next time.", ch.Name)
+		notice := fmt.Sprintf("%s\nBrief failed during summarization.\nNothing was consumed; it will be retried next time.", FormatHeading(serverName, chName))
 		_ = r.deliverer.Deliver(ctx, notice)
 		return
 	}
 
 	// F. Split into Telegram plain-text parts
-	parts := SplitBrief(ch.Name, len(dceRes.Messages), briefText, DefaultMaxTelegramRunes)
+	parts := SplitBrief(serverName, chName, len(dceRes.Messages), briefText, DefaultMaxTelegramRunes)
 
 	// G. Deliver ALL parts to Telegram
 	deliveryFailed := false

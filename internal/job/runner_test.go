@@ -778,3 +778,93 @@ func TestRunner_SanitizesAPIKeyInErrors(t *testing.T) {
 		}
 	}
 }
+
+func TestRunner_ServerHeadingFormatting(t *testing.T) {
+	store, _ := setupTestStore(t)
+	cfg := state.DefaultConfig()
+	cfg.Channels = []state.ChannelConfig{
+		{ID: "1001", Name: "configured-name"},
+		{ID: "1002", Name: "no-guild-channel"},
+		{ID: "1003", Name: "empty-zero-msgs"},
+	}
+	_ = store.SaveConfig(cfg)
+
+	st := state.NewEmptyState()
+	for _, ch := range cfg.Channels {
+		st.Channels[ch.ID] = state.ChannelState{Cursor: state.Cursor{Kind: state.CursorKindTimestamp, Value: "2026-09-14T08:00:00Z"}}
+	}
+	_ = store.SaveState(st)
+
+	fakeDCE := &FakeDCE{
+		configured: true,
+		exportFunc: func(ctx context.Context, req dce.ExportRequest) (*dce.ExportResult, error) {
+			switch req.ChannelID {
+			case "1001":
+				return &dce.ExportResult{
+					Guild:   dce.GuildInfo{Name: "LocalLLM"},
+					Channel: dce.ChannelInfo{ID: "1001", Name: "dce-actual-name"},
+					Messages: []dce.Message{
+						{ID: "9001", Content: "Hello world", Author: dce.Author{Name: "Alice"}},
+					},
+					MaxMessageID: "9001",
+				}, nil
+			case "1002":
+				return &dce.ExportResult{
+					Guild:   dce.GuildInfo{Name: ""}, // empty server name
+					Channel: dce.ChannelInfo{ID: "1002", Name: "no-guild-channel"},
+					Messages: []dce.Message{
+						{ID: "9002", Content: "Fallback server name", Author: dce.Author{Name: "Bob"}},
+					},
+					MaxMessageID: "9002",
+				}, nil
+			case "1003":
+				return &dce.ExportResult{
+					Guild:    dce.GuildInfo{Name: "LocalLLM"},
+					Channel:  dce.ChannelInfo{ID: "1003", Name: "empty-zero-msgs"},
+					Messages: []dce.Message{},
+				}, nil
+			}
+			return &dce.ExportResult{}, nil
+		},
+	}
+
+	fakeDel := &FakeDeliverer{}
+	fakeComp := &FakeCompleter{
+		completeFunc: func(ctx context.Context, messages []llm.Message) (string, error) {
+			return "• Summary content.", nil
+		},
+	}
+
+	runner, _ := NewRunner(store,
+		WithDCEClient(fakeDCE),
+		WithDeliverer(fakeDel),
+		WithCompleterFactory(func(b, m, k string) (brief.Completer, error) { return fakeComp, nil }),
+	)
+
+	if err := runner.Run(context.Background(), ""); err != nil {
+		t.Fatalf("expected run to succeed, got %v", err)
+	}
+
+	msgs := fakeDel.GetMessages()
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 delivered messages, got %d: %v", len(msgs), msgs)
+	}
+
+	// 1001: Server + preferred DCE channel name
+	expected1 := "LocalLLM · #dce-actual-name\n1 message\n\n• Summary content."
+	if msgs[0] != expected1 {
+		t.Errorf("channel 1001:\ngot:  %q\nwant: %q", msgs[0], expected1)
+	}
+
+	// 1002: Empty server name fallback
+	expected2 := "#no-guild-channel\n1 message\n\n• Summary content."
+	if msgs[1] != expected2 {
+		t.Errorf("channel 1002:\ngot:  %q\nwant: %q", msgs[1], expected2)
+	}
+
+	// 1003: Zero messages with server name
+	expected3 := "LocalLLM · #empty-zero-msgs\nNo new messages."
+	if msgs[2] != expected3 {
+		t.Errorf("channel 1003:\ngot:  %q\nwant: %q", msgs[2], expected3)
+	}
+}
