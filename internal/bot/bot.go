@@ -41,6 +41,7 @@ type Bot struct {
 	rawBot            *bot.Bot
 	store             *state.Store
 	dceClient         *dce.Client
+	dceManager        *dce.Manager
 	runner            *job.Runner
 	scheduler         *scheduler.Scheduler
 	ownerID           int64
@@ -75,6 +76,13 @@ func WithNow(now func() time.Time) Option {
 func WithDCEClient(client *dce.Client) Option {
 	return func(b *Bot) {
 		b.dceClient = client
+	}
+}
+
+// WithDCEManager sets a custom DCE manager (used for testing).
+func WithDCEManager(mgr *dce.Manager) Option {
+	return func(b *Bot) {
+		b.dceManager = mgr
 	}
 }
 
@@ -128,8 +136,11 @@ func New(appCtx context.Context, cfg *EnvConfig, store *state.Store, opts ...Opt
 		modelCache:     NewModelCache(),
 	}
 
-	// If DCE path and token are provided, initialize client fail-open (does not prevent bot startup)
+	// If DCE path and token are provided, initialize manager and client fail-open (does not prevent bot startup)
 	if cfg.DCEPath != "" && cfg.DiscordToken != "" {
+		if dceMgr, err := dce.NewManager(cfg.DataDir, cfg.DCEPath, cfg.DiscordToken); err == nil {
+			b.dceManager = dceMgr
+		}
 		if dceClient, err := dce.NewClient(cfg.DCEPath, cfg.DiscordToken); err == nil {
 			b.dceClient = dceClient
 		}
@@ -158,8 +169,14 @@ func New(appCtx context.Context, cfg *EnvConfig, store *state.Store, opts ...Opt
 
 	// Initialize runner if not set via WithRunner
 	if b.runner == nil {
+		var exporter job.DCEExporter
+		if b.dceManager != nil {
+			exporter = b.dceManager
+		} else if b.dceClient != nil {
+			exporter = b.dceClient
+		}
 		r, err := job.NewRunner(store,
-			job.WithDCEClient(b.dceClient),
+			job.WithDCEClient(exporter),
 			job.WithDeliverer(b),
 			job.WithLLMAPIKey(cfg.LLMAPIKey),
 		)
@@ -181,8 +198,11 @@ func New(appCtx context.Context, cfg *EnvConfig, store *state.Store, opts ...Opt
 	return b, nil
 }
 
-// Start launches Telegram long polling and the background scheduler until the application context is canceled.
+// Start launches Telegram long polling, background updater, and the background scheduler until the application context is canceled.
 func (b *Bot) Start() {
+	if b.dceManager != nil {
+		b.dceManager.Start(b.appCtx)
+	}
 	if b.scheduler != nil {
 		go b.scheduler.Run(b.appCtx)
 	}
@@ -214,6 +234,11 @@ func (b *Bot) Runner() *job.Runner {
 // Scheduler returns the active brief scheduler.
 func (b *Bot) Scheduler() *scheduler.Scheduler {
 	return b.scheduler
+}
+
+// DCEManager returns the active DCE manager.
+func (b *Bot) DCEManager() *dce.Manager {
+	return b.dceManager
 }
 
 func (b *Bot) sendTextMessage(ctx context.Context, chatID int64, text string) {

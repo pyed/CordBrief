@@ -134,7 +134,9 @@ func (b *Bot) handleStatus(ctx context.Context, chatID int64) {
 	}
 
 	dceStatus := "not configured"
-	if b.dceClient != nil && b.dceClient.IsConfigured() {
+	if b.dceManager != nil {
+		dceStatus = b.dceManager.Status()
+	} else if b.dceClient != nil && b.dceClient.IsConfigured() {
 		dceStatus = "configured"
 	}
 
