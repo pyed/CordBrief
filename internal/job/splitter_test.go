@@ -238,3 +238,44 @@ func TestSplitBrief_UnbrokenLongWord(t *testing.T) {
 		}
 	}
 }
+
+func TestSplitText(t *testing.T) {
+	t.Run("single short text fits in one part", func(t *testing.T) {
+		text := "A simple prompt within standard Telegram limit."
+		parts := SplitText(text, 3900)
+		if len(parts) != 1 || parts[0] != text {
+			t.Fatalf("expected 1 part identical to input, got %+v", parts)
+		}
+	})
+
+	t.Run("preserves all runes and breaks on paragraphs", func(t *testing.T) {
+		p1 := strings.Repeat("Paragraph 1 content. ", 30)
+		p2 := strings.Repeat("Paragraph 2 content. ", 30)
+		full := p1 + "\n\n" + p2
+
+		parts := SplitText(full, 300)
+		if len(parts) < 2 {
+			t.Fatalf("expected >= 2 parts, got %d", len(parts))
+		}
+
+		reconstructed := strings.Join(parts, "")
+		if reconstructed != full {
+			t.Fatalf("reconstructed text does not match original full text")
+		}
+
+		for i, part := range parts {
+			runes := len([]rune(part))
+			if runes > 300 {
+				t.Fatalf("part %d exceeded limit (%d > 300)", i+1, runes)
+			}
+		}
+	})
+
+	t.Run("default max runes used when limit is small or 0", func(t *testing.T) {
+		text := "Testing default rune budget"
+		parts := SplitText(text, 0)
+		if len(parts) != 1 || parts[0] != text {
+			t.Fatalf("expected 1 part with default budget, got %+v", parts)
+		}
+	})
+}

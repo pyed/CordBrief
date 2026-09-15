@@ -36,21 +36,22 @@ type ModelLister interface {
 
 // Bot is the Telegram control plane for CordBrief.
 type Bot struct {
-	appCtx         context.Context
-	client         Sender
-	rawBot         *bot.Bot
-	store          *state.Store
-	dceClient      *dce.Client
-	runner         *job.Runner
-	scheduler      *scheduler.Scheduler
-	ownerID        int64
-	now            func() time.Time
-	mu             sync.Mutex
-	pendingFollows map[string]PendingFollow
-	nextFollowID   int64
-	llmAPIKey      string
-	modelCache     *ModelCache
-	modelLister    ModelLister
+	appCtx            context.Context
+	client            Sender
+	rawBot            *bot.Bot
+	store             *state.Store
+	dceClient         *dce.Client
+	runner            *job.Runner
+	scheduler         *scheduler.Scheduler
+	ownerID           int64
+	now               func() time.Time
+	mu                sync.Mutex
+	pendingFollows    map[string]PendingFollow
+	nextFollowID      int64
+	llmAPIKey         string
+	modelCache        *ModelCache
+	modelLister       ModelLister
+	pendingPromptEdit bool
 }
 
 // Option configures Bot instances.

@@ -40,6 +40,22 @@ func (b *Bot) handleMessage(ctx context.Context, msg *models.Message) {
 		return
 	}
 
+	b.mu.Lock()
+	isPendingPrompt := b.pendingPromptEdit
+	b.mu.Unlock()
+
+	if isPendingPrompt {
+		if strings.EqualFold(strings.TrimSpace(msg.Text), "/cancel") {
+			b.mu.Lock()
+			b.pendingPromptEdit = false
+			b.mu.Unlock()
+			b.sendTextMessage(ctx, msg.Chat.ID, "Prompt edit cancelled.")
+			return
+		}
+		b.submitPromptEdit(ctx, msg.Chat.ID, msg.Text)
+		return
+	}
+
 	text := strings.TrimSpace(msg.Text)
 	if text == "" {
 		return
@@ -68,6 +84,10 @@ func (b *Bot) handleMessage(ctx context.Context, msg *models.Message) {
 		b.handleSchedule(ctx, msg.Chat.ID, parts[1:])
 	case "/model":
 		b.handleModel(ctx, msg.Chat.ID, parts[1:])
+	case "/prompt":
+		b.handlePrompt(ctx, msg.Chat.ID, parts[1:])
+	case "/cancel":
+		b.sendTextMessage(ctx, msg.Chat.ID, "Nothing to cancel.")
 	}
 }
 
@@ -123,8 +143,13 @@ func (b *Bot) handleStatus(ctx context.Context, chatID int64) {
 		jobStatus = "running"
 	}
 
-	text := fmt.Sprintf("CordBrief status\n\nChannels: %d\nSchedule: %s · %s · %s\nLLM: %s\nDiscord exporter: %s\nBrief job: %s",
-		len(cfg.Channels), schedEnabled, cfg.Schedule.Time, cfg.Timezone, cfg.LLM.Model, dceStatus, jobStatus)
+	promptStatus := "default"
+	if cfg.Brief != nil && strings.TrimSpace(cfg.Brief.Prompt) != "" {
+		promptStatus = "custom"
+	}
+
+	text := fmt.Sprintf("CordBrief status\n\nChannels: %d\nSchedule: %s · %s · %s\nLLM: %s\nBrief prompt: %s\nDiscord exporter: %s\nBrief job: %s",
+		len(cfg.Channels), schedEnabled, cfg.Schedule.Time, cfg.Timezone, cfg.LLM.Model, promptStatus, dceStatus, jobStatus)
 
 	markup := &models.InlineKeyboardMarkup{
 		InlineKeyboard: [][]models.InlineKeyboardButton{
@@ -327,6 +352,8 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, q *models.CallbackQuery) 
 		b.handleUnfollowCallback(ctx, chatID, messageID, data)
 	case strings.HasPrefix(data, "m:"):
 		b.handleModelCallback(ctx, chatID, messageID, data)
+	case strings.HasPrefix(data, "pr:"):
+		b.handlePromptCallback(ctx, chatID, messageID, data)
 	case data == "noop":
 		// No-op (e.g. page indicator)
 	}

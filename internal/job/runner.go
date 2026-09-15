@@ -193,7 +193,7 @@ func (r *Runner) run(ctx context.Context, targetChannelID string) error {
 		return err
 	}
 	retryComp := NewRetryCompleter(baseCompleter)
-	engine := brief.NewEngine(retryComp)
+	engine := brief.NewEngine(retryComp, brief.WithPrompt(cfg.EffectiveBriefPrompt()))
 
 	// 5. Capture fixed cutoff ONCE for the entire run
 	cutoff := r.now().UTC()

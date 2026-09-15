@@ -9,10 +9,12 @@ import (
 
 // Default non-secret configuration values.
 const (
-	DefaultLLMBaseURL = "https://generativelanguage.googleapis.com/v1beta/openai/"
-	DefaultLLMModel   = "gemini-3.8-flash"
-	DefaultTimezone   = "UTC"
-	DefaultSchedule   = "08:00"
+	DefaultLLMBaseURL   = "https://generativelanguage.googleapis.com/v1beta/openai/"
+	DefaultLLMModel     = "gemini-3.8-flash"
+	DefaultTimezone     = "UTC"
+	DefaultSchedule     = "08:00"
+	DefaultBriefPrompt  = "Create a short, high-signal digest of this Discord discussion. Include only what would matter to someone catching up: important developments, decisions, conclusions, solutions, technical findings, useful recommendations, notable releases or announcements, unresolved problems, and meaningful disagreements. Group related messages into topics instead of summarizing message-by-message, and order the brief by importance. Preserve concrete details when they matter—names, versions, numbers, benchmarks, links, errors, constraints, and attribution when it changes the meaning. Omit greetings, jokes, reactions, repetition, and low-value chatter. Compress aggressively, but never omit a detail that changes the meaning, outcome, risk, or next action. If little happened, keep the brief very short rather than padding it."
+	MaxBriefPromptBytes = 8192
 )
 
 // ChannelConfig represents a Discord channel followed by CordBrief.
@@ -34,6 +36,12 @@ type LLMConfig struct {
 	Model   string `json:"model"`
 }
 
+// BriefConfig stores user-customizable brief instructions.
+// An empty Prompt or nil pointer indicates the built-in DefaultBriefPrompt should be used.
+type BriefConfig struct {
+	Prompt string `json:"prompt,omitempty"`
+}
+
 // Config represents user intent stored in config.json.
 type Config struct {
 	Version  int             `json:"version"`
@@ -41,11 +49,12 @@ type Config struct {
 	Schedule ScheduleConfig  `json:"schedule"`
 	Timezone string          `json:"timezone"`
 	LLM      LLMConfig       `json:"llm"`
+	Brief    *BriefConfig    `json:"brief,omitempty"`
 }
 
 // CurrentConfigVersion defines the active config.json schema version.
-// Version 2 introduces the automatic daily scheduler with explicit operator opt-in.
-const CurrentConfigVersion = 2
+// Version 3 introduces operator-customizable brief prompt.
+const CurrentConfigVersion = 3
 
 // DefaultConfig returns the standard initial configuration.
 // Timezone defaults to UTC for portability. LLM defaults to the Gemini OpenAI-compatible endpoint.
@@ -107,5 +116,35 @@ func (c *Config) Validate() error {
 		seen[ch.ID] = struct{}{}
 	}
 
+	if c.Brief != nil {
+		if len(c.Brief.Prompt) > MaxBriefPromptBytes {
+			return fmt.Errorf("brief prompt exceeds maximum allowed size (%d characters)", MaxBriefPromptBytes)
+		}
+		if c.Brief.Prompt != "" && strings.TrimSpace(c.Brief.Prompt) == "" {
+			return errors.New("brief prompt cannot be whitespace-only")
+		}
+		for i, r := range c.Brief.Prompt {
+			if r < 0x20 && r != '\n' && r != '\r' && r != '\t' {
+				return fmt.Errorf("brief prompt contains invalid control character at byte %d", i)
+			}
+			if r == 0x7f {
+				return fmt.Errorf("brief prompt contains invalid delete character at byte %d", i)
+			}
+		}
+	}
+
 	return nil
+}
+
+// EffectiveBriefPrompt returns the custom brief prompt if non-empty, otherwise DefaultBriefPrompt.
+func (c *Config) EffectiveBriefPrompt() string {
+	if c == nil || c.Brief == nil || strings.TrimSpace(c.Brief.Prompt) == "" {
+		return DefaultBriefPrompt
+	}
+	return c.Brief.Prompt
+}
+
+// EffectiveBriefPrompt returns the effective brief prompt for the provided configuration.
+func EffectiveBriefPrompt(cfg *Config) string {
+	return cfg.EffectiveBriefPrompt()
 }

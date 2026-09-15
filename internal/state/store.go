@@ -57,9 +57,18 @@ func (s *Store) LoadConfig() (*Config, error) {
 	// In v1, schedule.enabled defaulted to true as an inert placeholder before any scheduler existed.
 	// In v2 (M6), automatic scheduling requires explicit operator configuration.
 	if cfg.Version == 1 {
-		cfg.Version = CurrentConfigVersion
 		cfg.Schedule.Enabled = false
-		// Persist the migrated config best-effort so disk is updated to v2
+		cfg.Version = 2
+	}
+
+	// Upgrade migration from v2 (M6-M8) to v3 (M9):
+	// Version 3 introduces operator-customizable brief prompt.
+	// Pre-existing v2 configs migrate to v3 with no custom override (Brief = nil),
+	// preserving channels, schedule, timezone, and LLM configuration untouched.
+	if cfg.Version == 2 {
+		cfg.Version = CurrentConfigVersion
+		cfg.Brief = nil
+		// Persist the migrated config best-effort so disk is updated to v3
 		_ = s.SaveConfig(&cfg)
 	}
 
@@ -79,6 +88,9 @@ func (s *Store) LoadConfig() (*Config, error) {
 func (s *Store) SaveConfig(cfg *Config) error {
 	if cfg == nil {
 		return errors.New("cannot save nil config")
+	}
+	if cfg.Brief != nil && cfg.Brief.Prompt == "" {
+		cfg.Brief = nil
 	}
 	if err := cfg.Validate(); err != nil {
 		return fmt.Errorf("validate config: %w", err)

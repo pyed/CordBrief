@@ -85,6 +85,15 @@ func SplitBrief(serverName, channelName string, messageCount int, body string, m
 	return result
 }
 
+// SplitText breaks text into contiguous parts strictly respecting maxRunes UTF-16 units.
+// It never loses characters, preserves exact content and order, and breaks on natural paragraph/line boundaries.
+func SplitText(text string, maxRunes int) []string {
+	if maxRunes < 2 {
+		maxRunes = DefaultMaxTelegramRunes
+	}
+	return sliceText(text, maxRunes, maxRunes)
+}
+
 // sliceText breaks text into contiguous chunks respecting the given rune budgets.
 func sliceText(text string, firstBudget, subBudget int) []string {
 	var chunks []string

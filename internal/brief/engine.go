@@ -17,18 +17,34 @@ const DefaultChunkBudget = 80000
 // MaxReductionPasses is the safety bound for hierarchical compression passes, preventing infinite reduction loops.
 const MaxReductionPasses = 5
 
+// Option configures Engine instances.
+type Option func(*Engine)
+
+// WithPrompt configures the operator briefing prompt instructions.
+func WithPrompt(prompt string) Option {
+	return func(e *Engine) {
+		e.prompt = prompt
+	}
+}
+
 // Engine turns channel messages into a concise executive brief.
 type Engine struct {
 	completer   Completer
 	ChunkBudget int
+	prompt      string
 }
 
 // NewEngine creates a briefing Engine backed by the given Completer.
-func NewEngine(completer Completer) *Engine {
-	return &Engine{
+func NewEngine(completer Completer, opts ...Option) *Engine {
+	e := &Engine{
 		completer:   completer,
 		ChunkBudget: DefaultChunkBudget,
+		prompt:      DefaultCustomizablePrompt,
 	}
+	for _, opt := range opts {
+		opt(e)
+	}
+	return e
 }
 
 // Summarize transforms a channel's messages into an executive brief.
@@ -54,7 +70,7 @@ func (e *Engine) Summarize(ctx context.Context, ch Channel, messages []Message) 
 		transcript := chunks[0]
 		userPrompt := BuildUserPrompt(ch, transcript)
 		req := []llm.Message{
-			{Role: "system", Content: SystemPromptBrief},
+			{Role: "system", Content: BuildBriefSystemPrompt(e.prompt)},
 			{Role: "user", Content: userPrompt},
 		}
 		return e.completer.Complete(ctx, req)
@@ -63,6 +79,7 @@ func (e *Engine) Summarize(ctx context.Context, ch Channel, messages []Message) 
 	// 3. Multi-chunk hierarchical path
 	// Stage 1: Summarize each chunk into chronological factual notes
 	notes := make([]string, len(chunks))
+	chunkSysPrompt := BuildChunkNotesSystemPrompt(e.prompt)
 	for i, chunk := range chunks {
 		select {
 		case <-ctx.Done():
@@ -72,7 +89,7 @@ func (e *Engine) Summarize(ctx context.Context, ch Channel, messages []Message) 
 
 		userPrompt := BuildChunkUserPrompt(ch, i, len(chunks), chunk)
 		req := []llm.Message{
-			{Role: "system", Content: SystemPromptChunkNotes},
+			{Role: "system", Content: chunkSysPrompt},
 			{Role: "user", Content: userPrompt},
 		}
 		note, err := e.completer.Complete(ctx, req)
@@ -104,7 +121,7 @@ func (e *Engine) Summarize(ctx context.Context, ch Channel, messages []Message) 
 			userPrompt := fmt.Sprintf("Channel: #%s (Consolidation Pass %d, Group %d of %d)\n\n%s\n\nConsolidate and compress these notes preserving all key facts.",
 				ch.Name, passes, i+1, len(batchedNotes), batch)
 			req := []llm.Message{
-				{Role: "system", Content: SystemPromptChunkNotes},
+				{Role: "system", Content: chunkSysPrompt},
 				{Role: "user", Content: userPrompt},
 			}
 			reduced, err := e.completer.Complete(ctx, req)
@@ -127,7 +144,7 @@ func (e *Engine) Summarize(ctx context.Context, ch Channel, messages []Message) 
 
 	synthesisUserPrompt := BuildSynthesisUserPrompt(ch, combinedNotes)
 	synthesisReq := []llm.Message{
-		{Role: "system", Content: SystemPromptSynthesis},
+		{Role: "system", Content: BuildSynthesisSystemPrompt(e.prompt)},
 		{Role: "user", Content: synthesisUserPrompt},
 	}
 
