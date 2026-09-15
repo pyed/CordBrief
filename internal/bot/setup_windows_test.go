@@ -21,8 +21,13 @@ func TestCredentialWindowsACL(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	want := "D:P(A;;FA;;;" + user.User.Sid.String() + ")"
-	if strings.Replace(sd.String(), "D:PAI", "D:P", 1) != want {
+	wantSD, err := windows.SecurityDescriptorFromString("D:P(A;;FA;;;" + user.User.Sid.String() + ")")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := strings.Replace(wantSD.String(), "D:PAI", "D:P", 1)
+	got := strings.Replace(sd.String(), "D:PAI", "D:P", 1)
+	if got != want {
 		t.Fatalf("unexpected credential DACL: %s", sd.String())
 	}
 }
