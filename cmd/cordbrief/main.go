@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"syscall"
+	_ "time/tzdata"
 
 	"github.com/pyed/CordBrief/internal/bot"
 	"github.com/pyed/CordBrief/internal/state"
@@ -13,7 +14,7 @@ import (
 
 func main() {
 	log.SetFlags(log.LstdFlags | log.LUTC)
-	log.Println("CordBrief v3 starting...")
+	log.Println("CordBrief starting...")
 
 	env, err := bot.LoadEnv()
 	if err != nil {

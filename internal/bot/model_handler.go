@@ -19,14 +19,6 @@ func (b *Bot) getModelLister(baseURL, model string) (ModelLister, error) {
 	return llm.NewClient(baseURL, model, b.llmAPIKey, nil)
 }
 
-func (b *Bot) renderOrEditModel(ctx context.Context, chatID int64, messageID int, text string, markup *models.InlineKeyboardMarkup) {
-	if messageID > 0 {
-		b.editMessage(ctx, chatID, messageID, text, markup)
-	} else {
-		b.sendMessageWithMarkup(ctx, chatID, text, markup)
-	}
-}
-
 func (b *Bot) handleModel(ctx context.Context, chatID int64, args []string) {
 	if len(args) == 0 {
 		b.showModelBrowser(ctx, chatID, 0, 0, false)
@@ -55,11 +47,6 @@ func (b *Bot) handleModel(ctx context.Context, chatID int64, args []string) {
 	}
 
 	cfg.LLM.Model = newModel
-	if err := cfg.Validate(); err != nil {
-		b.sendTextMessage(ctx, chatID, "Invalid configuration: "+err.Error())
-		return
-	}
-
 	if err := b.store.SaveConfig(cfg); err != nil {
 		b.sendTextMessage(ctx, chatID, "Failed to save configuration: "+err.Error())
 		return
@@ -71,26 +58,26 @@ func (b *Bot) handleModel(ctx context.Context, chatID int64, args []string) {
 func (b *Bot) showModelBrowser(ctx context.Context, chatID int64, messageID int, page int, forceRefresh bool) {
 	cfg, err := b.store.LoadConfig()
 	if err != nil {
-		b.renderOrEditModel(ctx, chatID, messageID, "Error loading configuration: "+err.Error(), nil)
+		b.renderOrEdit(ctx, chatID, messageID, "Error loading configuration: "+err.Error(), nil)
 		return
 	}
 
 	modelsList, gen, cached := b.modelCache.Get(cfg.LLM.BaseURL)
 	if !cached || forceRefresh {
 		if b.runner != nil && b.runner.IsRunning() {
-			b.renderOrEditModel(ctx, chatID, messageID, "A brief is currently running. Cannot refresh models while a brief is active.", nil)
+			b.renderOrEdit(ctx, chatID, messageID, "A brief is currently running. Cannot refresh models while a brief is active.", nil)
 			return
 		}
 
 		lister, err := b.getModelLister(cfg.LLM.BaseURL, cfg.LLM.Model)
 		if err != nil {
-			b.renderOrEditModel(ctx, chatID, messageID, "Failed to initialize LLM client: "+err.Error(), nil)
+			b.renderOrEdit(ctx, chatID, messageID, "Failed to initialize LLM client: "+err.Error(), nil)
 			return
 		}
 
 		discovered, err := lister.ListModels(ctx)
 		if err != nil {
-			b.renderOrEditModel(ctx, chatID, messageID, "Failed to discover models: "+err.Error(), nil)
+			b.renderOrEdit(ctx, chatID, messageID, "Failed to discover models: "+err.Error(), nil)
 			return
 		}
 
@@ -112,7 +99,7 @@ func (b *Bot) showModelBrowser(ctx context.Context, chatID int64, messageID int,
 				},
 			},
 		}
-		b.renderOrEditModel(ctx, chatID, messageID, text, markup)
+		b.renderOrEdit(ctx, chatID, messageID, text, markup)
 		return
 	}
 
@@ -173,7 +160,7 @@ func (b *Bot) showModelBrowser(ctx context.Context, chatID int64, messageID int,
 
 	text := fmt.Sprintf("LLM Model\n\nCurrent: %s\n\nModels reported by provider:\n(Note: Some provider models may not support chat summaries.)", cfg.LLM.Model)
 	markup := &models.InlineKeyboardMarkup{InlineKeyboard: rows}
-	b.renderOrEditModel(ctx, chatID, messageID, text, markup)
+	b.renderOrEdit(ctx, chatID, messageID, text, markup)
 }
 
 func (b *Bot) handleModelCallback(ctx context.Context, chatID int64, messageID int, data string) {
@@ -226,11 +213,6 @@ func (b *Bot) handleModelCallback(ctx context.Context, chatID int64, messageID i
 		}
 
 		cfg.LLM.Model = selectedModel
-		if err := cfg.Validate(); err != nil {
-			b.editMessage(ctx, chatID, messageID, "Invalid configuration: "+err.Error(), nil)
-			return
-		}
-
 		if err := b.store.SaveConfig(cfg); err != nil {
 			b.editMessage(ctx, chatID, messageID, "Failed to save configuration: "+err.Error(), nil)
 			return

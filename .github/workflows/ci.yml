@@ -1,0 +1,62 @@
+name: Build and release
+
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - run: go test -race ./...
+      - run: go vet ./...
+      - run: go build ./cmd/cordbrief
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: test
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: go.mod
+      - name: Build release archives
+        env:
+          CGO_ENABLED: '0'
+        run: |
+          mkdir -p dist
+          for os in linux darwin windows; do
+            for arch in amd64 arm64; do
+              name="cordbrief_${os}_${arch}"
+              mkdir -p "build/$name"
+              binary=cordbrief
+              if [ "$os" = windows ]; then binary=cordbrief.exe; fi
+              GOOS="$os" GOARCH="$arch" go build -trimpath -ldflags='-s -w' -o "build/$name/$binary" ./cmd/cordbrief
+              cp LICENSE README.md "build/$name/"
+              if [ "$os" = windows ]; then
+                (cd "build/$name" && zip "../../dist/$name.zip" "$binary" LICENSE README.md)
+              else
+                tar -czf "dist/$name.tar.gz" -C "build/$name" "$binary" LICENSE README.md
+              fi
+            done
+          done
+          (cd dist && sha256sum *.tar.gz *.zip > checksums.txt)
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes

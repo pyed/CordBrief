@@ -31,7 +31,7 @@ func (b *Bot) handlePrompt(ctx context.Context, chatID int64, args []string) {
 func (b *Bot) showPromptBrowser(ctx context.Context, chatID int64, messageID int) {
 	cfg, err := b.store.LoadConfig()
 	if err != nil {
-		b.renderOrEditPrompt(ctx, chatID, messageID, "Error loading configuration: "+err.Error(), nil)
+		b.renderOrEdit(ctx, chatID, messageID, "Error loading configuration: "+err.Error(), nil)
 		return
 	}
 
@@ -50,15 +50,7 @@ func (b *Bot) showPromptBrowser(ctx context.Context, chatID int64, messageID int
 		},
 	}
 
-	b.renderOrEditPrompt(ctx, chatID, messageID, text, markup)
-}
-
-func (b *Bot) renderOrEditPrompt(ctx context.Context, chatID int64, messageID int, text string, markup *models.InlineKeyboardMarkup) {
-	if messageID > 0 {
-		b.editMessage(ctx, chatID, messageID, text, markup)
-	} else {
-		b.sendMessageWithMarkup(ctx, chatID, text, markup)
-	}
+	b.renderOrEdit(ctx, chatID, messageID, text, markup)
 }
 
 func (b *Bot) handlePromptCallback(ctx context.Context, chatID int64, messageID int, data string) {
@@ -92,7 +84,7 @@ func (b *Bot) handlePromptCallback(ctx context.Context, chatID int64, messageID 
 func (b *Bot) showPromptView(ctx context.Context, chatID int64, messageID int) {
 	cfg, err := b.store.LoadConfig()
 	if err != nil {
-		b.renderOrEditPrompt(ctx, chatID, messageID, "Error loading configuration: "+err.Error(), nil)
+		b.renderOrEdit(ctx, chatID, messageID, "Error loading configuration: "+err.Error(), nil)
 		return
 	}
 
@@ -104,7 +96,7 @@ func (b *Bot) showPromptView(ctx context.Context, chatID int64, messageID int) {
 		return
 	}
 
-	b.renderOrEditPrompt(ctx, chatID, messageID, parts[0], nil)
+	b.renderOrEdit(ctx, chatID, messageID, parts[0], nil)
 	for _, part := range parts[1:] {
 		b.sendTextMessage(ctx, chatID, part)
 	}
@@ -117,28 +109,23 @@ func (b *Bot) executePromptReset(ctx context.Context, chatID int64, messageID in
 
 	if b.runner != nil && b.runner.IsRunning() {
 		msg := "A brief is currently running. Change the prompt after it finishes."
-		b.renderOrEditPrompt(ctx, chatID, messageID, msg, nil)
+		b.renderOrEdit(ctx, chatID, messageID, msg, nil)
 		return
 	}
 
 	cfg, err := b.store.LoadConfig()
 	if err != nil {
-		b.renderOrEditPrompt(ctx, chatID, messageID, "Error loading configuration: "+err.Error(), nil)
+		b.renderOrEdit(ctx, chatID, messageID, "Error loading configuration: "+err.Error(), nil)
 		return
 	}
 
 	cfg.Brief = nil
-	if err := cfg.Validate(); err != nil {
-		b.renderOrEditPrompt(ctx, chatID, messageID, "Invalid configuration: "+err.Error(), nil)
-		return
-	}
-
 	if err := b.store.SaveConfig(cfg); err != nil {
-		b.renderOrEditPrompt(ctx, chatID, messageID, "Failed to save configuration: "+err.Error(), nil)
+		b.renderOrEdit(ctx, chatID, messageID, "Failed to save configuration: "+err.Error(), nil)
 		return
 	}
 
-	b.renderOrEditPrompt(ctx, chatID, messageID, "Brief prompt reset to default.", nil)
+	b.renderOrEdit(ctx, chatID, messageID, "Brief prompt reset to default.", nil)
 }
 
 func (b *Bot) submitPromptEdit(ctx context.Context, chatID int64, rawText string) {
@@ -157,18 +144,6 @@ func (b *Bot) submitPromptEdit(ctx context.Context, chatID int64, rawText string
 		return
 	}
 
-	if len(newPrompt) > state.MaxBriefPromptBytes {
-		b.sendTextMessage(ctx, chatID, fmt.Sprintf("Brief prompt exceeds maximum allowed size (%d characters).", state.MaxBriefPromptBytes))
-		return
-	}
-
-	for i, r := range newPrompt {
-		if (r < 0x20 && r != '\n' && r != '\r' && r != '\t') || r == 0x7f {
-			b.sendTextMessage(ctx, chatID, fmt.Sprintf("Brief prompt contains invalid control character at byte %d.", i))
-			return
-		}
-	}
-
 	cfg, err := b.store.LoadConfig()
 	if err != nil {
 		b.sendTextMessage(ctx, chatID, "Error loading configuration: "+err.Error())
@@ -176,11 +151,6 @@ func (b *Bot) submitPromptEdit(ctx context.Context, chatID int64, rawText string
 	}
 
 	cfg.Brief = &state.BriefConfig{Prompt: newPrompt}
-	if err := cfg.Validate(); err != nil {
-		b.sendTextMessage(ctx, chatID, "Invalid configuration: "+err.Error())
-		return
-	}
-
 	if err := b.store.SaveConfig(cfg); err != nil {
 		b.sendTextMessage(ctx, chatID, "Failed to save configuration: "+err.Error())
 		return

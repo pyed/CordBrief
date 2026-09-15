@@ -6,7 +6,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"runtime"
 	"strings"
 )
 
@@ -137,9 +136,4 @@ func ExtractReleaseZip(zipPath, destDir, goos string) error {
 	cleanedUp = true
 
 	return nil
-}
-
-// CurrentPlatformExecutableName returns the CLI executable name for the current runtime OS.
-func CurrentPlatformExecutableName() string {
-	return ExpectedExecutableName(runtime.GOOS)
 }

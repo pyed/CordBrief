@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/pyed/CordBrief/internal/llm"
 )
@@ -154,57 +155,32 @@ func (e *Engine) Summarize(ctx context.Context, ch Channel, messages []Message) 
 // chunkMessages packs complete rendered message blocks into chunks up to target budget.
 // An individual message block is never split across chunks unless it alone exceeds budget.
 func (e *Engine) chunkMessages(messages []Message, budget int) []string {
-	var chunks []string
-	var currentChunk strings.Builder
-
-	for _, m := range messages {
-		block := RenderMessage(m)
-
-		// If a single message block exceeds the entire budget, handle gracefully
-		if len(block) > budget {
-			// Flush current accumulated chunk if non-empty
-			if currentChunk.Len() > 0 {
-				chunks = append(chunks, currentChunk.String())
-				currentChunk.Reset()
-			}
-			// Clamp oversized message block so it does not exceed budget
-			truncatedBlock := block[:budget-64] + "\n... [message truncated due to size]"
-			chunks = append(chunks, truncatedBlock)
-			continue
-		}
-
-		// Calculate size if added to current chunk
-		extraLen := len(block)
-		if currentChunk.Len() > 0 {
-			extraLen += 2 // "\n\n"
-		}
-
-		if currentChunk.Len()+extraLen > budget {
-			// Current chunk full; start new chunk
-			chunks = append(chunks, currentChunk.String())
-			currentChunk.Reset()
-			currentChunk.WriteString(block)
-		} else {
-			if currentChunk.Len() > 0 {
-				currentChunk.WriteString("\n\n")
-			}
-			currentChunk.WriteString(block)
-		}
+	blocks := make([]string, len(messages))
+	for i, m := range messages {
+		blocks[i] = RenderMessage(m)
 	}
-
-	if currentChunk.Len() > 0 {
-		chunks = append(chunks, currentChunk.String())
-	}
-
-	return chunks
+	return e.batchTextBlocks(blocks, budget)
 }
 
-// batchTextBlocks groups text blocks into contiguous batches that fit within budget.
+// batchTextBlocks keeps whole blocks together when possible and splits oversized blocks without losing text.
 func (e *Engine) batchTextBlocks(blocks []string, budget int) []string {
+	budget = max(budget, utf8.UTFMax) // A budget must fit at least one UTF-8 rune.
 	var batches []string
 	var current strings.Builder
 
 	for _, block := range blocks {
+		if len(block) > budget && current.Len() > 0 {
+			batches = append(batches, current.String())
+			current.Reset()
+		}
+		for len(block) > budget {
+			end := budget
+			for !utf8.RuneStart(block[end]) {
+				end--
+			}
+			batches = append(batches, block[:end])
+			block = block[end:]
+		}
 		extraLen := len(block)
 		if current.Len() > 0 {
 			extraLen += 2

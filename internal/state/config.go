@@ -143,8 +143,3 @@ func (c *Config) EffectiveBriefPrompt() string {
 	}
 	return c.Brief.Prompt
 }
-
-// EffectiveBriefPrompt returns the effective brief prompt for the provided configuration.
-func EffectiveBriefPrompt(cfg *Config) string {
-	return cfg.EffectiveBriefPrompt()
-}

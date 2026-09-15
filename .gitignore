@@ -20,6 +20,7 @@ build/
 /cordbrief.env.sh
 /config.json
 /state.json
+/data/
 
 # Runtime working directories and temporary data
 work/

@@ -929,7 +929,6 @@ func TestFollowAndUnfollow_BlockedWhileBriefRunning(t *testing.T) {
 	b.pendingFollows["temp_pending"] = PendingFollow{
 		ChannelID:   "20002",
 		DisplayName: "dev",
-		CreatedAt:   time.Now(),
 	}
 	b.mu.Unlock()
 
@@ -1080,7 +1079,7 @@ func TestSchedule_InvalidInputs(t *testing.T) {
 	// 1. Invalid time format
 	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/schedule 25:00"))
 	msg := sender.lastSent()
-	if msg == nil || !strings.Contains(msg.Text, "Invalid schedule time") {
+	if msg == nil || !strings.Contains(msg.Text, "Invalid schedule parameters") {
 		t.Fatalf("expected invalid schedule time error, got: %v", msg)
 	}
 
@@ -1219,7 +1218,7 @@ func TestSchedule_LegacyM5Upgrade_SafeByDefaultAndExplicitOptIn(t *testing.T) {
 	// 3b. Invalid /schedule input cannot accidentally mark scheduling as explicitly enabled
 	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/schedule 25:00"))
 	msg = sender.lastSent()
-	if msg == nil || !strings.Contains(msg.Text, "Invalid schedule time") {
+	if msg == nil || !strings.Contains(msg.Text, "Invalid schedule parameters") {
 		t.Errorf("expected invalid time error, got: %v", msg)
 	}
 	cfgCheck, _ := store.LoadConfig()

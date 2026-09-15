@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/pyed/CordBrief/internal/llm"
 )
@@ -281,6 +282,22 @@ func TestChunker_Integrity(t *testing.T) {
 		count := seenIDs[idStr]
 		if count != 1 {
 			t.Errorf("message %s appeared %d times across chunks (expected exactly 1)", idStr, count)
+		}
+	}
+}
+
+func TestChunker_OversizedUnicodePreservesText(t *testing.T) {
+	engine := NewEngine(&mockCompleter{})
+	message := Message{Author: "Alice", Content: strings.Repeat("hello 🌍 مرحبا ", 100)}
+	for _, budget := range []int{4, 40, 100} {
+		chunks := engine.chunkMessages([]Message{message}, budget)
+		if strings.Join(chunks, "") != RenderMessage(message) {
+			t.Fatalf("budget %d: message text was lost", budget)
+		}
+		for _, chunk := range chunks {
+			if len(chunk) > budget || !utf8.ValidString(chunk) {
+				t.Fatalf("budget %d: invalid chunk %q", budget, chunk)
+			}
 		}
 	}
 }

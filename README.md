@@ -1,106 +1,101 @@
 # CordBrief
 
-CordBrief is a lightweight, background Telegram-controlled Discord briefing bot.
+Discord catch-up briefs, delivered to your private Telegram chat. Follow channels, choose an AI model, and request a summary on demand or schedule one each day.
 
-At idle, CordBrief is a single Go process running Telegram long polling. M5 supports manual briefs; scheduled execution is not implemented yet. It operates with zero inbound ports and requires no Web UI, no Docker, no database server, and no browser or Discord runtime.
+CordBrief runs on your computer or server. It uses DiscordChatExporter to collect messages, an OpenAI-compatible API to summarize them, and Telegram to deliver the result.
 
-## Architecture
+## 1. Install
 
-- **Control Plane:** 100% Telegram-controlled. All status checks, channel subscriptions, and configuration occur through Telegram bot commands and menus.
-- **Discord Collection:** Relies on [`DiscordChatExporter.Cli`](https://github.com/Tyrrrz/DiscordChatExporter) as an external CLI collector. CordBrief knows nothing about Discord gateway, RPC, or session internals.
-- **Bounded Exports & Independent Cursors:** Each followed Discord channel maintains an independent cursor. When generating a brief, CordBrief invokes DiscordChatExporter to fetch only the interval from the channel's stored cursor to a fixed cutoff timestamp.
-- **At-Least-Once Delivery:** A channel's durable cursor advances *only after* its brief has been successfully sent to Telegram. If any stage fails, the cursor remains untouched and the interval is retried on the next run.
-- **Disposable Raw Exports:** Raw Discord message exports are temporary working data deleted immediately after processing. No raw messages are retained in databases or journals.
-- **Independent Channel Delivery:** Each followed channel produces its own separate Telegram brief and fails independently.
-- **LLM Abstraction:** Built on standard Go `net/http` targeting OpenAI-compatible chat completion APIs, with Google Gemini via its OpenAI-compatible endpoint as the default. Configurable base URL, model, and API key.
+Download and extract the archive for your system from [Releases](https://github.com/pyed/CordBrief/releases):
 
-## Persistence & State Contract
+- `linux`, `darwin` (macOS), or `windows`.
+- `amd64` for Intel/AMD; `arm64` for Apple Silicon and ARM machines.
 
-- **Config (`config.json`):** Declarative user intent (followed channels, brief schedule, timezone, non-secret LLM configuration). Contains no secrets or cursors.
-- **State (`state.json`):** Durable operational facts learned at runtime, strictly keyed by Discord channel ID. Contains per-channel cursors, last success timestamps, and error history.
-- **Cursor Lifecycle:** A newly followed channel initially begins with an explicit `timestamp` cursor (RFC3339). Once messages are processed, it advances to a Discord `message_id` snowflake cursor.
-- **Advance Invariant:** A channel's cursor advances *only after* its brief has been successfully delivered to Telegram. If any step fails, the cursor remains untouched so the next run retries the interval.
-- **Disposable Working Data:** Raw Discord message exports are temporary working files deleted immediately after brief generation. They are never retained as durable state.
+Also download the matching **CLI** archive from [DiscordChatExporter](https://github.com/Tyrrrz/DiscordChatExporter/releases) and extract the entire archive into a permanent folder. Run its executable with `--version` to check that it works. See its [setup documentation](https://github.com/Tyrrrz/DiscordChatExporter/tree/master/.docs) for platform requirements, Discord tokens, and channel IDs.
 
-## Telegram Control Plane
+## 2. Set credentials and start
 
-CordBrief operates as an owner-only, private Telegram bot. Interactions from unauthorized users or non-private chats are silently ignored.
+You need a Telegram bot token from [BotFather](https://t.me/BotFather), your numeric Telegram user ID, a Discord token with access to the channels, and an API key for your AI provider.
 
-## Discord Collection Boundary
+**Linux / macOS**: replace the example values, then run from the extracted CordBrief folder:
 
-Discord collection is performed strictly through [`DiscordChatExporter.Cli`](https://github.com/Tyrrrz/DiscordChatExporter) (pinned and validated on version 2.48).
-
-CordBrief itself does not implement Discord protocols (no Gateway, REST, RPC, scraping, or browser automation). It delegates collection entirely to the external DCE executable:
-
-- **Bounded Collection:** Invoked strictly with `--after` (persisted cursor) and `--before` (fixed UTC cutoff) to guarantee bounded intervals without message loss.
-- **Disposable Working Files:** Raw JSON exports are written to temporary files, parsed into normalized domain types, and deleted immediately. Raw exports are never retained as durable state or application history.
-- **On-Demand Invocation:** DCE is executed only during active collection jobs, never on status checks or idle polling.
-- **Collection Only:** The collection adapter is strictly read-only and never mutates cursors or durable state.
-
-### Environment Configuration
-
-- `TELEGRAM_BOT_TOKEN`: Telegram bot token from @BotFather (required for bot).
-- `TELEGRAM_OWNER_ID`: Telegram user ID of the authorized owner (required for bot, positive integer).
-- `CORDBRIEF_DATA_DIR`: Directory path for `config.json` and `state.json` (optional, defaults to `./data`).
-- `CORDBRIEF_DCE_PATH`: Path to the pinned `DiscordChatExporter.Cli` executable (required for collection).
-- `DISCORD_TOKEN`: Discord authentication token passed directly to child DCE process via environment without appearing in command-line arguments (required for collection).
-- `LLM_API_KEY`: Secret API key for OpenAI-compatible LLM endpoint (required for brief generation).
-
-## LLM & Brief Engine
-
-CordBrief transforms raw normalized Discord messages into concise executive summaries without heavy frameworks or vendor lock-in:
-
-- **OpenAI-Compatible Chat Completions:** Built entirely on standard library `net/http`. Compatible with Google Gemini (default), OpenAI, Groq, Ollama, vLLM, llama.cpp, or any OpenAI-compatible API.
-- **Zero Provider SDKs:** No third-party AI SDKs, external tokenizers, or python sidecars. Only the Telegram bot library is an external Go module.
-- **Gemini Default:** Pre-configured with Google Gemini (`gemini-3.8-flash`) via `https://generativelanguage.googleapis.com/v1beta/openai/`.
-- **Character-Based Chunking:** Conservative 80,000-character budget per chunk without splitting individual message blocks. If active discussions exceed budget, a 3-stage hierarchical pipeline generates chronological notes per chunk before final synthesis.
-- **Prompt Injection Defense:** Discord chat transcripts are treated as untrusted user data. They are structurally delimited in the `user` role and never placed into the `system` role. Strict system instructions enforce factual summarization and order the model to ignore user-supplied instructions embedded in the transcript.
-- **Pure Transformation:** The brief engine is completely isolated from state and scheduling. It never mutates `state.json` cursors or initiates network calls outside its explicit context.
-
-### Commands
-
-- `/start`: Display the main menu, overview, and quick action buttons.
-- `/status`: Show current followed channel count, schedule, timezone, LLM model, Discord exporter status, and brief job status (`idle` or `running`).
-- `/brief [channel_id]`: Trigger an immediate brief job for all followed channels or a single specified channel. Runs in background with immediate acknowledgement.
-- `/channels`: List followed Discord channels with interactive follow and unfollow controls.
-- `/follow <channel_id> [display name]`: Follow a new channel with interactive start mode selection (`From now` or `Last 24 hours`).
-- `/unfollow [channel_id]`: Remove a channel from followed configuration and purge its operational state after confirmation.
-
-## Brief Orchestration & Delivery
-
-CordBrief coordinates the end-to-end briefing pipeline with strict transactional safety:
-
-- **Single Active Job:** Only one brief job runs at any time. Triggering while active returns an immediate notice.
-- **Concurrent Mutation Protection:** Follow and unfollow confirmations are safely blocked while a brief job is running to preserve snapshot consistency.
-- **Sequential Channel Processing:** Followed channels are processed sequentially with a shared fixed cutoff timestamp. A failure on one channel does not abort others.
-- **Plain-Text Telegram Delivery:** Briefs preserve text across paragraph and line boundaries, with `#channel · X/Y` headers and a conservative 3,900 UTF-16-unit limit per message.
-- **Shutdown:** SIGINT/SIGTERM cancels the application context shared by the job, DCE child and network requests, then waits for the job to exit.
-- **Completion Retry:** Each LLM completion gets at most two attempts, two seconds apart; cancellation stops retrying. DCE and Telegram sends are not retried automatically.
-- **At-Least-Once Delivery Guarantee:** A channel's durable cursor in `state.json` advances to the new message ID *only after* all message parts have been successfully delivered to Telegram.
-
-## Project Structure
-
-```text
-CordBrief/
-├── cmd/
-│   └── cordbrief/     # Application entrypoint
-├── internal/
-│   ├── bot/           # Telegram bot control plane
-│   ├── brief/         # Transcript compaction & brief assembly
-│   ├── dce/           # DiscordChatExporter execution & parsing
-│   ├── job/           # End-to-end brief orchestration & message delivery
-│   ├── llm/           # OpenAI-compatible LLM client
-│   └── state/         # Configuration & cursor persistence
-├── go.mod
-├── README.md
-├── LICENSE
-└── .gitignore
+```sh
+export TELEGRAM_BOT_TOKEN='your-bot-token'
+export TELEGRAM_OWNER_ID='123456789'
+export DISCORD_TOKEN='your-discord-token'
+export CORDBRIEF_DCE_PATH='/absolute/path/to/DiscordChatExporter.Cli'
+export LLM_API_KEY='your-api-key'
+chmod +x cordbrief
+./cordbrief
 ```
 
-## Non-Goals
+**Windows PowerShell:**
 
-- No Web UI
-- No Docker or container orchestration required
-- No SQLite or external database
-- No Discord client, browser automation, or electron wrappers
-- No inbound open network ports
+```powershell
+$env:TELEGRAM_BOT_TOKEN = 'your-bot-token'
+$env:TELEGRAM_OWNER_ID = '123456789'
+$env:DISCORD_TOKEN = 'your-discord-token'
+$env:CORDBRIEF_DCE_PATH = 'C:\Tools\DCE\DiscordChatExporter.Cli.exe'
+$env:LLM_API_KEY = 'your-api-key'
+.\cordbrief.exe
+```
+
+These variables apply to the current terminal. CordBrief does not load `.env` files. Keep the process running for scheduled briefs; press Ctrl+C to stop. Only the configured Telegram owner can control it, in a private chat.
+
+## 3. Follow a channel
+
+Open your Telegram bot and send:
+
+```text
+/start
+/follow 123456789012345678 general
+```
+
+Choose **From now** or **Last 24 hours** using the buttons. Then send `/model` to choose an available chat model and `/brief` to get your first summary.
+
+| Command | What it does |
+| --- | --- |
+| `/brief [channel_id]` | Summarize new messages from all followed channels, or one channel. |
+| `/channels` | List followed channels. |
+| `/unfollow [channel_id]` | Stop following a channel after confirmation. |
+| `/schedule 08:00 Asia/Riyadh` | Enable a daily brief at that local time. |
+| `/schedule off` | Disable daily briefs; `/schedule` shows the current setting. |
+| `/model [model_id]` | Browse available models or set one directly. |
+| `/prompt` | View or edit the summary instructions; `/prompt reset` restores the default. |
+| `/status` | Show configuration, exporter status, and whether a brief is running. |
+
+Scheduling starts disabled. Without a timezone argument, `/schedule` keeps the current timezone, initially UTC.
+
+## Settings and data
+
+Settings and channel progress are saved under `./data`. Set `CORDBRIEF_DATA_DIR` to use another folder. Back it up and run only one CordBrief instance per data folder.
+
+The default AI endpoint is Google's Gemini OpenAI-compatible API. To use another provider, first save a setting with `/model model-id`, stop CordBrief, and edit `llm.base_url` and `llm.model` in `data/config.json`. Restart with that provider's `LLM_API_KEY`; a local server that needs no authentication can leave the key unset.
+
+Messages go to your configured AI provider for summarization. Temporary exports are deleted after collection. Channel progress advances only after every summary part reaches Telegram, so failures can be retried. A partially delivered brief may repeat on retry.
+
+CordBrief checks weekly for DiscordChatExporter updates, verifies download checksums, and tries a new version on the next export. If it fails, it retries with the previous version.
+
+## Build and release
+
+With Go 1.26 or newer installed:
+
+```sh
+git clone https://github.com/pyed/CordBrief.git
+cd CordBrief
+go test ./...
+go build ./cmd/cordbrief
+```
+
+The default tests run without credentials or live services. GitHub Actions runs tests, race checks, static analysis, and a build on Linux, macOS, and Windows for pushes and pull requests.
+
+After committing and pushing your changes, push a new tag to publish a release. For example, using an unused version:
+
+```sh
+git tag v3.0.0
+git push origin v3.0.0
+```
+
+Every pushed tag triggers a release after CI passes, with Linux, macOS, and Windows archives for both architectures and a `checksums.txt` file. GitHub Actions uses its built-in token; no extra release secret is needed.
+
+[MIT License](LICENSE)

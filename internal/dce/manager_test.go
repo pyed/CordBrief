@@ -30,6 +30,17 @@ func writeMockExportJSON(args []string) error {
 	return errors.New("no -o found in args")
 }
 
+func TestManager_UnreadableStateReturnsError(t *testing.T) {
+	dir := t.TempDir()
+	// A directory where a JSON file belongs reliably fails to read on every OS.
+	if err := os.MkdirAll(filepath.Join(dir, "dce", "updater.json"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if mgr, err := NewManager(dir, "bootstrap", "token", WithBootstrapVersion("2.48")); err == nil || mgr != nil {
+		t.Fatalf("expected initialization error, got manager %v, error %v", mgr, err)
+	}
+}
+
 func TestManager_CandidateSuccess(t *testing.T) {
 	tmpDir := t.TempDir()
 	bootstrapDir := filepath.Join(tmpDir, "bootstrap")

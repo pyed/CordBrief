@@ -18,9 +18,6 @@ func TestPromptConfig(t *testing.T) {
 		if cfg.EffectiveBriefPrompt() != state.DefaultBriefPrompt {
 			t.Fatalf("expected built-in default prompt, got %q", cfg.EffectiveBriefPrompt())
 		}
-		if state.EffectiveBriefPrompt(cfg) != state.DefaultBriefPrompt {
-			t.Fatalf("expected built-in default prompt via function, got %q", state.EffectiveBriefPrompt(cfg))
-		}
 	})
 
 	t.Run("custom prompt override returns exact custom text", func(t *testing.T) {
@@ -29,9 +26,6 @@ func TestPromptConfig(t *testing.T) {
 		cfg.Brief = &state.BriefConfig{Prompt: custom}
 		if cfg.EffectiveBriefPrompt() != custom {
 			t.Fatalf("expected custom prompt %q, got %q", custom, cfg.EffectiveBriefPrompt())
-		}
-		if state.EffectiveBriefPrompt(cfg) != custom {
-			t.Fatalf("expected custom prompt %q via function, got %q", custom, state.EffectiveBriefPrompt(cfg))
 		}
 	})
 

@@ -1,6 +1,7 @@
 package dce
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -13,6 +14,22 @@ import (
 
 	"github.com/pyed/CordBrief/internal/state"
 )
+
+func TestCappedBufferConsumesEntireWrite(t *testing.T) {
+	var buf cappedBuffer
+	buf.limit = 10
+	data := []byte(strings.Repeat("log line\n", 20))
+	// bytes.Reader uses WriteTo, which rejects short writes with no error.
+	if n, err := io.Copy(&buf, bytes.NewReader(data)); err != nil || n != int64(len(data)) {
+		t.Fatalf("copy stopped at %d bytes: %v", n, err)
+	}
+	if n, err := buf.Write(data); n != len(data) || err != nil {
+		t.Fatalf("full buffer rejected write: %d, %v", n, err)
+	}
+	if buf.String() != string(data[:buf.limit]) {
+		t.Fatalf("unexpected captured log: %q", buf.String())
+	}
+}
 
 // sampleValidJSON provides a realistic fixture matching observed DCE 2.48 output.
 const sampleValidJSON = `{

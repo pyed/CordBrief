@@ -26,7 +26,6 @@ type Sender interface {
 type PendingFollow struct {
 	ChannelID   string
 	DisplayName string
-	CreatedAt   time.Time
 }
 
 // ModelLister defines the capability to discover available LLM models.
@@ -243,6 +242,14 @@ func (b *Bot) DCEManager() *dce.Manager {
 
 func (b *Bot) sendTextMessage(ctx context.Context, chatID int64, text string) {
 	b.sendMessageWithMarkup(ctx, chatID, text, nil)
+}
+
+func (b *Bot) renderOrEdit(ctx context.Context, chatID int64, messageID int, text string, markup *models.InlineKeyboardMarkup) {
+	if messageID > 0 {
+		b.editMessage(ctx, chatID, messageID, text, markup)
+	} else {
+		b.sendMessageWithMarkup(ctx, chatID, text, markup)
+	}
 }
 
 func (b *Bot) sendMessageWithMarkup(ctx context.Context, chatID int64, text string, markup *models.InlineKeyboardMarkup) {

@@ -369,17 +369,10 @@ type cappedBuffer struct {
 }
 
 func (b *cappedBuffer) Write(p []byte) (n int, err error) {
-	if b.limit <= 0 {
-		return len(p), nil
+	if remaining := b.limit - b.buf.Len(); remaining > 0 {
+		_, _ = b.buf.Write(p[:min(len(p), remaining)])
 	}
-	remaining := b.limit - b.buf.Len()
-	if remaining <= 0 {
-		return len(p), nil
-	}
-	if len(p) > remaining {
-		p = p[:remaining]
-	}
-	return b.buf.Write(p)
+	return len(p), nil
 }
 
 func (b *cappedBuffer) String() string {

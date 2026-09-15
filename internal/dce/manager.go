@@ -110,8 +110,8 @@ func NewManager(dataDir, bootstrapPath, token string, opts ...ManagerOption) (*M
 	m.statePath = filepath.Join(dceDir, "updater.json")
 
 	st, err := LoadUpdaterState(m.statePath, m.bootstrapPath, m.bootstrapVersion)
-	if err != nil && !errors.Is(err, os.ErrNotExist) {
-		// On corrupt state, LoadUpdaterState fails closed returning bootstrap fallback
+	if err != nil && st == nil {
+		return nil, err
 	}
 	m.state = st
 
@@ -197,7 +197,6 @@ func (m *Manager) Export(ctx context.Context, req ExportRequest) (*ExportResult,
 
 	m.mu.Lock()
 	activePath := m.state.ActivePath
-	activeVer := m.state.ActiveVersion
 	candPath := m.state.CandidatePath
 	candVer := m.state.CandidateVersion
 	m.mu.Unlock()
@@ -233,7 +232,6 @@ func (m *Manager) Export(ctx context.Context, req ExportRequest) (*ExportResult,
 		return nil, errors.New("no active dce executable configured")
 	}
 	activeClient := NewMockClient(activePath, m.token, m.runner)
-	_ = activeVer
 	return activeClient.Export(ctx, req)
 }
 
