@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -22,6 +23,9 @@ const (
 	DefaultUserAgent              = "CordBrief/3.0"
 	MaxReleaseJSONBytes           = 1024 * 1024       // 1 MB
 	MaxDownloadBytes              = 150 * 1024 * 1024 // 150 MB
+	ReleaseMetadataTimeout        = 30 * time.Second
+	AssetDownloadTimeout          = 3 * time.Minute
+	PreparationTimeout            = 10 * time.Minute
 )
 
 // GitHubRelease represents the subset of GitHub release metadata needed by the updater.
@@ -51,7 +55,7 @@ type ReleaseClient struct {
 // NewReleaseClient constructs a standard ReleaseClient.
 func NewReleaseClient() *ReleaseClient {
 	return &ReleaseClient{
-		HTTPClient: &http.Client{Timeout: 2 * time.Minute},
+		HTTPClient: &http.Client{},
 		Endpoint:   DefaultGitHubLatestReleaseURL,
 		UserAgent:  DefaultUserAgent,
 	}
@@ -92,6 +96,8 @@ func (c *ReleaseClient) FetchLatestRelease(ctx context.Context) (*GitHubRelease,
 
 // FetchRelease uses the official latest endpoint or an exact official release tag.
 func (c *ReleaseClient) FetchRelease(ctx context.Context, tag string) (*GitHubRelease, error) {
+	ctx, cancel := context.WithTimeout(ctx, ReleaseMetadataTimeout)
+	defer cancel()
 	endpoint := c.Endpoint
 	if endpoint == "" {
 		endpoint = DefaultGitHubLatestReleaseURL
@@ -169,40 +175,65 @@ func (c *ReleaseClient) FindAsset(rel *GitHubRelease, goos, goarch string) (*Git
 	return nil, fmt.Errorf("release %s has no asset matching %s for %s/%s", rel.TagName, expectedName, goos, goarch)
 }
 
-// DownloadAndVerify streams the asset into targetPath and validates its SHA-256 digest.
+// DownloadAndVerify retries failed transfers from scratch. Each attempt has its own
+// deadline; a caller cancellation or overall preparation deadline always wins.
 func (c *ReleaseClient) DownloadAndVerify(ctx context.Context, asset GitHubAsset, targetPath string) error {
+	for attempt := 0; ; attempt++ {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		attemptCtx, cancel := context.WithTimeout(ctx, AssetDownloadTimeout)
+		retry, err := c.downloadAttempt(attemptCtx, asset, targetPath)
+		cancel()
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err == nil || !retry {
+			return err
+		}
+		if attempt == 2 {
+			return fmt.Errorf("asset download failed after 3 attempts: %w", err)
+		}
+		if err := waitContext(ctx, time.Duration(attempt+1)*2*time.Second); err != nil {
+			return err
+		}
+	}
+}
+
+// downloadAttempt exposes only a complete SHA-256-verified file at targetPath.
+func (c *ReleaseClient) downloadAttempt(ctx context.Context, asset GitHubAsset, targetPath string) (bool, error) {
 	rawURL := strings.TrimSpace(asset.BrowserDownloadURL)
 	if rawURL == "" {
-		return errors.New("download url cannot be empty")
+		return false, errors.New("download url cannot be empty")
 	}
 
 	u, err := url.Parse(rawURL)
 	if err != nil {
-		return fmt.Errorf("invalid download url: %w", err)
+		return false, fmt.Errorf("invalid download url: %w", err)
 	}
 	if !c.AllowHTTP && u.Scheme != "https" {
-		return fmt.Errorf("insecure download scheme %q; HTTPS required", u.Scheme)
+		return false, fmt.Errorf("insecure download scheme %q; HTTPS required", u.Scheme)
 	}
 
 	// Validate digest syntax
 	digestStr := strings.TrimSpace(asset.Digest)
 	if !strings.HasPrefix(digestStr, "sha256:") {
-		return fmt.Errorf("missing or unsupported asset digest %q (expected sha256:<hex>)", digestStr)
+		return false, fmt.Errorf("missing or unsupported asset digest %q (expected sha256:<hex>)", digestStr)
 	}
 	expectedHex := strings.TrimPrefix(digestStr, "sha256:")
 	expectedBytes, err := hex.DecodeString(expectedHex)
 	if err != nil || len(expectedBytes) != 32 {
-		return fmt.Errorf("invalid sha256 hex in asset digest: %q", expectedHex)
+		return false, fmt.Errorf("invalid sha256 hex in asset digest: %q", expectedHex)
 	}
 
 	if err := os.MkdirAll(filepath.Dir(targetPath), 0700); err != nil {
-		return fmt.Errorf("create target dir: %w", err)
+		return false, fmt.Errorf("create target dir: %w", err)
 	}
 
 	tmpPath := targetPath + ".download.tmp"
 	tmpFile, err := os.OpenFile(tmpPath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0600)
 	if err != nil {
-		return fmt.Errorf("create temp download file: %w", err)
+		return false, fmt.Errorf("create temp download file: %w", err)
 	}
 
 	cleanedUp := false
@@ -215,7 +246,7 @@ func (c *ReleaseClient) DownloadAndVerify(ctx context.Context, asset GitHubAsset
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
 	if err != nil {
-		return fmt.Errorf("create download request: %w", err)
+		return false, fmt.Errorf("create download request: %w", err)
 	}
 	ua := c.UserAgent
 	if ua == "" {
@@ -230,12 +261,12 @@ func (c *ReleaseClient) DownloadAndVerify(ctx context.Context, asset GitHubAsset
 
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("execute download request: %w", err)
+		return true, fmt.Errorf("execute download request: %w", err)
 	}
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("unexpected download status code: %d", resp.StatusCode)
+		return resp.StatusCode == 408 || resp.StatusCode == 429 || resp.StatusCode >= 500, fmt.Errorf("unexpected download status code: %d", resp.StatusCode)
 	}
 
 	hasher := sha256.New()
@@ -245,31 +276,36 @@ func (c *ReleaseClient) DownloadAndVerify(ctx context.Context, asset GitHubAsset
 	limitedReader := io.LimitReader(resp.Body, MaxDownloadBytes+1)
 	written, err := io.Copy(multiWriter, limitedReader)
 	if err != nil {
-		return fmt.Errorf("streaming download failed: %w", err)
+		var networkError net.Error
+		retry := errors.Is(err, io.ErrUnexpectedEOF) || errors.Is(err, context.DeadlineExceeded) || errors.As(err, &networkError)
+		return retry, fmt.Errorf("streaming download failed: %w", err)
 	}
 
 	if written > MaxDownloadBytes {
-		return fmt.Errorf("download exceeded maximum allowed size (%d bytes)", MaxDownloadBytes)
+		return false, fmt.Errorf("download exceeded maximum allowed size (%d bytes)", MaxDownloadBytes)
 	}
 
 	if err := tmpFile.Sync(); err != nil {
-		return fmt.Errorf("sync temp file: %w", err)
+		return false, fmt.Errorf("sync temp file: %w", err)
 	}
 	if err := tmpFile.Close(); err != nil {
-		return fmt.Errorf("close temp file: %w", err)
+		return false, fmt.Errorf("close temp file: %w", err)
 	}
 
 	// Verify SHA-256 digest
 	actualBytes := hasher.Sum(nil)
 	if subtle.ConstantTimeCompare(actualBytes, expectedBytes) != 1 {
-		return fmt.Errorf("digest mismatch: expected sha256:%s, got sha256:%x", expectedHex, actualBytes)
+		return false, fmt.Errorf("digest mismatch: expected sha256:%s, got sha256:%x", expectedHex, actualBytes)
 	}
 
 	// Atomically replace targetPath with verified temp file
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
 	if err := os.Rename(tmpPath, targetPath); err != nil {
-		return fmt.Errorf("rename verified download: %w", err)
+		return false, fmt.Errorf("rename verified download: %w", err)
 	}
 	cleanedUp = true
 
-	return nil
+	return false, nil
 }

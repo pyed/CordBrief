@@ -82,6 +82,8 @@ func (b *Bot) handleMessage(ctx context.Context, msg *models.Message) {
 		b.handleBrief(ctx, msg.Chat.ID, parts[1:])
 	case "/schedule":
 		b.handleSchedule(ctx, msg.Chat.ID, parts[1:])
+	case "/dcecooldown":
+		b.handleDCECooldown(ctx, msg.Chat.ID, parts[1:])
 	case "/model":
 		b.handleModel(ctx, msg.Chat.ID, parts[1:])
 	case "/prompt":
@@ -450,6 +452,9 @@ func (b *Bot) handleFollowCallback(ctx context.Context, chatID int64, messageID 
 		return
 	}
 
+	if b.scheduler != nil {
+		b.scheduler.Wake()
+	}
 	b.editMessage(ctx, chatID, messageID, fmt.Sprintf("Now following %s (%s)\nStart mode: %s", pf.DisplayName, pf.ChannelID, modeLabel), nil)
 }
 
@@ -555,6 +560,9 @@ func (b *Bot) handleUnfollowCallback(ctx context.Context, chatID int64, messageI
 			return
 		}
 
+		if b.scheduler != nil {
+			b.scheduler.Wake()
+		}
 		b.editMessage(ctx, chatID, messageID, fmt.Sprintf("Unfollowed channel %s.", channelID), nil)
 	}
 }
@@ -633,7 +641,7 @@ func (b *Bot) handleSchedule(ctx context.Context, chatID int64, args []string) {
 			}
 		}
 
-		text := fmt.Sprintf("Daily brief: %s\nTime: %s\nTimezone: %s\nNext run: %s",
+		text := fmt.Sprintf("Daily brief: %s\nTime: %s\nTimezone: %s\nNext delivery: %s",
 			schedState, cfg.Schedule.Time, cfg.Timezone, nextRunStr)
 		b.sendTextMessage(ctx, chatID, text)
 		return
@@ -665,7 +673,7 @@ func (b *Bot) handleSchedule(ctx context.Context, chatID int64, args []string) {
 		if b.scheduler != nil {
 			b.scheduler.Wake()
 		}
-		text := fmt.Sprintf("Daily brief: disabled\nTime: %s\nTimezone: %s\nNext run: none",
+		text := fmt.Sprintf("Daily brief: disabled\nTime: %s\nTimezone: %s\nNext delivery: none",
 			cfg.Schedule.Time, cfg.Timezone)
 		b.sendTextMessage(ctx, chatID, text)
 		return
@@ -693,7 +701,39 @@ func (b *Bot) handleSchedule(ctx context.Context, chatID int64, args []string) {
 	if err == nil {
 		nextRunStr = nextTime.Format("2006-01-02 15:04 -07")
 	}
-	text := fmt.Sprintf("Daily brief: enabled\nTime: %s\nTimezone: %s\nNext run: %s",
+	text := fmt.Sprintf("Daily brief: enabled\nTime: %s\nTimezone: %s\nNext delivery: %s",
 		cfg.Schedule.Time, cfg.Timezone, nextRunStr)
 	b.sendTextMessage(ctx, chatID, text)
+}
+
+func (b *Bot) handleDCECooldown(ctx context.Context, chatID int64, args []string) {
+	cfg, err := b.store.LoadConfig()
+	if err != nil {
+		b.sendTextMessage(ctx, chatID, "Error loading configuration: "+err.Error())
+		return
+	}
+	if len(args) > 0 {
+		if b.runner != nil && b.runner.IsRunning() {
+			b.sendTextMessage(ctx, chatID, "A brief is currently running. Configuration changes are frozen until it finishes.")
+			return
+		}
+		duration, err := time.ParseDuration(args[0])
+		if len(args) != 1 || err != nil || duration < 0 || duration > time.Hour || duration%time.Second != 0 {
+			b.sendTextMessage(ctx, chatID, "Use /dcecooldown 0, 5m, 15m or 1h (0 to 1 hour, in whole seconds).")
+			return
+		}
+		cfg.DCECooldownSeconds = int(duration / time.Second)
+		if err := b.store.SaveConfig(cfg); err != nil {
+			b.sendTextMessage(ctx, chatID, "Failed to save configuration: "+err.Error())
+			return
+		}
+		if b.scheduler != nil {
+			b.scheduler.Wake()
+		}
+	}
+	value := cfg.DCECooldown().String()
+	if cfg.DCECooldownSeconds == 0 {
+		value = "0 (disabled)"
+	}
+	b.sendTextMessage(ctx, chatID, "DCE cooldown: "+value+"\nChange with /dcecooldown 0, 5m, 15m or 1h.\nScheduled times target delivery; collection starts earlier.")
 }

@@ -1,9 +1,12 @@
 package dce
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +16,8 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
+	"time"
 )
 
 // Fixtures exercise only HTTP and filesystem paths. The process hook fails if called.
@@ -290,4 +295,204 @@ func TestUnpinRejectedLatestRetainsRollback(t *testing.T) {
 	if mgr.State().PinnedVersion != "" || mgr.State().ActiveVersion != "2.48" || mgr.State().RejectedVersion != "2.50" {
 		t.Fatal("returning to automatic updates lost rollback or retained pin")
 	}
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type stalledBody struct {
+	ctx    context.Context
+	prefix bool
+	closed *int
+}
+
+func (b *stalledBody) Read(p []byte) (int, error) {
+	if !b.prefix {
+		b.prefix = true
+		return copy(p, "partial"), nil
+	}
+	<-b.ctx.Done()
+	return 0, b.ctx.Err()
+}
+func (b *stalledBody) Close() error { *b.closed++; return nil }
+
+func TestMetadataDeadlineIsSeparateFromAssetDeadline(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client := NewReleaseClient()
+		if client.HTTPClient.Timeout != 0 {
+			t.Fatal("shared whole-response timeout")
+		}
+		client.HTTPClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) { <-r.Context().Done(); return nil, r.Context().Err() })
+		start := time.Now()
+		_, err := client.FetchRelease(context.Background(), "")
+		if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) != 30*time.Second {
+			t.Fatalf("metadata deadline: %v %v", err, time.Since(start))
+		}
+	})
+}
+
+func TestSlowAssetSucceedsAndParentDeadlineWins(t *testing.T) {
+	for _, shortParent := range []bool{false, true} {
+		synctest.Test(t, func(t *testing.T) {
+			payload := "complete"
+			client := NewReleaseClient()
+			calls := 0
+			client.HTTPClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				select {
+				case <-r.Context().Done():
+					return nil, r.Context().Err()
+				case <-time.After(150 * time.Second):
+					return &http.Response{StatusCode: 200, Body: io.NopCloser(strings.NewReader(payload)), Header: make(http.Header)}, nil
+				}
+			})
+			limit := PreparationTimeout
+			if shortParent {
+				limit = time.Minute
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), limit)
+			defer cancel()
+			start := time.Now()
+			err := client.DownloadAndVerify(ctx, GitHubAsset{BrowserDownloadURL: "https://example.invalid/a", Digest: fmt.Sprintf("sha256:%x", sha256.Sum256([]byte(payload)))}, filepath.Join(t.TempDir(), "asset.zip"))
+			if calls != 1 {
+				t.Fatal("unexpected retry", calls)
+			}
+			if shortParent {
+				if !errors.Is(err, context.DeadlineExceeded) || time.Since(start) != time.Minute {
+					t.Fatal("parent deadline ignored", err)
+				}
+			} else if err != nil || time.Since(start) != 150*time.Second {
+				t.Fatal("slow transfer rejected", err)
+			}
+		})
+	}
+}
+
+func TestAssetStallRetriesFreshAndRemainsBounded(t *testing.T) {
+	for _, recover := range []bool{true, false} {
+		synctest.Test(t, func(t *testing.T) {
+			payload := []byte("verified complete archive")
+			asset := GitHubAsset{BrowserDownloadURL: "https://example.invalid/asset", Digest: fmt.Sprintf("sha256:%x", sha256.Sum256(payload))}
+			target := filepath.Join(t.TempDir(), "archive.zip")
+			if err := os.WriteFile(target, []byte("existing"), 0600); err != nil {
+				t.Fatal(err)
+			}
+			calls, closed := 0, 0
+			client := NewReleaseClient()
+			client.HTTPClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				old, err := os.ReadFile(target)
+				if err != nil || string(old) != "existing" {
+					t.Fatal("partial target exposed")
+				}
+				deadline, ok := r.Context().Deadline()
+				if !ok || deadline.Sub(time.Now()) != 3*time.Minute {
+					t.Fatal("wrong asset deadline")
+				}
+				var body io.ReadCloser = &stalledBody{ctx: r.Context(), closed: &closed}
+				if recover && calls == 2 {
+					body = io.NopCloser(bytes.NewReader(payload))
+				}
+				return &http.Response{StatusCode: 200, Body: body, Header: make(http.Header)}, nil
+			})
+			start := time.Now()
+			err := client.DownloadAndVerify(context.Background(), asset, target)
+			got, _ := os.ReadFile(target)
+			if recover {
+				if err != nil || calls != 2 || closed != 1 || !bytes.Equal(got, payload) || time.Since(start) != 3*time.Minute+2*time.Second {
+					t.Fatalf("recovery: %v calls=%d closed=%d elapsed=%v", err, calls, closed, time.Since(start))
+				}
+			} else {
+				if err == nil || !strings.Contains(err.Error(), "3 attempts") || calls != 3 || closed != 3 || string(got) != "existing" || time.Since(start) != 9*time.Minute+6*time.Second {
+					t.Fatalf("exhaustion: %v calls=%d closed=%d elapsed=%v", err, calls, closed, time.Since(start))
+				}
+			}
+			if _, err := os.Stat(target + ".download.tmp"); !os.IsNotExist(err) {
+				t.Fatal("partial file left behind")
+			}
+		})
+	}
+}
+
+func TestDownloadCancellationStopsBodyAndRetryWait(t *testing.T) {
+	for _, duringBody := range []bool{true, false} {
+		synctest.Test(t, func(t *testing.T) {
+			calls, closed := 0, 0
+			client := NewReleaseClient()
+			client.HTTPClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+				calls++
+				if !duringBody {
+					return &http.Response{StatusCode: 503, Body: io.NopCloser(strings.NewReader("")), Header: make(http.Header)}, nil
+				}
+				return &http.Response{StatusCode: 200, Body: &stalledBody{ctx: r.Context(), closed: &closed}, Header: make(http.Header)}, nil
+			})
+			ctx, cancel := context.WithCancel(context.Background())
+			target := filepath.Join(t.TempDir(), "asset.zip")
+			done := make(chan error, 1)
+			go func() {
+				done <- client.DownloadAndVerify(ctx, GitHubAsset{BrowserDownloadURL: "https://example.invalid/a", Digest: "sha256:" + strings.Repeat("0", 64)}, target)
+			}()
+			synctest.Wait()
+			at := time.Now()
+			cancel()
+			if err := <-done; !errors.Is(err, context.Canceled) {
+				t.Fatal(err)
+			}
+			if calls != 1 || !time.Now().Equal(at) || (duringBody && closed != 1) {
+				t.Fatal("cancel delayed/retried", calls, closed)
+			}
+			if _, err := os.Stat(target); !os.IsNotExist(err) {
+				t.Fatal("canceled target exposed")
+			}
+			if _, err := os.Stat(target + ".download.tmp"); !os.IsNotExist(err) {
+				t.Fatal("partial left behind")
+			}
+		})
+	}
+}
+
+func TestFailedTransferNeverBecomesCandidate(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		client := NewReleaseClient()
+		payload, digest := makeMockDCEZip(t, "linux")
+		calls, closed := 0, 0
+		client.HTTPClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			var body io.ReadCloser
+			if strings.HasSuffix(r.URL.Path, "/latest") {
+				data, _ := json.Marshal(GitHubRelease{TagName: "2.50", Assets: []GitHubAsset{{Name: "DiscordChatExporter.Cli.linux-x64.zip", BrowserDownloadURL: "https://example.invalid/asset", Digest: "sha256:" + digest}}})
+				body = io.NopCloser(bytes.NewReader(data))
+			} else {
+				calls++
+				body = &stalledBody{ctx: r.Context(), closed: &closed}
+			}
+			return &http.Response{StatusCode: 200, Body: body, Header: make(http.Header)}, nil
+		})
+		m, err := NewManager(t.TempDir(), "", "fake", WithPlatform("linux", "amd64"), WithReleaseClient(client), WithCommandRunner(func(context.Context, string, []string, []string, io.Writer, io.Writer) error {
+			t.Fatal("installer executed DCE")
+			return nil
+		}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), PreparationTimeout)
+		defer cancel()
+		if err := m.Ensure(ctx, ""); err == nil || calls != 3 || m.IsConfigured() {
+			t.Fatalf("failed install: %v calls=%d state=%+v", err, calls, m.State())
+		}
+		if entries, _ := os.ReadDir(filepath.Join(m.dataDir, "dce", "versions")); len(entries) != 0 {
+			t.Fatal("partial candidate files")
+		}
+		// Positive control: the identical fixture becomes a candidate when complete.
+		transport := client.HTTPClient.Transport
+		client.HTTPClient.Transport = roundTripFunc(func(r *http.Request) (*http.Response, error) {
+			if strings.HasSuffix(r.URL.Path, "/latest") {
+				return transport.RoundTrip(r)
+			}
+			return &http.Response{StatusCode: 200, Body: io.NopCloser(bytes.NewReader(payload)), Header: make(http.Header)}, nil
+		})
+		if err := m.Ensure(ctx, ""); err != nil || m.State().CandidatePath == "" || m.State().ActivePath != "" {
+			t.Fatalf("verified fixture not staged: %v", err)
+		}
+	})
 }

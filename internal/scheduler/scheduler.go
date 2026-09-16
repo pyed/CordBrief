@@ -10,7 +10,7 @@ import (
 )
 
 // TriggerFunc invokes a brief run. It returns true if started, false if skipped (e.g. collision).
-type TriggerFunc func(ctx context.Context) bool
+type TriggerFunc func(ctx context.Context, deliveryAt time.Time) bool
 
 // Option configures Scheduler instances.
 type Option func(*Scheduler)
@@ -62,7 +62,7 @@ func NextRun(now time.Time, loc *time.Location, hour, minute int) time.Time {
 	return candidate.AddDate(0, 0, 1)
 }
 
-// NextRunForConfig calculates the next scheduled execution time from a Config and a reference time.
+// NextRunForConfig calculates the next scheduled delivery time.
 // It returns (nextTime, enabled, error).
 func NextRunForConfig(cfg *state.Config, now time.Time) (time.Time, bool, error) {
 	if cfg == nil || !cfg.Schedule.Enabled {
@@ -81,6 +81,7 @@ func NextRunForConfig(cfg *state.Config, now time.Time) (time.Time, bool, error)
 
 // Run executes the scheduler loop until ctx is canceled.
 func (s *Scheduler) Run(ctx context.Context) {
+	var lastTarget time.Time
 	for {
 		cfg, err := s.store.LoadConfig()
 		if err != nil {
@@ -95,7 +96,11 @@ func (s *Scheduler) Run(ctx context.Context) {
 			}
 		}
 
-		nextTime, enabled, err := NextRunForConfig(cfg, s.now())
+		reference := s.now()
+		if lastTarget.After(reference) {
+			reference = lastTarget
+		}
+		nextTime, enabled, err := NextRunForConfig(cfg, reference)
 		if err != nil {
 			log.Printf("[scheduler] invalid schedule config: %v", err)
 			select {
@@ -115,7 +120,7 @@ func (s *Scheduler) Run(ctx context.Context) {
 			}
 		}
 
-		delay := nextTime.Sub(s.now())
+		delay := PreparationTime(cfg, nextTime).Sub(s.now())
 		if delay < 0 {
 			delay = 0
 		}
@@ -129,19 +134,21 @@ func (s *Scheduler) Run(ctx context.Context) {
 			timer.Stop()
 			continue
 		case <-timer.C:
+			lastTarget = nextTime
 			if s.trigger != nil {
-				if !s.trigger(ctx) {
+				if !s.trigger(ctx, nextTime) {
 					log.Println("[scheduler] skipping scheduled brief: job already running")
-				}
-			}
-			// If timer fired microseconds early, wait until nextTime is strictly past
-			if remaining := nextTime.Sub(s.now()); remaining > 0 {
-				select {
-				case <-ctx.Done():
-					return
-				case <-time.After(remaining + 10*time.Millisecond):
 				}
 			}
 		}
 	}
+}
+
+// PreparationTime budgets one slot per channel, leaving the final slot for
+// summarization. Even with spacing disabled, allow a minute per channel.
+func PreparationTime(cfg *state.Config, deliveryAt time.Time) time.Time {
+	lead := time.Duration(len(cfg.Channels)) * max(cfg.DCECooldown(), time.Minute)
+	// ponytail: at most one day's lookahead; jobs that cannot fit still deliver late.
+	lead = min(lead, 24*time.Hour-time.Minute)
+	return deliveryAt.Add(-lead)
 }

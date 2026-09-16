@@ -48,7 +48,8 @@ func (s *Store) LoadConfig() (*Config, error) {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
 
-	var cfg Config
+	// Missing cooldown in older configs gets the default; explicit zero stays disabled.
+	cfg := Config{DCECooldownSeconds: DefaultDCECooldownSeconds}
 	if err := decodeStrictJSON(data, &cfg); err != nil {
 		return nil, fmt.Errorf("decode config: %w", err)
 	}

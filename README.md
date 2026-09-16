@@ -25,7 +25,7 @@ Discord catch-up briefs, delivered to your private Telegram chat. Follow channel
 
 Input is hidden. CordBrief saves your credentials and automatically downloads the appropriate official DiscordChatExporter CLI. Keep CordBrief running for scheduled briefs. Ctrl+C stops it.
 
-The first installation needs access to GitHub. Later starts reuse the downloaded copy, so GitHub being unavailable does not prevent startup. The exporter may still require the system libraries listed in its platform documentation.
+The first installation needs access to GitHub. Metadata requests have a 30-second deadline. Release assets get up to three fresh download attempts, each limited to 3 minutes, with short waits between transient failures. Startup preparation is limited to 10 minutes and Ctrl+C cancels it. Every attempt must pass SHA-256 verification; partial downloads are discarded. Later starts reuse the downloaded copy, so GitHub being unavailable does not prevent startup. The exporter may still require the system libraries listed in its platform documentation.
 
 ## Get your first brief
 
@@ -43,13 +43,26 @@ Replace the example with your channel ID. Choose **From now** or **Last 24 hours
 | `/brief [channel_id]` | Summarize all followed channels, or one channel. |
 | `/channels` | List followed channels. |
 | `/unfollow [channel_id]` | Stop following a channel after confirmation. |
-| `/schedule 08:00 Asia/Riyadh` | Enable a daily brief at that local time. |
+| `/schedule 08:00 Asia/Riyadh` | Target daily brief delivery around that local time; preparation starts earlier. |
 | `/schedule off` | Disable daily briefs; `/schedule` shows the current setting. |
+| `/dcecooldown [0\|5m\|15m\|1h]` | Show or save the minimum interval between DCE export starts (default 15m; 0 disables it; maximum 1h). |
 | `/model [model_id]` | Browse models or set one directly. |
 | `/prompt` | View/edit instructions; `/prompt reset` restores the default. |
 | `/status` | Show settings, exporter version, and current job status. |
 
 Scheduling starts disabled, with UTC as the initial timezone. Only the configured owner can control CordBrief, in a private Telegram chat.
+
+### Export spacing and scheduled delivery
+
+`/dcecooldown` reports the current interval. For example, `/dcecooldown 5m` saves five minutes; `/dcecooldown 0` disables spacing. Whole-second durations from 0 to 1 hour are accepted. The setting is stored in `config.json`; older configurations default to 15 minutes. The last export-start time also survives restarts. Failed exports and candidate rollback attempts share this interval. Configuration changes are frozen while a brief is running.
+
+A manual `/brief` starts immediately unless a previous export's cooldown is still active. Channels are handled sequentially: collect, summarize, deliver, then collect the next channel when its slot is available. Summarization and delivery use the time between export starts; they do not add another full cooldown afterward.
+
+Scheduled times mean **delivery around that time**. CordBrief starts preparation one interval per followed channel ahead of delivery, using at least one minute per channel when the cooldown is shorter. With four channels, a 15-minute cooldown and a 12:00 schedule, exports normally start around 11:00, 11:15, 11:30 and 11:45. All channels finish preparation before delivery begins at 12:00. Slow exports or summaries can make delivery late; CordBrief finishes preparation rather than sending unfinished work at the deadline. Preparation looks ahead at most one day.
+
+Each channel's freshness boundary is its own export time. Earlier channels are **not exported again** at delivery time. A channel's cursor advances only to the highest collected message ID, and only after every part of that channel's brief has been delivered successfully. Later arrivals remain for the next brief. Failed channels retain their cursors and report an error; other channels can succeed independently.
+
+Keep the app running for scheduled delivery. Prepared text is held in memory; restarting discards it without consuming messages. Starting inside the preparation window begins collection immediately and may deliver late. An already-running brief keeps the existing single-job behavior: a colliding scheduled run is skipped, and undelivered messages remain available for the next brief.
 
 ## Credentials and headless operation
 

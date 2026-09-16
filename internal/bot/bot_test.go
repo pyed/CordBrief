@@ -980,7 +980,7 @@ func TestSchedule_View(t *testing.T) {
 	if msg == nil {
 		t.Fatal("expected message sent for /schedule")
 	}
-	expected := "Daily brief: enabled\nTime: 08:00\nTimezone: UTC\nNext run: 2026-09-15 08:00 +00"
+	expected := "Daily brief: enabled\nTime: 08:00\nTimezone: UTC\nNext delivery: 2026-09-15 08:00 +00"
 	if msg.Text != expected {
 		t.Errorf("got:\n%s\nwant:\n%s", msg.Text, expected)
 	}
@@ -991,7 +991,7 @@ func TestSchedule_View(t *testing.T) {
 
 	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/schedule"))
 	msg = sender.lastSent()
-	expectedDisabled := "Daily brief: disabled\nTime: 08:00\nTimezone: UTC\nNext run: none"
+	expectedDisabled := "Daily brief: disabled\nTime: 08:00\nTimezone: UTC\nNext delivery: none"
 	if msg.Text != expectedDisabled {
 		t.Errorf("got:\n%s\nwant:\n%s", msg.Text, expectedDisabled)
 	}
@@ -1198,7 +1198,7 @@ func TestSchedule_LegacyM5Upgrade_SafeByDefaultAndExplicitOptIn(t *testing.T) {
 	// 3. /schedule reports disabled
 	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/schedule"))
 	msg := sender.lastSent()
-	if msg == nil || !strings.Contains(msg.Text, "Daily brief: disabled") || !strings.Contains(msg.Text, "Next run: none") {
+	if msg == nil || !strings.Contains(msg.Text, "Daily brief: disabled") || !strings.Contains(msg.Text, "Next delivery: none") {
 		t.Fatalf("expected /schedule to report disabled, got: %v", msg)
 	}
 
@@ -1281,7 +1281,7 @@ func TestSchedule_LegacyM5Upgrade_SafeByDefaultAndExplicitOptIn(t *testing.T) {
 	// 7. /schedule off disables it durably
 	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/schedule off"))
 	msg = sender.lastSent()
-	if msg == nil || !strings.Contains(msg.Text, "Daily brief: disabled") || !strings.Contains(msg.Text, "Next run: none") {
+	if msg == nil || !strings.Contains(msg.Text, "Daily brief: disabled") || !strings.Contains(msg.Text, "Next delivery: none") {
 		t.Fatalf("expected /schedule off to report disabled, got: %v", msg)
 	}
 
@@ -1289,5 +1289,52 @@ func TestSchedule_LegacyM5Upgrade_SafeByDefaultAndExplicitOptIn(t *testing.T) {
 	offCfg, _ := offStore.LoadConfig()
 	if offCfg.Schedule.Enabled {
 		t.Fatal("schedule off did not persist to disk")
+	}
+}
+
+func TestDCECooldownCommand(t *testing.T) {
+	b, sender, store, _ := setupTestBot(t)
+	ctx := context.Background()
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/dcecooldown"))
+	if !strings.Contains(sender.lastSent().Text, "15m") {
+		t.Fatal(sender.lastSent().Text)
+	}
+	for _, tc := range []struct {
+		arg     string
+		seconds int
+		report  string
+	}{
+		{"0", 0, "disabled"}, {"5m", 300, "5m"}, {"15m", 900, "15m"}, {"1h", 3600, "1h"},
+	} {
+		b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/dcecooldown "+tc.arg))
+		cfg, err := state.NewStore(store.DataDir()).LoadConfig()
+		if err != nil || cfg.DCECooldownSeconds != tc.seconds {
+			t.Fatalf("%s: %v %v", tc.arg, cfg, err)
+		}
+		b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/dcecooldown"))
+		if !strings.Contains(sender.lastSent().Text, tc.report) {
+			t.Fatal(sender.lastSent().Text)
+		}
+	}
+	for _, arg := range []string{"61m", "-1s", "invalid", "1", "1m extra", "0.5s"} {
+		b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/dcecooldown "+arg))
+		if !strings.Contains(sender.lastSent().Text, "Use /dcecooldown") {
+			t.Fatal(sender.lastSent().Text)
+		}
+		cfg, _ := store.LoadConfig()
+		if cfg.DCECooldownSeconds != 3600 {
+			t.Fatal("invalid command mutated config")
+		}
+	}
+	for _, msg := range []struct {
+		owner int64
+		chat  string
+	}{{12346, "private"}, {12345, "group"}} {
+		before := sender.sentCount()
+		b.HandleUpdate(ctx, nil, makeMsg(msg.owner, msg.chat, "/dcecooldown 0"))
+		cfg, _ := store.LoadConfig()
+		if cfg.DCECooldownSeconds != 3600 || sender.sentCount() != before {
+			t.Fatal("unauthorized change")
+		}
 	}
 }

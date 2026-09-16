@@ -138,7 +138,7 @@ func New(appCtx context.Context, cfg *EnvConfig, store *state.Store, opts ...Opt
 		if err != nil {
 			return nil, fmt.Errorf("initialize DCE: %s", cfg.Redact(err.Error()))
 		}
-		installCtx, cancel := context.WithTimeout(appCtx, 3*time.Minute)
+		installCtx, cancel := context.WithTimeout(appCtx, dce.PreparationTimeout)
 		err = mgr.Ensure(installCtx, cfg.DCEVersion)
 		cancel()
 		if err != nil {
@@ -183,11 +183,11 @@ func New(appCtx context.Context, cfg *EnvConfig, store *state.Store, opts ...Opt
 
 	// Initialize scheduler if not set via WithScheduler
 	if b.scheduler == nil {
-		b.scheduler = scheduler.New(store, func(ctx context.Context) bool {
+		b.scheduler = scheduler.New(store, func(ctx context.Context, deliveryAt time.Time) bool {
 			if b.runner == nil {
 				return false
 			}
-			return b.runner.Start(ctx, "")
+			return b.runner.StartScheduled(ctx, deliveryAt)
 		}, scheduler.WithNow(b.now))
 	}
 

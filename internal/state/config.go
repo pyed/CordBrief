@@ -9,12 +9,13 @@ import (
 
 // Default non-secret configuration values.
 const (
-	DefaultLLMBaseURL   = "https://generativelanguage.googleapis.com/v1beta/openai/"
-	DefaultLLMModel     = "gemini-3.8-flash"
-	DefaultTimezone     = "UTC"
-	DefaultSchedule     = "08:00"
-	DefaultBriefPrompt  = "Create a short, high-signal digest of this Discord discussion. Include only what would matter to someone catching up: important developments, decisions, conclusions, solutions, technical findings, useful recommendations, notable releases or announcements, unresolved problems, and meaningful disagreements. Group related messages into topics instead of summarizing message-by-message, and order the brief by importance. Preserve concrete details when they matter—names, versions, numbers, benchmarks, links, errors, constraints, and attribution when it changes the meaning. Omit greetings, jokes, reactions, repetition, and low-value chatter. Compress aggressively, but never omit a detail that changes the meaning, outcome, risk, or next action. If little happened, keep the brief very short rather than padding it."
-	MaxBriefPromptBytes = 8192
+	DefaultLLMBaseURL         = "https://generativelanguage.googleapis.com/v1beta/openai/"
+	DefaultLLMModel           = "gemini-3.8-flash"
+	DefaultTimezone           = "UTC"
+	DefaultSchedule           = "08:00"
+	DefaultBriefPrompt        = "Create a short, high-signal digest of this Discord discussion. Include only what would matter to someone catching up: important developments, decisions, conclusions, solutions, technical findings, useful recommendations, notable releases or announcements, unresolved problems, and meaningful disagreements. Group related messages into topics instead of summarizing message-by-message, and order the brief by importance. Preserve concrete details when they matter—names, versions, numbers, benchmarks, links, errors, constraints, and attribution when it changes the meaning. Omit greetings, jokes, reactions, repetition, and low-value chatter. Compress aggressively, but never omit a detail that changes the meaning, outcome, risk, or next action. If little happened, keep the brief very short rather than padding it."
+	MaxBriefPromptBytes       = 8192
+	DefaultDCECooldownSeconds = 15 * 60
 )
 
 // ChannelConfig represents a Discord channel followed by CordBrief.
@@ -44,12 +45,13 @@ type BriefConfig struct {
 
 // Config represents user intent stored in config.json.
 type Config struct {
-	Version  int             `json:"version"`
-	Channels []ChannelConfig `json:"channels"`
-	Schedule ScheduleConfig  `json:"schedule"`
-	Timezone string          `json:"timezone"`
-	LLM      LLMConfig       `json:"llm"`
-	Brief    *BriefConfig    `json:"brief,omitempty"`
+	Version            int             `json:"version"`
+	Channels           []ChannelConfig `json:"channels"`
+	Schedule           ScheduleConfig  `json:"schedule"`
+	Timezone           string          `json:"timezone"`
+	LLM                LLMConfig       `json:"llm"`
+	Brief              *BriefConfig    `json:"brief,omitempty"`
+	DCECooldownSeconds int             `json:"dce_cooldown_seconds"`
 }
 
 // CurrentConfigVersion defines the active config.json schema version.
@@ -61,8 +63,9 @@ const CurrentConfigVersion = 3
 // Schedule defaults to disabled until explicitly configured by the operator.
 func DefaultConfig() *Config {
 	return &Config{
-		Version:  CurrentConfigVersion,
-		Channels: []ChannelConfig{},
+		Version:            CurrentConfigVersion,
+		DCECooldownSeconds: DefaultDCECooldownSeconds,
+		Channels:           []ChannelConfig{},
 		Schedule: ScheduleConfig{
 			Enabled: false,
 			Time:    DefaultSchedule,
@@ -77,6 +80,9 @@ func DefaultConfig() *Config {
 
 // Validate ensures all config fields satisfy required invariants.
 func (c *Config) Validate() error {
+	if c.DCECooldownSeconds < 0 || c.DCECooldownSeconds > 3600 {
+		return errors.New("DCE cooldown must be between 0 and 1 hour")
+	}
 	if c.Version != CurrentConfigVersion {
 		return fmt.Errorf("unsupported config version: %d (expected %d)", c.Version, CurrentConfigVersion)
 	}
@@ -134,6 +140,10 @@ func (c *Config) Validate() error {
 	}
 
 	return nil
+}
+
+func (c *Config) DCECooldown() time.Duration {
+	return time.Duration(c.DCECooldownSeconds) * time.Second
 }
 
 // EffectiveBriefPrompt returns the custom brief prompt if non-empty, otherwise DefaultBriefPrompt.

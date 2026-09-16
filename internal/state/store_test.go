@@ -2,10 +2,12 @@ package state
 
 import (
 	"bytes"
+	"encoding/json"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 1. Missing config loads defaults
@@ -944,4 +946,45 @@ func TestValidation_EdgeCases(t *testing.T) {
 			t.Error("expected error for trailing content after JSON")
 		}
 	})
+}
+
+func TestDCECooldownDefaultsPersistenceAndLimits(t *testing.T) {
+	store := NewStore(t.TempDir())
+	cfg, err := store.LoadConfig()
+	if err != nil || cfg.DCECooldown() != 15*time.Minute {
+		t.Fatalf("default: %v %v", cfg, err)
+	}
+	// A v3.0.1 config has no cooldown field; preserve all its other settings.
+	data, _ := json.Marshal(cfg)
+	var legacy map[string]any
+	_ = json.Unmarshal(data, &legacy)
+	delete(legacy, "dce_cooldown_seconds")
+	data, _ = json.Marshal(legacy)
+	if err := os.WriteFile(store.ConfigPath(), data, 0600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err = store.LoadConfig()
+	if err != nil || cfg.DCECooldown() != 15*time.Minute {
+		t.Fatalf("legacy: %v %v", cfg, err)
+	}
+	for _, seconds := range []int{0, 300, 900, 3600} {
+		cfg.DCECooldownSeconds = seconds
+		if err := store.SaveConfig(cfg); err != nil {
+			t.Fatal(err)
+		}
+		reloaded, err := NewStore(store.DataDir()).LoadConfig()
+		if err != nil || reloaded.DCECooldown() != time.Duration(seconds)*time.Second {
+			t.Fatalf("reload: %v %v", reloaded, err)
+		}
+	}
+	for _, seconds := range []int{-1, 3601} {
+		cfg.DCECooldownSeconds = seconds
+		if err := store.SaveConfig(cfg); err == nil {
+			t.Fatalf("accepted %d", seconds)
+		}
+		reloaded, _ := store.LoadConfig()
+		if reloaded.DCECooldownSeconds != 3600 {
+			t.Fatal("invalid write changed config")
+		}
+	}
 }

@@ -24,6 +24,7 @@ type UpdaterState struct {
 	CandidatePath    string    `json:"candidate_path,omitempty"`
 	RejectedVersion  string    `json:"rejected_version,omitempty"`
 	LastCheck        time.Time `json:"last_check"`
+	LastExport       time.Time `json:"last_export,omitempty"`
 	PinnedVersion    string    `json:"pinned_version,omitempty"`
 }
 

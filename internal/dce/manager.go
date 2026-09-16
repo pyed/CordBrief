@@ -4,12 +4,15 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/pyed/CordBrief/internal/state"
 )
 
 // Manager coordinates DiscordChatExporter execution, automatic updates, candidate probation,
@@ -197,9 +200,23 @@ func (m *Manager) Export(ctx context.Context, req ExportRequest) (*ExportResult,
 	candVer := m.state.CandidateVersion
 	m.mu.Unlock()
 
+	// Gate each actual process attempt, including a candidate rollback. The existing
+	// operation lock serializes this path with updates; no separate queue is needed.
+	attempted := false
+	run := func(ctx context.Context, name string, args, env []string, stdout, stderr io.Writer) error {
+		if err := m.reserveExport(ctx); err != nil {
+			return err
+		}
+		if req.Before.IsZero() {
+			args = append(args, "--before", m.now().UTC().Format("2006-01-02T15:04:05Z"))
+		}
+		attempted = true
+		return m.runner(ctx, name, args, env, stdout, stderr)
+	}
+
 	// If candidate exists, execute candidate on probation
 	if candPath != "" {
-		candClient := NewMockClient(candPath, m.token, m.runner)
+		candClient := NewMockClient(candPath, m.token, run)
 		res, err := candClient.Export(ctx, req)
 		if err == nil {
 			// Candidate succeeded! Promote candidate.
@@ -210,7 +227,7 @@ func (m *Manager) Export(ctx context.Context, req ExportRequest) (*ExportResult,
 		}
 
 		// If caller canceled or timed out, do not reject, do not promote, do not retry
-		if isCancellation(ctx, err) {
+		if !attempted || isCancellation(ctx, err) {
 			return nil, err
 		}
 
@@ -221,7 +238,7 @@ func (m *Manager) Export(ctx context.Context, req ExportRequest) (*ExportResult,
 
 		// Retry requested operation once with active known-good if context alive
 		if ctx.Err() == nil && activePath != "" {
-			activeClient := NewMockClient(activePath, m.token, m.runner)
+			activeClient := NewMockClient(activePath, m.token, run)
 			return activeClient.Export(ctx, req)
 		}
 		return nil, err
@@ -231,8 +248,42 @@ func (m *Manager) Export(ctx context.Context, req ExportRequest) (*ExportResult,
 	if activePath == "" {
 		return nil, errors.New("no active dce executable configured")
 	}
-	activeClient := NewMockClient(activePath, m.token, m.runner)
+	activeClient := NewMockClient(activePath, m.token, run)
 	return activeClient.Export(ctx, req)
+}
+
+// reserveExport persists the start boundary before invoking DCE, so even failed
+// attempts and application restarts retain spacing. It never touches cursors.
+func (m *Manager) reserveExport(ctx context.Context) error {
+	cfg, err := state.NewStore(m.dataDir).LoadConfig()
+	if err != nil {
+		return err
+	}
+	next := m.State()
+	if !next.LastExport.IsZero() && cfg.DCECooldown() > 0 {
+		if err := waitContext(ctx, next.LastExport.Add(cfg.DCECooldown()).Sub(m.now())); err != nil {
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	next.LastExport = m.now().UTC()
+	return m.saveState(next)
+}
+
+func waitContext(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return ctx.Err()
+	}
+	timer := time.NewTimer(delay)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
 }
 
 // saveState commits a snapshot before exposing it to exports or deleting old files.
@@ -464,7 +515,7 @@ func (m *Manager) Start(ctx context.Context) {
 				}
 			}
 
-			checkCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+			checkCtx, cancel := context.WithTimeout(ctx, PreparationTimeout)
 			_, _ = m.CheckForUpdates(checkCtx)
 			cancel()
 

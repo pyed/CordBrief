@@ -1,13 +1,18 @@
 package job
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"os"
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/pyed/CordBrief/internal/brief"
@@ -15,6 +20,80 @@ import (
 	"github.com/pyed/CordBrief/internal/llm"
 	"github.com/pyed/CordBrief/internal/state"
 )
+
+func TestDeliverChannelLogsFailureOrDurableCommit(t *testing.T) {
+	for _, outcome := range []string{"success", "delivery failure", "save failure"} {
+		t.Run(outcome, func(t *testing.T) {
+			store, _ := setupTestStore(t)
+			st := state.NewEmptyState()
+			original := state.ChannelState{Cursor: state.Cursor{Kind: state.CursorKindMessageID, Value: "1"}, LastError: "previous error"}
+			st.Channels["123"] = original
+			if err := store.SaveState(st); err != nil {
+				t.Fatal(err)
+			}
+
+			var logs bytes.Buffer
+			previous := log.Writer()
+			log.SetOutput(&logs)
+			defer log.SetOutput(previous)
+			const secret = "test-api-key"
+			calls := 0
+			deliverer := &FakeDeliverer{deliverFunc: func(context.Context, string) error {
+				calls++
+				if strings.Contains(logs.String(), "successfully delivered brief") {
+					t.Fatal("success logged before durable commit")
+				}
+				current, err := store.LoadState()
+				if err != nil || current.Channels["123"].Cursor != original.Cursor {
+					t.Fatal("cursor advanced before all parts succeeded", err)
+				}
+				if outcome == "delivery failure" && calls == 2 {
+					return errors.New("send failed: " + secret)
+				}
+				return nil
+			}}
+			r, err := NewRunner(store, WithDeliverer(deliverer), WithLLMAPIKey(secret))
+			if err != nil {
+				t.Fatal(err)
+			}
+			result := &preparedChannel{channel: state.ChannelConfig{ID: "123", Name: "general"}, parts: []string{"part 1", "part 2"}, maxMessageID: "2"}
+			if outcome == "save failure" {
+				// Invalid cursor forces SaveState validation to fail on every platform.
+				result.maxMessageID = "invalid"
+			}
+			r.deliverChannel(context.Background(), result)
+			current, err := store.LoadState()
+			if err != nil {
+				t.Fatal(err)
+			}
+			failure := "[job] Telegram delivery failed for #general (123): send failed: [REDACTED]"
+			success := "[job] successfully delivered brief and committed cursor 2 for #general (123)"
+			if strings.Contains(logs.String(), secret) {
+				t.Fatal("secret leaked in log")
+			}
+			switch outcome {
+			case "success":
+				if strings.Count(logs.String(), success) != 1 || current.Channels["123"].Cursor.Value != "2" || current.Channels["123"].LastError != "" || calls != 2 {
+					t.Fatal("missing successful durable commit", logs.String(), current)
+				}
+			case "delivery failure":
+				if strings.Count(logs.String(), failure) != 1 || current.Channels["123"].Cursor != original.Cursor || current.Channels["123"].LastError != "send failed: [REDACTED]" || calls != 2 {
+					t.Fatal("failure log or state incorrect", logs.String(), current)
+				}
+			case "save failure":
+				if current.Channels["123"] != original || calls != 3 || !strings.Contains(deliverer.GetMessages()[2], "Warning: saving state failed") {
+					t.Fatal("save failure changed state or lost warning", current)
+				}
+			}
+			if outcome != "success" && strings.Contains(logs.String(), "successfully delivered brief") {
+				t.Fatal("false commit log", logs.String())
+			}
+			if outcome != "delivery failure" && strings.Contains(logs.String(), "Telegram delivery failed") {
+				t.Fatal("false delivery failure log", logs.String())
+			}
+		})
+	}
+}
 
 // FakeDCE implements DCEExporter for unit tests.
 type FakeDCE struct {
@@ -155,7 +234,7 @@ func TestRunner_SingleJobAtATime(t *testing.T) {
 	}
 }
 
-func TestRunner_FixedCutoffSharedAcrossChannels(t *testing.T) {
+func TestRunner_CollectorChoosesCutoffForEachChannel(t *testing.T) {
 	store, _ := setupTestStore(t)
 	fixedTime := time.Date(2026, 9, 14, 15, 0, 0, 0, time.UTC)
 
@@ -201,9 +280,9 @@ func TestRunner_FixedCutoffSharedAcrossChannels(t *testing.T) {
 		t.Fatalf("channels not processed in config order: %v, %v", fakeDCE.exports[0].ChannelID, fakeDCE.exports[1].ChannelID)
 	}
 
-	// Shared cutoff
-	if !fakeDCE.exports[0].Before.Equal(fixedTime) || !fakeDCE.exports[1].Before.Equal(fixedTime) {
-		t.Fatalf("cutoff mismatch: %v vs %v (expected %v)", fakeDCE.exports[0].Before, fakeDCE.exports[1].Before, fixedTime)
+	// The collector chooses the boundary after waiting for its actual DCE slot.
+	if !fakeDCE.exports[0].Before.IsZero() || !fakeDCE.exports[1].Before.IsZero() {
+		t.Fatal("runner pinned the cutoff before collection")
 	}
 
 	// Exact cursors preserved
@@ -866,5 +945,188 @@ func TestRunner_ServerHeadingFormatting(t *testing.T) {
 	expected3 := "LocalLLM · #empty-zero-msgs\nNo new messages."
 	if msgs[2] != expected3 {
 		t.Errorf("channel 1003:\ngot:  %q\nwant: %q", msgs[2], expected3)
+	}
+}
+
+func TestBriefTimingAndFreshness(t *testing.T) {
+	for _, mode := range []string{"manual", "scheduled", "overrun"} {
+		t.Run(mode, func(t *testing.T) {
+			synctest.Test(t, func(t *testing.T) {
+				store, dir := setupTestStore(t)
+				cfg := state.DefaultConfig()
+				st := state.NewEmptyState()
+				for i := 1; i <= 4; i++ {
+					id := fmt.Sprint(i)
+					cfg.Channels = append(cfg.Channels, state.ChannelConfig{ID: id, Name: id})
+					st.Channels[id] = state.ChannelState{Cursor: state.Cursor{Kind: state.CursorKindMessageID, Value: "1"}}
+				}
+				if err := store.SaveConfig(cfg); err != nil {
+					t.Fatal(err)
+				}
+				if err := store.SaveState(st); err != nil {
+					t.Fatal(err)
+				}
+				start := time.Now()
+				work := 2 * time.Minute
+				if mode == "overrun" {
+					work = 20 * time.Minute
+				}
+				var exports, summaries, deliveries []time.Time
+				var afters []string
+				nextBrief := false
+				unchanged := func() {
+					if mode == "manual" || nextBrief {
+						return
+					}
+					current, err := store.LoadState()
+					if err != nil {
+						t.Fatal(err)
+					}
+					for _, ch := range current.Channels {
+						if ch.Cursor.Value != "1" {
+							t.Fatal("cursor advanced during preparation")
+						}
+					}
+				}
+				manager, err := dce.NewManager(dir, "fake-dce", "fake-token", dce.WithBootstrapVersion("2.48"),
+					dce.WithCommandRunner(func(ctx context.Context, name string, args, env []string, stdout, stderr io.Writer) error {
+						unchanged()
+						values := map[string]string{}
+						for i := 0; i+1 < len(args); i++ {
+							values[args[i]] = args[i+1]
+						}
+						exports = append(exports, time.Now())
+						afters = append(afters, values["--after"])
+						cutoff, err := time.Parse(time.RFC3339, values["--before"])
+						if err != nil || !cutoff.Equal(time.Now()) {
+							t.Fatalf("actual export cutoff: %v %v", cutoff, err)
+						}
+						messages := []map[string]any{}
+						for _, message := range []struct {
+							id string
+							at time.Time
+						}{{"10", start.Add(-time.Minute)}, {"11", start.Add(5 * time.Minute)}} {
+							if message.id == "11" && values["-c"] != "1" {
+								continue
+							}
+							if dce.CompareSnowflake(message.id, values["--after"]) > 0 && message.at.Before(cutoff) {
+								messages = append(messages, map[string]any{"id": message.id, "timestamp": message.at, "content": "message " + message.id})
+							}
+						}
+						data, _ := json.Marshal(map[string]any{"channel": map[string]string{"id": values["-c"]}, "messages": messages})
+						return os.WriteFile(values["-o"], data, 0600)
+					}))
+				if err != nil {
+					t.Fatal(err)
+				}
+				completer := &FakeCompleter{completeFunc: func(context.Context, []llm.Message) (string, error) {
+					unchanged()
+					summaries = append(summaries, time.Now())
+					time.Sleep(work)
+					return "Summary", nil
+				}}
+				deliverer := &FakeDeliverer{deliverFunc: func(context.Context, string) error {
+					if len(deliveries) == 0 {
+						unchanged()
+					}
+					deliveries = append(deliveries, time.Now())
+					return nil
+				}}
+				r, err := NewRunner(store, WithDCEClient(manager), WithDeliverer(deliverer), WithCompleterFactory(func(string, string, string) (brief.Completer, error) { return completer, nil }))
+				if err != nil {
+					t.Fatal(err)
+				}
+				if mode == "manual" {
+					if err := r.Run(context.Background(), ""); err != nil {
+						t.Fatal(err)
+					}
+				} else {
+					if !r.StartScheduled(context.Background(), start.Add(time.Hour)) {
+						t.Fatal("not started")
+					}
+					r.Wait()
+				}
+				if len(exports) != 4 || len(summaries) != 4 || len(deliveries) != 4 {
+					t.Fatalf("exports=%v summaries=%v deliveries=%v", exports, summaries, deliveries)
+				}
+				for i := range 4 {
+					want := start.Add(time.Duration(i) * max(15*time.Minute, work))
+					if !exports[i].Equal(want) || !summaries[i].Equal(want) {
+						t.Fatal("LLM work did not use cooldown window", exports, summaries)
+					}
+					delivery := want.Add(work)
+					if mode != "manual" {
+						delivery = start.Add(max(time.Hour, 4*work))
+					}
+					if !deliveries[i].Equal(delivery) {
+						t.Fatalf("delivery %d: %v want %v", i, deliveries[i], delivery)
+					}
+				}
+				current, _ := store.LoadState()
+				if current.Channels["1"].Cursor.Value != "10" {
+					t.Fatal("early channel consumed a later arrival")
+				}
+				nextBrief = true
+				if err := r.Run(context.Background(), "1"); err != nil {
+					t.Fatal(err)
+				}
+				current, _ = store.LoadState()
+				if len(exports) != 5 || afters[4] != "10" || current.Channels["1"].Cursor.Value != "11" {
+					t.Fatal("later arrival was lost or channel re-exported at delivery")
+				}
+			})
+		})
+	}
+}
+
+func TestScheduledCancellationAndPartialDeliveryKeepCursor(t *testing.T) {
+	for _, cancelWhileWaiting := range []bool{true, false} {
+		synctest.Test(t, func(t *testing.T) {
+			store, _ := setupTestStore(t)
+			cfg := state.DefaultConfig()
+			cfg.Channels = []state.ChannelConfig{{ID: "1", Name: "one"}}
+			if err := store.SaveConfig(cfg); err != nil {
+				t.Fatal(err)
+			}
+			st := state.NewEmptyState()
+			st.Channels["1"] = state.ChannelState{Cursor: state.Cursor{Kind: state.CursorKindMessageID, Value: "1"}}
+			if err := store.SaveState(st); err != nil {
+				t.Fatal(err)
+			}
+			exporter := &FakeDCE{configured: true, exportFunc: func(context.Context, dce.ExportRequest) (*dce.ExportResult, error) {
+				return &dce.ExportResult{Messages: []dce.Message{{ID: "2", Content: "update"}}, MaxMessageID: "2"}, nil
+			}}
+			comp := &FakeCompleter{completeFunc: func(context.Context, []llm.Message) (string, error) { return strings.Repeat("summary ", 1000), nil }}
+			calls := 0
+			del := &FakeDeliverer{deliverFunc: func(context.Context, string) error {
+				calls++
+				current, _ := store.LoadState()
+				if current.Channels["1"].Cursor.Value != "1" {
+					t.Fatal("early commit")
+				}
+				if calls == 2 {
+					return fmt.Errorf("send failed")
+				}
+				return nil
+			}}
+			r, _ := NewRunner(store, WithDCEClient(exporter), WithDeliverer(del), WithCompleterFactory(func(string, string, string) (brief.Completer, error) { return comp, nil }))
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			if !r.StartScheduled(ctx, time.Now().Add(time.Hour)) {
+				t.Fatal("not started")
+			}
+			if cancelWhileWaiting {
+				synctest.Wait()
+				cancel()
+			}
+			r.Wait()
+			current, _ := store.LoadState()
+			if current.Channels["1"].Cursor.Value != "1" {
+				t.Fatal("cursor consumed undelivered brief")
+			}
+			if (cancelWhileWaiting && calls != 0) || (!cancelWhileWaiting && calls != 2) {
+				t.Fatal("unexpected sends", calls)
+			}
+		})
 	}
 }

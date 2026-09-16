@@ -21,7 +21,7 @@ func DefaultCompleterFactory(baseURL, model, apiKey string) (brief.Completer, er
 }
 
 // Runner coordinates the end-to-end brief transaction:
-// followed channel + persisted cursor -> fixed cutoff -> DCE export -> brief engine -> Telegram delivery -> commit cursor.
+// followed channel + persisted cursor -> DCE export -> brief engine -> Telegram delivery -> commit cursor.
 type Runner struct {
 	store            *state.Store
 	dceClient        DCEExporter
@@ -106,10 +106,19 @@ func (r *Runner) acquire() bool {
 
 // Start atomically claims and launches a background job using the application context.
 func (r *Runner) Start(ctx context.Context, targetChannelID string) bool {
+	return r.start(ctx, targetChannelID, time.Time{})
+}
+
+// StartScheduled prepares now and holds all channel briefs until deliveryAt.
+func (r *Runner) StartScheduled(ctx context.Context, deliveryAt time.Time) bool {
+	return r.start(ctx, "", deliveryAt)
+}
+
+func (r *Runner) start(ctx context.Context, targetChannelID string, deliveryAt time.Time) bool {
 	if !r.acquire() {
 		return false
 	}
-	go func() { _ = r.run(ctx, targetChannelID) }()
+	go func() { _ = r.run(ctx, targetChannelID, deliveryAt) }()
 	return true
 }
 
@@ -137,10 +146,10 @@ func (r *Runner) Run(ctx context.Context, targetChannelID string) error {
 	if !r.acquire() {
 		return errors.New("brief already running")
 	}
-	return r.run(ctx, targetChannelID)
+	return r.run(ctx, targetChannelID, time.Time{})
 }
 
-func (r *Runner) run(ctx context.Context, targetChannelID string) error {
+func (r *Runner) run(ctx context.Context, targetChannelID string, deliveryAt time.Time) error {
 	defer r.finish()
 
 	if r.deliverer == nil {
@@ -195,8 +204,8 @@ func (r *Runner) run(ctx context.Context, targetChannelID string) error {
 	retryComp := NewRetryCompleter(baseCompleter)
 	engine := brief.NewEngine(retryComp, brief.WithPrompt(cfg.EffectiveBriefPrompt()))
 
-	// 5. Capture fixed cutoff ONCE for the entire run
-	cutoff := r.now().UTC()
+	// 5. Scheduled runs retain only finished text and message-ID boundaries.
+	var prepared []*preparedChannel
 
 	// 6. Process channels sequentially in config order
 	for _, ch := range targetChannels {
@@ -206,34 +215,60 @@ func (r *Runner) run(ctx context.Context, targetChannelID string) error {
 		default:
 		}
 
-		r.processChannel(ctx, ch, cutoff, engine)
+		result := r.prepareChannel(ctx, ch, engine)
+		if deliveryAt.IsZero() {
+			r.deliverChannel(ctx, result)
+		} else {
+			prepared = append(prepared, result)
+		}
 	}
 
-	return nil
+	if !deliveryAt.IsZero() {
+		timer := time.NewTimer(max(0, deliveryAt.Sub(r.now())))
+		defer timer.Stop()
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-timer.C:
+		}
+		for _, result := range prepared {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			r.deliverChannel(ctx, result)
+		}
+	}
+	return ctx.Err()
 }
 
-// processChannel executes the isolated transaction for a single followed channel.
-func (r *Runner) processChannel(ctx context.Context, ch state.ChannelConfig, cutoff time.Time, engine *brief.Engine) {
+type preparedChannel struct {
+	channel      state.ChannelConfig
+	parts        []string
+	maxMessageID string
+}
+
+// prepareChannel collects and summarizes sequentially; it never advances a cursor.
+func (r *Runner) prepareChannel(ctx context.Context, ch state.ChannelConfig, engine *brief.Engine) *preparedChannel {
+	result := &preparedChannel{channel: ch}
 	// A. Load durable state
 	st, err := r.store.LoadState()
 	if err != nil {
 		log.Printf("[job] failed to load state for #%s (%s): %v", ch.Name, ch.ID, err)
-		_ = r.deliverer.Deliver(ctx, fmt.Sprintf("#%s\nFailed to load state: %s", ch.Name, r.sanitize(err.Error())))
-		return
+		result.parts = []string{fmt.Sprintf("#%s\nFailed to load state: %s", ch.Name, r.sanitize(err.Error()))}
+		return result
 	}
 
 	chState, exists := st.Channels[ch.ID]
 	if !exists || chState.Cursor.Value == "" {
 		log.Printf("[job] no valid cursor for #%s (%s)", ch.Name, ch.ID)
-		_ = r.deliverer.Deliver(ctx, fmt.Sprintf("#%s\nNo valid cursor found; channel skipped.", ch.Name))
-		return
+		result.parts = []string{fmt.Sprintf("#%s\nNo valid cursor found; channel skipped.", ch.Name)}
+		return result
 	}
 
 	// B. Bounded Discord collection via DCE
 	req := dce.ExportRequest{
 		ChannelID: ch.ID,
 		After:     chState.Cursor,
-		Before:    cutoff,
 	}
 
 	dceRes, err := r.dceClient.Export(ctx, req)
@@ -245,8 +280,8 @@ func (r *Runner) processChannel(ctx context.Context, ch state.ChannelConfig, cut
 		_ = r.store.SaveState(st)
 
 		notice := fmt.Sprintf("#%s\nBrief failed during Discord collection.\nNothing was consumed; it will be retried next time.", ch.Name)
-		_ = r.deliverer.Deliver(ctx, notice)
-		return
+		result.parts = []string{notice}
+		return result
 	}
 
 	serverName := strings.TrimSpace(dceRes.Guild.Name)
@@ -257,8 +292,8 @@ func (r *Runner) processChannel(ctx context.Context, ch state.ChannelConfig, cut
 
 	// C. Zero-message export is success: no LLM call, no cursor change
 	if len(dceRes.Messages) == 0 {
-		_ = r.deliverer.Deliver(ctx, FormatNoMessages(serverName, chName))
-		return
+		result.parts = []string{FormatNoMessages(serverName, chName)}
+		return result
 	}
 
 	// D. Map dce.Message -> brief.Message explicitly
@@ -297,49 +332,49 @@ func (r *Runner) processChannel(ctx context.Context, ch state.ChannelConfig, cut
 		_ = r.store.SaveState(st)
 
 		notice := fmt.Sprintf("%s\nBrief failed during summarization.\nNothing was consumed; it will be retried next time.", FormatHeading(serverName, chName))
-		_ = r.deliverer.Deliver(ctx, notice)
-		return
+		result.parts = []string{notice}
+		return result
 	}
 
 	// F. Split into Telegram plain-text parts
-	parts := SplitBrief(serverName, chName, len(dceRes.Messages), briefText, DefaultMaxTelegramRunes)
+	result.parts = SplitBrief(serverName, chName, len(dceRes.Messages), briefText, DefaultMaxTelegramRunes)
+	result.maxMessageID = dceRes.MaxMessageID
+	return result
+}
 
-	// G. Deliver ALL parts to Telegram
-	deliveryFailed := false
-	for _, part := range parts {
-		if dErr := r.deliverer.Deliver(ctx, part); dErr != nil {
-			deliveryFailed = true
-			log.Printf("[job] Telegram delivery failed for #%s (%s): %v", ch.Name, ch.ID, dErr)
-			chState.LastError = r.sanitize(dErr.Error())
-			st.Channels[ch.ID] = chState
-			_ = r.store.SaveState(st)
+// deliverChannel commits only after every part of this channel's brief succeeds.
+func (r *Runner) deliverChannel(ctx context.Context, result *preparedChannel) {
+	ch := result.channel
+	var deliveryErr error
+	for _, part := range result.parts {
+		if deliveryErr = r.deliverer.Deliver(ctx, part); deliveryErr != nil {
+			log.Printf("[job] Telegram delivery failed for #%s (%s): %s", ch.Name, ch.ID, r.sanitize(deliveryErr.Error()))
 			break
 		}
 	}
-
-	if deliveryFailed {
-		// Delivery failed: cursor remains unchanged so next run retries the interval
+	if result.maxMessageID == "" {
 		return
 	}
 
-	// H. ONLY AFTER ALL PARTS DELIVERED: advance cursor to new message-ID
-	chState.Cursor = state.Cursor{
-		Kind:  state.CursorKindMessageID,
-		Value: dceRes.MaxMessageID,
+	st, err := r.store.LoadState()
+	if err == nil {
+		chState := st.Channels[ch.ID]
+		if deliveryErr != nil {
+			chState.LastError = r.sanitize(deliveryErr.Error())
+		} else {
+			chState.Cursor = state.Cursor{Kind: state.CursorKindMessageID, Value: result.maxMessageID}
+			chState.LastSuccessAt = r.now().UTC().Format(time.RFC3339)
+			chState.LastError = ""
+		}
+		st.Channels[ch.ID] = chState
+		err = r.store.SaveState(st)
 	}
-	chState.LastSuccessAt = r.now().UTC().Format(time.RFC3339)
-	chState.LastError = ""
-	st.Channels[ch.ID] = chState
-
-	// I. Save state atomically
-	if sErr := r.store.SaveState(st); sErr != nil {
-		log.Printf("[job] CRITICAL: failed to commit state after successful Telegram delivery for #%s: %v", ch.Name, sErr)
-		warning := fmt.Sprintf("#%s\nWarning: brief was delivered but saving state failed. The next brief run may duplicate messages.", ch.Name)
-		_ = r.deliverer.Deliver(ctx, warning)
-		return
+	if err != nil {
+		log.Printf("[job] failed to save delivery state for #%s: %v", ch.Name, err)
+		_ = r.deliverer.Deliver(ctx, fmt.Sprintf("#%s\nWarning: saving state failed. The next brief run may duplicate messages.", ch.Name))
+	} else if deliveryErr == nil {
+		log.Printf("[job] successfully delivered brief and committed cursor %s for #%s (%s)", result.maxMessageID, ch.Name, ch.ID)
 	}
-
-	log.Printf("[job] successfully delivered brief and committed cursor %s for #%s (%s)", dceRes.MaxMessageID, ch.Name, ch.ID)
 }
 
 // sanitize strips the LLM API key from user-facing error text.

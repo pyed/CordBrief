@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/pyed/CordBrief/internal/state"
@@ -121,7 +122,7 @@ func TestScheduler_TriggerAndCollision(t *testing.T) {
 	var triggerCalls int32
 	var shouldCollide int32
 
-	trigger := func(ctx context.Context) bool {
+	trigger := func(ctx context.Context, deliveryAt time.Time) bool {
 		atomic.AddInt32(&triggerCalls, 1)
 		if atomic.LoadInt32(&shouldCollide) == 1 {
 			// Simulate runner collision
@@ -198,7 +199,7 @@ func TestScheduler_WakeRecomputesConfig(t *testing.T) {
 	}
 
 	var triggerCalls int32
-	trigger := func(ctx context.Context) bool {
+	trigger := func(ctx context.Context, deliveryAt time.Time) bool {
 		atomic.AddInt32(&triggerCalls, 1)
 		return true
 	}
@@ -247,4 +248,96 @@ func TestScheduler_WakeRecomputesConfig(t *testing.T) {
 
 	cancel()
 	<-runDone
+}
+
+func TestScheduledPreparationTargetsDelivery(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := setupTestStore(t)
+		cfg := state.DefaultConfig()
+		cfg.Schedule = state.ScheduleConfig{Enabled: true, Time: "12:00"}
+		cfg.Channels = []state.ChannelConfig{{ID: "1"}, {ID: "2"}, {ID: "3"}, {ID: "4"}}
+		if err := store.SaveConfig(cfg); err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		target := time.Date(start.Year(), start.Month(), start.Day(), 12, 0, 0, 0, time.UTC)
+		var calls atomic.Int32
+		s := New(store, func(ctx context.Context, at time.Time) bool {
+			want := target.AddDate(0, 0, int(calls.Load()))
+			if !at.Equal(want) || !time.Now().Equal(want.Add(-time.Hour)) {
+				t.Errorf("preparation=%v delivery=%v want=%v", time.Now(), at, want)
+			}
+			calls.Add(1)
+			return true
+		})
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan struct{})
+		go func() { s.Run(ctx); close(done) }()
+		time.Sleep(target.Add(-time.Hour).Sub(start))
+		synctest.Wait()
+		if calls.Load() != 1 {
+			t.Fatal("did not prepare at 11:00", calls.Load())
+		}
+		// Reconfiguration wakeups during preparation must not duplicate this target.
+		s.Wake()
+		synctest.Wait()
+		time.Sleep(time.Hour)
+		synctest.Wait()
+		if calls.Load() != 1 {
+			t.Fatal("recollected at delivery", calls.Load())
+		}
+		time.Sleep(23 * time.Hour)
+		synctest.Wait()
+		if calls.Load() != 2 {
+			t.Fatal("next daily preparation missed", calls.Load())
+		}
+		cancel()
+		<-done
+	})
+}
+
+func TestPreparationBudgetAcrossMidnightAndDisabledCooldown(t *testing.T) {
+	cfg := state.DefaultConfig()
+	cfg.Channels = []state.ChannelConfig{{ID: "1"}, {ID: "2"}, {ID: "3"}, {ID: "4"}}
+	target := time.Date(2026, 9, 16, 0, 30, 0, 0, time.UTC)
+	if got := PreparationTime(cfg, target); !got.Equal(target.Add(-time.Hour)) {
+		t.Fatal(got)
+	}
+	cfg.DCECooldownSeconds = 0
+	if got := PreparationTime(cfg, target); !got.Equal(target.Add(-4 * time.Minute)) {
+		t.Fatal(got)
+	}
+	cfg.DCECooldownSeconds = 3600
+	cfg.Channels = make([]state.ChannelConfig, 48)
+	if !PreparationTime(cfg, target).After(target.Add(-24 * time.Hour)) {
+		t.Fatal("unbounded daily lookahead")
+	}
+}
+
+func TestStartupInsidePreparationWindowBeginsImmediately(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		store := setupTestStore(t)
+		cfg := state.DefaultConfig()
+		cfg.Schedule = state.ScheduleConfig{Enabled: true, Time: "00:30"}
+		cfg.Channels = []state.ChannelConfig{{ID: "1"}, {ID: "2"}, {ID: "3"}, {ID: "4"}}
+		if err := store.SaveConfig(cfg); err != nil {
+			t.Fatal(err)
+		}
+		start := time.Now()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		calls := 0
+		s := New(store, func(ctx context.Context, target time.Time) bool {
+			calls++
+			if !time.Now().Equal(start) || !target.Equal(start.Add(30*time.Minute)) {
+				t.Fatal("missed imminent delivery", target)
+			}
+			cancel()
+			return true
+		})
+		s.Run(ctx)
+		if calls != 1 {
+			t.Fatal("missing preparation", calls)
+		}
+	})
 }

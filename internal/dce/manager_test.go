@@ -17,7 +17,10 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"testing/synctest"
 	"time"
+
+	"github.com/pyed/CordBrief/internal/state"
 )
 
 func writeMockExportJSON(args []string) error {
@@ -36,7 +39,7 @@ func TestManager_UnreadableStateReturnsError(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(dir, "dce", "updater.json"), 0700); err != nil {
 		t.Fatal(err)
 	}
-	if mgr, err := NewManager(dir, "bootstrap", "token", WithBootstrapVersion("2.48")); err == nil || mgr != nil {
+	if mgr, err := newUnspacedTestManager(t, dir, "bootstrap", "token", WithBootstrapVersion("2.48")); err == nil || mgr != nil {
 		t.Fatalf("expected initialization error, got manager %v, error %v", mgr, err)
 	}
 }
@@ -71,7 +74,7 @@ func TestManager_CandidateSuccess(t *testing.T) {
 		return writeMockExportJSON(args)
 	}
 
-	mgr, err := NewManager(dataDir, bootstrapExe, "mock-token",
+	mgr, err := newUnspacedTestManager(t, dataDir, bootstrapExe, "mock-token",
 		WithCommandRunner(runner),
 		WithBootstrapVersion("2.48.0"),
 	)
@@ -164,7 +167,7 @@ func TestManager_CandidateFailureAndCancellation(t *testing.T) {
 			return writeMockExportJSON(args)
 		}
 
-		mgr, err := NewManager(dataDir, bootstrapExe, "mock-token",
+		mgr, err := newUnspacedTestManager(t, dataDir, bootstrapExe, "mock-token",
 			WithCommandRunner(runner),
 			WithBootstrapVersion("2.48.0"),
 		)
@@ -250,7 +253,7 @@ func TestManager_CandidateFailureAndCancellation(t *testing.T) {
 			return errors.New("exec error")
 		}
 
-		mgr, _ := NewManager(dataDir, bootstrapExe, "mock-token",
+		mgr, _ := newUnspacedTestManager(t, dataDir, bootstrapExe, "mock-token",
 			WithCommandRunner(runner),
 			WithBootstrapVersion("2.48.0"),
 		)
@@ -294,7 +297,7 @@ func TestManager_CandidateFailureAndCancellation(t *testing.T) {
 			return context.Canceled
 		}
 
-		mgr, _ := NewManager(dataDir, bootstrapExe, "mock-token",
+		mgr, _ := newUnspacedTestManager(t, dataDir, bootstrapExe, "mock-token",
 			WithCommandRunner(runner),
 			WithBootstrapVersion("2.48.0"),
 		)
@@ -362,7 +365,7 @@ func TestManager_CheckForUpdates(t *testing.T) {
 			AllowHTTP:  true,
 		}
 
-		mgr, _ := NewManager(tmpDir, "/bootstrap/dce", "token",
+		mgr, _ := newUnspacedTestManager(t, tmpDir, "/bootstrap/dce", "token",
 			WithReleaseClient(rc),
 			WithBootstrapVersion("2.48.0"),
 		)
@@ -392,7 +395,7 @@ func TestManager_CheckForUpdates(t *testing.T) {
 			AllowHTTP:  true,
 		}
 
-		mgr, _ := NewManager(tmpDir, "/bootstrap/dce", "token",
+		mgr, _ := newUnspacedTestManager(t, tmpDir, "/bootstrap/dce", "token",
 			WithReleaseClient(rc),
 			WithBootstrapVersion("2.48.0"),
 		)
@@ -442,7 +445,7 @@ func TestManager_CheckForUpdates(t *testing.T) {
 			AllowHTTP:  true,
 		}
 
-		mgr, _ := NewManager(tmpDir, "/bootstrap/dce", "token",
+		mgr, _ := newUnspacedTestManager(t, tmpDir, "/bootstrap/dce", "token",
 			WithReleaseClient(rc),
 			WithBootstrapVersion("2.48.0"),
 			WithPlatform(runtime.GOOS, runtime.GOARCH),
@@ -468,7 +471,7 @@ func TestManager_CheckForUpdates(t *testing.T) {
 	t.Run("weekly timing and next check calculation", func(t *testing.T) {
 		tmpDir := t.TempDir()
 		now := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
-		mgr, _ := NewManager(tmpDir, "/bootstrap/dce", "token",
+		mgr, _ := newUnspacedTestManager(t, tmpDir, "/bootstrap/dce", "token",
 			WithClock(func() time.Time { return now }),
 		)
 
@@ -506,7 +509,7 @@ func TestManager_PinnedCheckRefreshesLastCheckWithoutRequest(t *testing.T) {
 	defer ts.Close()
 
 	now := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
-	mgr, err := NewManager(t.TempDir(), "/bootstrap/dce", "token",
+	mgr, err := newUnspacedTestManager(t, t.TempDir(), "/bootstrap/dce", "token",
 		WithReleaseClient(&ReleaseClient{Endpoint: ts.URL + "/latest", HTTPClient: ts.Client(), AllowHTTP: true}),
 		WithBootstrapVersion("2.48.0"),
 		WithClock(func() time.Time { return now }),
@@ -535,4 +538,105 @@ func TestManager_PinnedCheckRefreshesLastCheckWithoutRequest(t *testing.T) {
 	if got := mgr.NextCheckDuration(); got != 7*24*time.Hour {
 		t.Fatalf("pinned check did not advance schedule: got %v", got)
 	}
+}
+
+func newUnspacedTestManager(t *testing.T, dir, path, token string, opts ...ManagerOption) (*Manager, error) {
+	t.Helper()
+	cfg := state.DefaultConfig()
+	cfg.DCECooldownSeconds = 0
+	if err := state.NewStore(dir).SaveConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+	return NewManager(dir, path, token, opts...)
+}
+
+func TestExportCooldownPersistsAcrossRestartAndRollback(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		dir := t.TempDir()
+		var starts []time.Time
+		runner := func(ctx context.Context, name string, args, env []string, stdout, stderr io.Writer) error {
+			starts = append(starts, time.Now())
+			for i, arg := range args {
+				if arg == "--before" && args[i+1] != time.Now().UTC().Format("2006-01-02T15:04:05Z") {
+					t.Fatal("stale cutoff")
+				}
+			}
+			if name == "candidate" {
+				return errors.New("candidate crashed")
+			}
+			return writeMockExportJSON(args)
+		}
+		newManager := func() *Manager {
+			m, err := NewManager(dir, "active", "fake", WithBootstrapVersion("2.48"), WithCommandRunner(runner))
+			if err != nil {
+				t.Fatal(err)
+			}
+			return m
+		}
+		m := newManager()
+		req := ExportRequest{ChannelID: "123"}
+		if _, err := m.Export(context.Background(), req); err != nil {
+			t.Fatal(err)
+		}
+		m = newManager()
+		next := m.State()
+		next.CandidatePath, next.CandidateVersion = "candidate", "2.49"
+		if err := m.saveState(next); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.Export(context.Background(), req); err != nil {
+			t.Fatal(err)
+		}
+		if len(starts) != 3 || starts[1].Sub(starts[0]) != 15*time.Minute || starts[2].Sub(starts[1]) != 15*time.Minute {
+			t.Fatalf("unspaced restart/candidate/fallback: %v", starts)
+		}
+		if m.State().RejectedVersion != "2.49" || m.State().ActivePath != "active" {
+			t.Fatal(m.State())
+		}
+		cfg := state.DefaultConfig()
+		cfg.DCECooldownSeconds = 0
+		if err := state.NewStore(dir).SaveConfig(cfg); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.Export(context.Background(), req); err != nil {
+			t.Fatal(err)
+		}
+		if !starts[3].Equal(starts[2]) {
+			t.Fatal("zero cooldown still waits")
+		}
+	})
+}
+
+func TestExportCooldownCancellationKeepsCandidatePending(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		calls := 0
+		m, err := NewManager(t.TempDir(), "active", "fake", WithBootstrapVersion("2.48"),
+			WithCommandRunner(func(ctx context.Context, name string, args, env []string, stdout, stderr io.Writer) error {
+				calls++
+				return writeMockExportJSON(args)
+			}))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := m.Export(context.Background(), ExportRequest{ChannelID: "123"}); err != nil {
+			t.Fatal(err)
+		}
+		next := m.State()
+		next.CandidateVersion, next.CandidatePath = "2.49", "candidate"
+		if err := m.saveState(next); err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		done := make(chan error, 1)
+		go func() { _, err := m.Export(ctx, ExportRequest{ChannelID: "123"}); done <- err }()
+		synctest.Wait()
+		at := time.Now()
+		cancel()
+		if err := <-done; err == nil {
+			t.Fatal("cancellation ignored")
+		}
+		if !time.Now().Equal(at) || calls != 1 || m.State() != next {
+			t.Fatal("wait ran DCE, changed candidate, or delayed cancellation")
+		}
+	})
 }
