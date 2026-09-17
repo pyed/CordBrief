@@ -1408,3 +1408,57 @@ func TestRunner_Mutate_RejectedWhenRunning(t *testing.T) {
 	close(jobHold)
 	r.Wait()
 }
+
+func TestRunner_OversizedExport_LeavesCursorUnchanged(t *testing.T) {
+	store, _ := setupTestStore(t)
+	cfg := state.DefaultConfig()
+	cfg.Channels = []state.ChannelConfig{{ID: "100", Name: "general"}}
+	if err := store.SaveConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	st := state.NewEmptyState()
+	originalCursor := state.Cursor{Kind: state.CursorKindMessageID, Value: "500"}
+	st.Channels["100"] = state.ChannelState{Cursor: originalCursor}
+	if err := store.SaveState(st); err != nil {
+		t.Fatal(err)
+	}
+
+	d := &FakeDCE{
+		configured: true,
+		exportFunc: func(ctx context.Context, req dce.ExportRequest) (*dce.ExportResult, error) {
+			return nil, fmt.Errorf("%w: 60000000 bytes exceeds limit of 52428800 bytes", dce.ErrExportTooLarge)
+		},
+	}
+	deliverer := &FakeDeliverer{}
+
+	runner, err := NewRunner(store, WithDCEClient(d), WithDeliverer(deliverer))
+	if err != nil {
+		t.Fatalf("failed to create runner: %v", err)
+	}
+
+	err = runner.Run(context.Background(), "")
+	if err != nil {
+		t.Fatalf("unexpected runner error: %v", err)
+	}
+
+	loadedSt, err := store.LoadState()
+	if err != nil {
+		t.Fatal(err)
+	}
+	chState := loadedSt.Channels["100"]
+	if chState.Cursor != originalCursor {
+		t.Fatalf("expected cursor %v to remain unchanged, got %v", originalCursor, chState.Cursor)
+	}
+	if !strings.Contains(chState.LastError, "dce export exceeded maximum allowed size") {
+		t.Fatalf("expected LastError to record size error, got: %s", chState.LastError)
+	}
+
+	msgs := deliverer.GetMessages()
+	if len(msgs) != 1 {
+		t.Fatalf("expected 1 delivery notice, got %d", len(msgs))
+	}
+	if !strings.Contains(msgs[0], "Brief failed during Discord collection") || !strings.Contains(msgs[0], "Nothing was consumed") {
+		t.Fatalf("unexpected delivery notice: %s", msgs[0])
+	}
+}

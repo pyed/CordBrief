@@ -260,7 +260,13 @@ func (b *Bot) sendMessageWithMarkup(ctx context.Context, chatID int64, text stri
 	if markup != nil {
 		params.ReplyMarkup = markup
 	}
-	_, _ = b.client.SendMessage(ctx, params)
+	if _, err := b.client.SendMessage(ctx, params); err != nil {
+		redacted := err.Error()
+		if b.redact != nil {
+			redacted = b.redact(redacted)
+		}
+		log.Printf("Telegram SendMessage failed for chat %d: %s", chatID, redacted)
+	}
 }
 
 func (b *Bot) editMessage(ctx context.Context, chatID int64, messageID int, text string, markup *models.InlineKeyboardMarkup) {
@@ -272,5 +278,11 @@ func (b *Bot) editMessage(ctx context.Context, chatID int64, messageID int, text
 	if markup != nil {
 		params.ReplyMarkup = markup
 	}
-	_, _ = b.client.EditMessageText(ctx, params)
+	if _, err := b.client.EditMessageText(ctx, params); err != nil {
+		redacted := err.Error()
+		if b.redact != nil {
+			redacted = b.redact(redacted)
+		}
+		log.Printf("Telegram EditMessageText failed for chat %d message %d: %s", chatID, messageID, redacted)
+	}
 }

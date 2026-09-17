@@ -1,7 +1,10 @@
 package bot
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -1421,5 +1424,156 @@ func TestDCECooldownCommand(t *testing.T) {
 		if cfg.DCECooldownSeconds != 3600 || sender.sentCount() != before {
 			t.Fatal("unauthorized change")
 		}
+	}
+}
+
+func TestChannels_TelegramSafeMultiPartDelivery(t *testing.T) {
+	b, sender, store, _ := setupTestBot(t)
+	ctx := context.Background()
+
+	cfg, err := store.LoadConfig()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Configure 120 channels to produce output far exceeding DefaultMaxTelegramRunes (3900)
+	cfg.Channels = make([]state.ChannelConfig, 120)
+	for i := 0; i < 120; i++ {
+		cfg.Channels[i] = state.ChannelConfig{
+			ID:   fmt.Sprintf("100000000000000%03d", i),
+			Name: fmt.Sprintf("very-long-channel-name-for-testing-%03d", i),
+		}
+	}
+	if err := store.SaveConfig(cfg); err != nil {
+		t.Fatal(err)
+	}
+
+	b.HandleUpdate(ctx, nil, makeMsg(12345, "private", "/channels"))
+
+	if sender.sentCount() <= 1 {
+		t.Fatalf("expected multi-part delivery (>1 message), got %d sent messages", sender.sentCount())
+	}
+
+	var combined strings.Builder
+	for i, msg := range sender.sent {
+		// Check that no part exceeds DefaultMaxTelegramRunes or Telegram's 4096 character limit
+		if len([]rune(msg.Text)) > job.DefaultMaxTelegramRunes {
+			t.Fatalf("part %d exceeds DefaultMaxTelegramRunes: %d runes", i, len([]rune(msg.Text)))
+		}
+		if len([]rune(msg.Text)) > 4096 {
+			t.Fatalf("part %d exceeds Telegram limit: %d runes", i, len([]rune(msg.Text)))
+		}
+
+		// Controls/buttons must appear on only one sensible part (the final part)
+		if i < len(sender.sent)-1 {
+			if msg.ReplyMarkup != nil {
+				t.Fatalf("intermediate part %d had non-nil ReplyMarkup", i)
+			}
+		} else {
+			if msg.ReplyMarkup == nil {
+				t.Fatalf("final part %d missing ReplyMarkup", i)
+			}
+			kb := getInlineKeyboard(msg)
+			if len(kb) == 0 {
+				t.Fatalf("final part %d had empty inline keyboard", i)
+			}
+		}
+
+		combined.WriteString(msg.Text)
+	}
+
+	// Verify all channels are present in combined output and preserved in exact order
+	lastIdx := -1
+	for _, ch := range cfg.Channels {
+		expectedLine := fmt.Sprintf("• #%s (%s)", ch.Name, ch.ID)
+		idx := strings.Index(combined.String(), expectedLine)
+		if idx == -1 {
+			t.Fatalf("missing channel line in combined output: %s", expectedLine)
+		}
+		if idx <= lastIdx {
+			t.Fatalf("channel ordering not preserved for channel: %s", ch.Name)
+		}
+		lastIdx = idx
+	}
+}
+
+type errSender struct {
+	sendErr error
+	editErr error
+}
+
+func (e *errSender) SendMessage(ctx context.Context, params *bot.SendMessageParams) (*models.Message, error) {
+	return nil, e.sendErr
+}
+
+func (e *errSender) AnswerCallbackQuery(ctx context.Context, params *bot.AnswerCallbackQueryParams) (bool, error) {
+	return true, nil
+}
+
+func (e *errSender) EditMessageText(ctx context.Context, params *bot.EditMessageTextParams) (*models.Message, error) {
+	return nil, e.editErr
+}
+
+func TestTelegramSendAndEdit_LogsDiagnosticOnFailure(t *testing.T) {
+	dir := t.TempDir()
+	store := state.NewStore(dir)
+
+	const botToken = "secret-bot-token-12345"
+	const secretText = "super-secret-user-message-text"
+	const secretEditText = "super-secret-edit-text"
+
+	sender := &errSender{
+		sendErr: fmt.Errorf("network failure with token %s", botToken),
+		editErr: fmt.Errorf("edit failed with token %s", botToken),
+	}
+
+	b, err := New(context.Background(), &EnvConfig{
+		BotToken: botToken,
+		OwnerID:  12345,
+		DataDir:  dir,
+	}, store, WithSender(sender))
+	if err != nil {
+		t.Fatalf("New bot failed: %v", err)
+	}
+
+	var logBuf bytes.Buffer
+	prevLog := log.Writer()
+	log.SetOutput(&logBuf)
+	defer log.SetOutput(prevLog)
+
+	// Test sendMessageWithMarkup failure logging
+	b.sendMessageWithMarkup(context.Background(), 99999, secretText, nil)
+
+	logOutput := logBuf.String()
+	if !strings.Contains(logOutput, "Telegram SendMessage failed for chat 99999:") {
+		t.Fatalf("expected SendMessage failure log, got: %s", logOutput)
+	}
+	if strings.Contains(logOutput, botToken) {
+		t.Fatalf("botToken leaked in SendMessage failure log: %s", logOutput)
+	}
+	if !strings.Contains(logOutput, "[REDACTED]") {
+		t.Fatalf("expected [REDACTED] in SendMessage failure log: %s", logOutput)
+	}
+	if strings.Contains(logOutput, secretText) {
+		t.Fatalf("message text content leaked in SendMessage failure log: %s", logOutput)
+	}
+
+	logBuf.Reset()
+
+	// Test editMessage failure logging
+	b.editMessage(context.Background(), 99999, 42, secretEditText, nil)
+
+	editLogOutput := logBuf.String()
+	if !strings.Contains(editLogOutput, "Telegram EditMessageText failed for chat 99999 message 42:") {
+		t.Fatalf("expected EditMessageText failure log, got: %s", editLogOutput)
+	}
+	if strings.Contains(editLogOutput, botToken) {
+		t.Fatalf("botToken leaked in EditMessageText failure log: %s", editLogOutput)
+	}
+	if !strings.Contains(editLogOutput, "[REDACTED]") {
+		t.Fatalf("expected [REDACTED] in EditMessageText failure log: %s", editLogOutput)
+	}
+	if strings.Contains(editLogOutput, secretEditText) {
+		t.Fatalf("message text content leaked in EditMessageText failure log: %s", editLogOutput)
 	}
 }

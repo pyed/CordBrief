@@ -722,3 +722,88 @@ func TestManager_CandidateMalformedRollback(t *testing.T) {
 		t.Fatalf("unexpected status: %s", mgr.Status())
 	}
 }
+
+func TestManager_CandidateOversizedRollback(t *testing.T) {
+	tmpDir := t.TempDir()
+	bootstrapExe := filepath.Join(tmpDir, "bootstrap", ExpectedExecutableName(runtime.GOOS))
+	_ = os.MkdirAll(filepath.Dir(bootstrapExe), 0700)
+	_ = os.WriteFile(bootstrapExe, []byte("boot"), 0755)
+
+	dataDir := filepath.Join(tmpDir, "data")
+	candDir := filepath.Join(dataDir, "dce", "versions", "2.49.0")
+	_ = os.MkdirAll(candDir, 0700)
+	candExe := filepath.Join(candDir, ExpectedExecutableName(runtime.GOOS))
+	_ = os.WriteFile(candExe, []byte("cand"), 0755)
+
+	var mu sync.Mutex
+	executed := make([]string, 0)
+	runner := func(ctx context.Context, name string, args []string, env []string, stdout, stderr io.Writer) error {
+		mu.Lock()
+		executed = append(executed, name)
+		mu.Unlock()
+
+		var outPath string
+		for i, arg := range args {
+			if arg == "-o" && i+1 < len(args) {
+				outPath = args[i+1]
+			}
+		}
+		if outPath == "" {
+			return errors.New("no -o in args")
+		}
+
+		if name == candExe {
+			// Candidate writes oversized output
+			return os.WriteFile(outPath, bytes.Repeat([]byte("x"), 2000), 0600)
+		}
+		// Active writes valid normal output
+		return writeMockExportJSON(args)
+	}
+
+	mgr, err := newUnspacedTestManager(t, dataDir, bootstrapExe, "mock-token",
+		WithCommandRunner(runner),
+		WithBootstrapVersion("2.48.0"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr.maxExportBytes = 1000
+
+	mgr.mu.Lock()
+	mgr.state.CandidateVersion = "2.49.0"
+	mgr.state.CandidatePath = candExe
+	_ = SaveUpdaterState(mgr.statePath, mgr.state)
+	mgr.mu.Unlock()
+
+	req := ExportRequest{ChannelID: "123456789"}
+	res, err := mgr.Export(context.Background(), req)
+	if err != nil {
+		t.Fatalf("expected successful fallback, got: %v", err)
+	}
+	if res == nil {
+		t.Fatal("expected non-nil result from active retry")
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(executed) != 2 || executed[0] != candExe || executed[1] != bootstrapExe {
+		t.Fatalf("expected candidate then active execution, got: %v", executed)
+	}
+
+	st := mgr.State()
+	if st.CandidateVersion != "" || st.CandidatePath != "" {
+		t.Fatalf("expected candidate cleared from state, got: %+v", st)
+	}
+	if st.RejectedVersion != "2.49.0" {
+		t.Fatalf("expected RejectedVersion 2.49.0, got %s", st.RejectedVersion)
+	}
+	if st.ActiveVersion != "2.48.0" || st.ActivePath != bootstrapExe {
+		t.Fatalf("expected active version 2.48.0 retained, got %+v", st)
+	}
+	if mgr.Status() != "2.48.0 · 2.49.0 rejected" {
+		t.Fatalf("unexpected status: %s", mgr.Status())
+	}
+	if _, err := os.Stat(candDir); !os.IsNotExist(err) {
+		t.Fatalf("expected candidate dir %s to be removed, err: %v", candDir, err)
+	}
+}

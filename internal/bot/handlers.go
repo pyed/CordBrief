@@ -202,7 +202,14 @@ func (b *Bot) handleChannels(ctx context.Context, chatID int64) {
 		},
 	}
 
-	b.sendMessageWithMarkup(ctx, chatID, sb.String(), markup)
+	parts := job.SplitText(sb.String(), job.DefaultMaxTelegramRunes)
+	for i, part := range parts {
+		if i == len(parts)-1 {
+			b.sendMessageWithMarkup(ctx, chatID, part, markup)
+		} else {
+			b.sendTextMessage(ctx, chatID, part)
+		}
+	}
 }
 
 func (b *Bot) handleFollow(ctx context.Context, chatID int64, args []string) {

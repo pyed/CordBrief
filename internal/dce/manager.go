@@ -28,10 +28,11 @@ type Manager struct {
 	goarch           string
 	now              func() time.Time
 
-	statePath string
-	state     *UpdaterState
-	mu        sync.Mutex
-	opMu      sync.Mutex // Serialize install/export so candidate files cannot change during use.
+	statePath      string
+	state          *UpdaterState
+	maxExportBytes int64
+	mu             sync.Mutex
+	opMu           sync.Mutex // Serialize install/export so candidate files cannot change during use.
 }
 
 // ManagerOption configures a Manager instance.
@@ -217,6 +218,7 @@ func (m *Manager) Export(ctx context.Context, req ExportRequest) (*ExportResult,
 	// If candidate exists, execute candidate on probation
 	if candPath != "" {
 		candClient := NewMockClient(candPath, m.token, run)
+		candClient.maxExportBytes = m.maxExportBytes
 		res, err := candClient.Export(ctx, req)
 		if err == nil {
 			// Candidate succeeded! Promote candidate.
@@ -239,6 +241,7 @@ func (m *Manager) Export(ctx context.Context, req ExportRequest) (*ExportResult,
 		// Retry requested operation once with active known-good if context alive
 		if ctx.Err() == nil && activePath != "" {
 			activeClient := NewMockClient(activePath, m.token, run)
+			activeClient.maxExportBytes = m.maxExportBytes
 			return activeClient.Export(ctx, req)
 		}
 		return nil, err
@@ -249,6 +252,7 @@ func (m *Manager) Export(ctx context.Context, req ExportRequest) (*ExportResult,
 		return nil, errors.New("no active dce executable configured")
 	}
 	activeClient := NewMockClient(activePath, m.token, run)
+	activeClient.maxExportBytes = m.maxExportBytes
 	return activeClient.Export(ctx, req)
 }
 

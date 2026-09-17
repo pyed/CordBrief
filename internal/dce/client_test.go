@@ -763,3 +763,71 @@ func TestDCE_Validation(t *testing.T) {
 		}
 	})
 }
+
+func TestDCE_ExportSizeLimit(t *testing.T) {
+	const testLimit int64 = 128
+	baseJSON := []byte(`{"guild":{"id":"1"},"channel":{"id":"100"},"messages":[]}`)
+	if int64(len(baseJSON)) > testLimit {
+		t.Fatalf("baseJSON length %d exceeds testLimit %d", len(baseJSON), testLimit)
+	}
+
+	makePaddedPayload := func(targetLen int64) []byte {
+		padLen := int(targetLen) - len(baseJSON)
+		if padLen < 0 {
+			panic("targetLen smaller than baseJSON")
+		}
+		return append(bytes.Clone(baseJSON), bytes.Repeat([]byte(" "), padLen)...)
+	}
+
+	runWithPayload := func(t *testing.T, payload []byte) (*ExportResult, error) {
+		runner := func(ctx context.Context, name string, args []string, env []string, stdout, stderr io.Writer) error {
+			var outPath string
+			for i, arg := range args {
+				if arg == "-o" && i+1 < len(args) {
+					outPath = args[i+1]
+				}
+			}
+			return os.WriteFile(outPath, payload, 0600)
+		}
+		client := NewMockClient("dce.exe", "fake-token", runner)
+		client.maxExportBytes = testLimit
+		req := ExportRequest{ChannelID: "100"}
+		return client.Export(context.Background(), req)
+	}
+
+	t.Run("size below limit is accepted", func(t *testing.T) {
+		payload := makePaddedPayload(testLimit - 1)
+		res, err := runWithPayload(t, payload)
+		if err != nil {
+			t.Fatalf("expected size below limit to succeed, got: %v", err)
+		}
+		if res == nil {
+			t.Fatal("expected non-nil result")
+		}
+	})
+
+	t.Run("size exactly equal to limit is accepted", func(t *testing.T) {
+		payload := makePaddedPayload(testLimit)
+		res, err := runWithPayload(t, payload)
+		if err != nil {
+			t.Fatalf("expected size exactly equal to limit to succeed, got: %v", err)
+		}
+		if res == nil {
+			t.Fatal("expected non-nil result")
+		}
+	})
+
+	t.Run("size one byte above limit returns ErrExportTooLarge", func(t *testing.T) {
+		payload := makePaddedPayload(testLimit + 1)
+		res, err := runWithPayload(t, payload)
+		if err == nil {
+			t.Fatal("expected ErrExportTooLarge for size one byte above limit, got nil")
+		}
+		if !errors.Is(err, ErrExportTooLarge) {
+			t.Fatalf("expected ErrExportTooLarge, got: %v", err)
+		}
+		if res != nil {
+			t.Fatalf("expected nil result, got %v", res)
+		}
+	})
+}

@@ -20,6 +20,13 @@ import (
 // MaxDiagnosticBuffer limits captured stderr/stdout to 64 KB to prevent unbounded memory growth.
 const MaxDiagnosticBuffer = 64 * 1024
 
+// DefaultMaxExportBytes bounds the raw JSON file size accepted from DiscordChatExporter (50 MiB),
+// preventing memory exhaustion from pathological or runaway exports before decoding.
+const DefaultMaxExportBytes int64 = 50 * 1024 * 1024
+
+// ErrExportTooLarge indicates a raw DCE export exceeds the maximum allowed file size.
+var ErrExportTooLarge = errors.New("dce export exceeded maximum allowed size")
+
 // CommandRunner defines the function signature for executing the DCE child process.
 // This abstraction allows deterministic unit tests without running external binaries.
 type CommandRunner func(ctx context.Context, name string, args []string, env []string, stdout, stderr io.Writer) error
@@ -34,9 +41,10 @@ func defaultCommandRunner(ctx context.Context, name string, args []string, env [
 
 // Client manages bounded exports using the external DiscordChatExporter.Cli executable.
 type Client struct {
-	dcePath string
-	token   string
-	runner  CommandRunner
+	dcePath        string
+	token          string
+	runner         CommandRunner
+	maxExportBytes int64
 }
 
 // NewClient creates a Client configured with the given executable path and Discord token.
@@ -205,10 +213,24 @@ func (c *Client) Export(ctx context.Context, req ExportRequest) (*ExportResult, 
 		return nil, c.sanitizeError(fmt.Errorf("dce export failed: %w", runErr))
 	}
 
+	// Verify output file size before loading into memory
+	fi, err := os.Stat(outFilePath)
+	if err != nil {
+		return nil, fmt.Errorf("dce completed successfully but output file is missing: %w", err)
+	}
+
+	limit := c.maxExportBytes
+	if limit <= 0 {
+		limit = DefaultMaxExportBytes
+	}
+	if fi.Size() > limit {
+		return nil, fmt.Errorf("%w: %d bytes exceeds limit of %d bytes", ErrExportTooLarge, fi.Size(), limit)
+	}
+
 	// Read raw export file
 	data, err := os.ReadFile(outFilePath)
 	if err != nil {
-		return nil, fmt.Errorf("dce completed successfully but output file is missing: %w", err)
+		return nil, fmt.Errorf("failed to read dce export file: %w", err)
 	}
 
 	return parseDCEExport(data, req)
