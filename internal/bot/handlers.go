@@ -2,12 +2,14 @@ package bot
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	"github.com/go-telegram/bot"
 	"github.com/go-telegram/bot/models"
+	"github.com/pyed/CordBrief/internal/job"
 	"github.com/pyed/CordBrief/internal/scheduler"
 	"github.com/pyed/CordBrief/internal/state"
 )
@@ -360,6 +362,13 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, q *models.CallbackQuery) 
 	}
 }
 
+func (b *Bot) mutateState(fn func() error) error {
+	if b.runner != nil {
+		return b.runner.Mutate(fn)
+	}
+	return fn()
+}
+
 func (b *Bot) handleFollowCallback(ctx context.Context, chatID int64, messageID int, data string) {
 	parts := strings.Split(data, ":")
 	if len(parts) != 3 {
@@ -371,23 +380,19 @@ func (b *Bot) handleFollowCallback(ctx context.Context, chatID int64, messageID 
 
 	b.mu.Lock()
 	pf, exists := b.pendingFollows[followKey]
-	delete(b.pendingFollows, followKey)
-	b.mu.Unlock()
-
 	if !exists {
+		b.mu.Unlock()
 		b.editMessage(ctx, chatID, messageID, "This request expired. Run /follow again.", nil)
 		return
 	}
 
 	if action == "cancel" {
+		delete(b.pendingFollows, followKey)
+		b.mu.Unlock()
 		b.editMessage(ctx, chatID, messageID, "Follow cancelled.", nil)
 		return
 	}
-
-	if b.runner != nil && b.runner.IsRunning() {
-		b.editMessage(ctx, chatID, messageID, "A brief is currently running. Try again when it finishes.", nil)
-		return
-	}
+	b.mu.Unlock()
 
 	now := b.now().UTC()
 	var cursorVal string
@@ -406,51 +411,61 @@ func (b *Bot) handleFollowCallback(ctx context.Context, chatID int64, messageID 
 
 	// Safe Follow Persistence Order:
 	// 1. Load latest state & config
-	st, err := b.store.LoadState()
-	if err != nil {
-		b.editMessage(ctx, chatID, messageID, "Failed to load state: "+err.Error(), nil)
-		return
-	}
-	cfg, err := b.store.LoadConfig()
-	if err != nil {
-		b.editMessage(ctx, chatID, messageID, "Failed to load config: "+err.Error(), nil)
-		return
-	}
-
 	// 2. Validate proposed updates in memory
-	st.Channels[pf.ChannelID] = state.ChannelState{
-		Cursor: state.Cursor{
-			Kind:  state.CursorKindTimestamp,
-			Value: cursorVal,
-		},
-		LastSuccessAt: "",
-		LastError:     "",
-	}
-	if err := st.Validate(); err != nil {
-		b.editMessage(ctx, chatID, messageID, "State validation error: "+err.Error(), nil)
-		return
-	}
-
-	cfg.Channels = append(cfg.Channels, state.ChannelConfig{
-		ID:   pf.ChannelID,
-		Name: pf.DisplayName,
-	})
-	if err := cfg.Validate(); err != nil {
-		b.editMessage(ctx, chatID, messageID, "Config validation error: "+err.Error(), nil)
-		return
-	}
-
 	// 3. Save STATE FIRST
-	if err := b.store.SaveState(st); err != nil {
-		b.editMessage(ctx, chatID, messageID, "Failed to save channel state. Follow aborted: "+err.Error(), nil)
+	// 4. Save CONFIG SECOND
+	err := b.mutateState(func() error {
+		st, err := b.store.LoadState()
+		if err != nil {
+			return fmt.Errorf("Failed to load state: %w", err)
+		}
+		cfg, err := b.store.LoadConfig()
+		if err != nil {
+			return fmt.Errorf("Failed to load config: %w", err)
+		}
+
+		st.Channels[pf.ChannelID] = state.ChannelState{
+			Cursor: state.Cursor{
+				Kind:  state.CursorKindTimestamp,
+				Value: cursorVal,
+			},
+			LastSuccessAt: "",
+			LastError:     "",
+		}
+		if err := st.Validate(); err != nil {
+			return fmt.Errorf("State validation error: %w", err)
+		}
+
+		cfg.Channels = append(cfg.Channels, state.ChannelConfig{
+			ID:   pf.ChannelID,
+			Name: pf.DisplayName,
+		})
+		if err := cfg.Validate(); err != nil {
+			return fmt.Errorf("Config validation error: %w", err)
+		}
+
+		if err := b.store.SaveState(st); err != nil {
+			return fmt.Errorf("Failed to save channel state. Follow aborted: %w", err)
+		}
+
+		if err := b.store.SaveConfig(cfg); err != nil {
+			return fmt.Errorf("Saved channel state, but failed to save configuration. Follow not completed: %w", err)
+		}
+		return nil
+	})
+
+	if err != nil {
+		if errors.Is(err, job.ErrBriefRunning) {
+			b.editMessage(ctx, chatID, messageID, "A brief is currently running. Try again when it finishes.", nil)
+			return
+		}
+		b.editMessage(ctx, chatID, messageID, err.Error(), nil)
 		return
 	}
 
-	// 4. Save CONFIG SECOND
-	if err := b.store.SaveConfig(cfg); err != nil {
-		b.editMessage(ctx, chatID, messageID, "Saved channel state, but failed to save configuration. Follow not completed: "+err.Error(), nil)
-		return
-	}
+	b.mu.Lock()
+	delete(b.pendingFollows, followKey)
+	b.mu.Unlock()
 
 	if b.scheduler != nil {
 		b.scheduler.Wake()
@@ -511,52 +526,67 @@ func (b *Bot) handleUnfollowCallback(ctx context.Context, chatID int64, messageI
 		}
 		channelID := parts[2]
 
-		if b.runner != nil && b.runner.IsRunning() {
-			b.editMessage(ctx, chatID, messageID, "A brief is currently running. Try again when it finishes.", nil)
-			return
-		}
-
-		// Safe Unfollow Persistence Order:
-		// 1. Load latest config & state
-		cfg, err := b.store.LoadConfig()
-		if err != nil {
-			b.editMessage(ctx, chatID, messageID, "Failed to load config: "+err.Error(), nil)
-			return
-		}
-		st, err := b.store.LoadState()
-		if err != nil {
-			b.editMessage(ctx, chatID, messageID, "Failed to load state: "+err.Error(), nil)
-			return
-		}
-
-		// 2. Remove channel from config
-		var newChannels []state.ChannelConfig
-		found := false
-		for _, ch := range cfg.Channels {
-			if ch.ID == channelID {
-				found = true
-				continue
+		var channelNotFound bool
+		var stateSaveErr error
+		err := b.mutateState(func() error {
+			// Safe Unfollow Persistence Order:
+			// 1. Load latest config & state
+			cfg, err := b.store.LoadConfig()
+			if err != nil {
+				return fmt.Errorf("Failed to load config: %w", err)
 			}
-			newChannels = append(newChannels, ch)
+			st, err := b.store.LoadState()
+			if err != nil {
+				return fmt.Errorf("Failed to load state: %w", err)
+			}
+
+			// 2. Remove channel from config
+			var newChannels []state.ChannelConfig
+			found := false
+			for _, ch := range cfg.Channels {
+				if ch.ID == channelID {
+					found = true
+					continue
+				}
+				newChannels = append(newChannels, ch)
+			}
+			if !found {
+				channelNotFound = true
+				return nil
+			}
+			cfg.Channels = newChannels
+
+			// 3. Remove channel from state
+			delete(st.Channels, channelID)
+
+			// 4. Save CONFIG FIRST
+			if err := b.store.SaveConfig(cfg); err != nil {
+				return fmt.Errorf("Failed to update configuration. Unfollow aborted: %w", err)
+			}
+
+			// 5. Save STATE SECOND
+			if err := b.store.SaveState(st); err != nil {
+				stateSaveErr = err
+			}
+			return nil
+		})
+
+		if err != nil {
+			if errors.Is(err, job.ErrBriefRunning) {
+				b.editMessage(ctx, chatID, messageID, "A brief is currently running. Try again when it finishes.", nil)
+				return
+			}
+			b.editMessage(ctx, chatID, messageID, err.Error(), nil)
+			return
 		}
-		if !found {
+
+		if channelNotFound {
 			b.editMessage(ctx, chatID, messageID, fmt.Sprintf("Channel %s is not currently followed.", channelID), nil)
 			return
 		}
-		cfg.Channels = newChannels
 
-		// 3. Remove channel from state
-		delete(st.Channels, channelID)
-
-		// 4. Save CONFIG FIRST
-		if err := b.store.SaveConfig(cfg); err != nil {
-			b.editMessage(ctx, chatID, messageID, "Failed to update configuration. Unfollow aborted: "+err.Error(), nil)
-			return
-		}
-
-		// 5. Save STATE SECOND
-		if err := b.store.SaveState(st); err != nil {
-			b.editMessage(ctx, chatID, messageID, fmt.Sprintf("Unfollowed channel %s, but failed to clean up state: %v. Config is authoritative.", channelID, err), nil)
+		if stateSaveErr != nil {
+			b.editMessage(ctx, chatID, messageID, fmt.Sprintf("Unfollowed channel %s, but failed to clean up state: %v. Config is authoritative.", channelID, stateSaveErr), nil)
 			return
 		}
 

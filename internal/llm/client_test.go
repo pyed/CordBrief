@@ -3,11 +3,13 @@ package llm
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 )
 
 // 1, 2, 3, 4, 5, 7, 20: Comprehensive request serialization test
@@ -371,5 +373,97 @@ func TestIsGeminiEndpoint(t *testing.T) {
 		if got != tc.expected {
 			t.Errorf("isGeminiEndpoint(%q) = %v, expected %v", tc.url, got, tc.expected)
 		}
+	}
+}
+
+func TestLLM_Timeout_StalledServer(t *testing.T) {
+	done := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		select {
+		case <-done:
+		case <-r.Context().Done():
+		}
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, "test-model", "", &http.Client{Timeout: 50 * time.Millisecond})
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	start := time.Now()
+	_, err = client.Complete(context.Background(), []Message{{Role: "user", Content: "hello"}})
+	elapsed := time.Since(start)
+
+	close(done)
+	server.CloseClientConnections()
+	if tr, ok := http.DefaultTransport.(*http.Transport); ok {
+		tr.CloseIdleConnections()
+	}
+
+	if err == nil {
+		t.Fatal("expected timeout error for stalled server, got nil")
+	}
+	if elapsed > 2*time.Second {
+		t.Fatalf("request took too long to time out: %v", elapsed)
+	}
+}
+
+func TestLLM_DefaultTimeout_Installed(t *testing.T) {
+	client, err := NewClient("http://localhost:1234", "test-model", "", nil)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	if client.http == nil {
+		t.Fatal("expected http.Client to be initialized")
+	}
+	if client.http.Timeout != DefaultRequestTimeout {
+		t.Fatalf("expected default timeout %v, got %v", DefaultRequestTimeout, client.http.Timeout)
+	}
+	if DefaultRequestTimeout <= 0 {
+		t.Fatal("expected DefaultRequestTimeout to be positive finite duration")
+	}
+}
+
+func TestLLM_PreservesCustomClient(t *testing.T) {
+	customClient := &http.Client{Timeout: 123 * time.Millisecond}
+	client, err := NewClient("http://localhost:1234", "test-model", "", customClient)
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+	if client.http != customClient {
+		t.Fatal("expected custom HTTP client to be preserved")
+	}
+	if client.http.Timeout != 123*time.Millisecond {
+		t.Fatalf("expected custom timeout 123ms, got %v", client.http.Timeout)
+	}
+}
+
+func TestLLM_StatusError(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+		_, _ = w.Write([]byte("Rate limit reached"))
+	}))
+	defer server.Close()
+
+	client, err := NewClient(server.URL, "test-model", "test-key", server.Client())
+	if err != nil {
+		t.Fatalf("failed to create client: %v", err)
+	}
+
+	_, err = client.Complete(context.Background(), []Message{{Role: "user", Content: "hi"}})
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+
+	var statusErr *StatusError
+	if !strings.Contains(err.Error(), "429") {
+		t.Fatalf("expected status 429 in error, got: %v", err)
+	}
+	if !errors.As(err, &statusErr) {
+		t.Fatalf("expected StatusError type, got %T: %v", err, err)
+	}
+	if statusErr.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("expected StatusCode 429, got %d", statusErr.StatusCode)
 	}
 }

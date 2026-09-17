@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
+	"time"
 )
 
 // Default limits for response bodies.
@@ -19,6 +20,23 @@ const (
 	// MaxErrorBytes caps diagnostic error response bodies to 64 KiB.
 	MaxErrorBytes = 64 * 1024
 )
+
+// DefaultRequestTimeout is the timeout applied to the default HTTP client.
+// It bounds stalled requests while providing ample time for completions.
+const DefaultRequestTimeout = 60 * time.Second
+
+// StatusError represents an HTTP error response from an LLM provider.
+type StatusError struct {
+	StatusCode int
+	Message    string
+}
+
+func (e *StatusError) Error() string {
+	if e.Message != "" {
+		return fmt.Sprintf("llm request failed with status %d: %s", e.StatusCode, e.Message)
+	}
+	return fmt.Sprintf("llm request failed with status %d", e.StatusCode)
+}
 
 // Message represents a single chat role and textual content.
 type Message struct {
@@ -58,7 +76,9 @@ func NewClient(baseURL, model, apiKey string, httpClient *http.Client) (*Client,
 	}
 
 	if httpClient == nil {
-		httpClient = &http.Client{}
+		httpClient = &http.Client{
+			Timeout: DefaultRequestTimeout,
+		}
 	}
 
 	return &Client{
@@ -126,10 +146,7 @@ func (c *Client) Complete(ctx context.Context, messages []Message) (string, erro
 		diagReader := io.LimitReader(resp.Body, MaxErrorBytes)
 		diagBody, _ := io.ReadAll(diagReader)
 		diagText := strings.TrimSpace(string(diagBody))
-		if diagText != "" {
-			return "", c.sanitizeError(fmt.Errorf("llm request failed with status %d: %s", resp.StatusCode, diagText))
-		}
-		return "", c.sanitizeError(fmt.Errorf("llm request failed with status %d", resp.StatusCode))
+		return "", c.sanitizeError(&StatusError{StatusCode: resp.StatusCode, Message: diagText})
 	}
 
 	// Read response bounded by MaxResponseBytes
@@ -167,13 +184,38 @@ func (c *Client) Complete(ctx context.Context, messages []Message) (string, erro
 	return content, nil
 }
 
-// sanitizeError strips the API key from any error message.
+type sanitizedError struct {
+	err error
+	msg string
+}
+
+func (s *sanitizedError) Error() string { return s.msg }
+func (s *sanitizedError) Unwrap() error { return s.err }
+
+// sanitizeError strips the API key from any error message while preserving StatusError and error wrapping.
 func (c *Client) sanitizeError(err error) error {
-	if err == nil || c.apiKey == "" {
+	if err == nil {
+		return nil
+	}
+	var statusErr *StatusError
+	if errors.As(err, &statusErr) {
+		sanitizedMsg := statusErr.Message
+		if c.apiKey != "" && strings.Contains(sanitizedMsg, c.apiKey) {
+			sanitizedMsg = strings.ReplaceAll(sanitizedMsg, c.apiKey, "[REDACTED]")
+		}
+		return &StatusError{
+			StatusCode: statusErr.StatusCode,
+			Message:    sanitizedMsg,
+		}
+	}
+	if c.apiKey == "" || !strings.Contains(err.Error(), c.apiKey) {
 		return err
 	}
 	msg := strings.ReplaceAll(err.Error(), c.apiKey, "[REDACTED]")
-	return errors.New(msg)
+	return &sanitizedError{
+		err: err,
+		msg: msg,
+	}
 }
 
 // isGeminiEndpoint reports whether baseURL points to the Google Gemini OpenAI-compatible API.
@@ -223,10 +265,7 @@ func (c *Client) ListModels(ctx context.Context) ([]ModelInfo, error) {
 		diagReader := io.LimitReader(resp.Body, MaxErrorBytes)
 		diagBody, _ := io.ReadAll(diagReader)
 		diagText := strings.TrimSpace(string(diagBody))
-		if diagText != "" {
-			return nil, c.sanitizeError(fmt.Errorf("llm models request failed with status %d: %s", resp.StatusCode, diagText))
-		}
-		return nil, c.sanitizeError(fmt.Errorf("llm models request failed with status %d", resp.StatusCode))
+		return nil, c.sanitizeError(&StatusError{StatusCode: resp.StatusCode, Message: diagText})
 	}
 
 	limitedReader := io.LimitReader(resp.Body, MaxResponseBytes+1)

@@ -8,6 +8,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -24,13 +25,21 @@ import (
 )
 
 func writeMockExportJSON(args []string) error {
+	channelID := "1"
+	var outPath string
 	for i, arg := range args {
+		if arg == "-c" && i+1 < len(args) {
+			channelID = args[i+1]
+		}
 		if arg == "-o" && i+1 < len(args) {
-			outPath := args[i+1]
-			return os.WriteFile(outPath, []byte(`{"guild":{"id":"1"},"channel":{"id":"1"},"messages":[]}`), 0600)
+			outPath = args[i+1]
 		}
 	}
-	return errors.New("no -o found in args")
+	if outPath == "" {
+		return errors.New("no -o found in args")
+	}
+	content := fmt.Sprintf(`{"guild":{"id":"1"},"channel":{"id":%q},"messages":[]}`, channelID)
+	return os.WriteFile(outPath, []byte(content), 0600)
 }
 
 func TestManager_UnreadableStateReturnsError(t *testing.T) {
@@ -639,4 +648,77 @@ func TestExportCooldownCancellationKeepsCandidatePending(t *testing.T) {
 			t.Fatal("wait ran DCE, changed candidate, or delayed cancellation")
 		}
 	})
+}
+
+func TestManager_CandidateMalformedRollback(t *testing.T) {
+	tmpDir := t.TempDir()
+	bootstrapExe := filepath.Join(tmpDir, "bootstrap", ExpectedExecutableName(runtime.GOOS))
+	_ = os.MkdirAll(filepath.Dir(bootstrapExe), 0700)
+	_ = os.WriteFile(bootstrapExe, []byte("boot"), 0755)
+
+	dataDir := filepath.Join(tmpDir, "data")
+	candDir := filepath.Join(dataDir, "dce", "versions", "2.49.0")
+	_ = os.MkdirAll(candDir, 0700)
+	candExe := filepath.Join(candDir, ExpectedExecutableName(runtime.GOOS))
+	_ = os.WriteFile(candExe, []byte("cand"), 0755)
+
+	var mu sync.Mutex
+	executed := make([]string, 0)
+	runner := func(ctx context.Context, name string, args []string, env []string, stdout, stderr io.Writer) error {
+		mu.Lock()
+		executed = append(executed, name)
+		mu.Unlock()
+		if name == candExe {
+			for i, arg := range args {
+				if arg == "-o" && i+1 < len(args) {
+					return os.WriteFile(args[i+1], []byte(`{"guild":{"id":"1"},"channel":{"id":"100"}}`), 0600)
+				}
+			}
+			return errors.New("no -o flag")
+		}
+		return writeMockExportJSON(args)
+	}
+
+	mgr, err := newUnspacedTestManager(t, dataDir, bootstrapExe, "mock-token",
+		WithCommandRunner(runner),
+		WithBootstrapVersion("2.48.0"),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mgr.mu.Lock()
+	mgr.state.CandidateVersion = "2.49.0"
+	mgr.state.CandidatePath = candExe
+	_ = SaveUpdaterState(mgr.statePath, mgr.state)
+	mgr.mu.Unlock()
+
+	req := ExportRequest{ChannelID: "100"}
+	res, err := mgr.Export(context.Background(), req)
+	if err != nil {
+		t.Fatalf("expected successful active retry after candidate malformed output, got err: %v", err)
+	}
+	if res == nil {
+		t.Fatal("expected non-nil result from active retry")
+	}
+
+	mu.Lock()
+	if len(executed) != 2 || executed[0] != candExe || executed[1] != bootstrapExe {
+		t.Fatalf("expected candidate execution followed by active retry, got %v", executed)
+	}
+	mu.Unlock()
+
+	st := mgr.State()
+	if st.RejectedVersion != "2.49.0" {
+		t.Fatalf("expected RejectedVersion 2.49.0, got %q", st.RejectedVersion)
+	}
+	if st.ActiveVersion != "2.48.0" || st.ActivePath != bootstrapExe {
+		t.Fatalf("expected ActiveVersion 2.48.0, got %+v", st)
+	}
+	if st.CandidateVersion != "" {
+		t.Fatalf("expected empty CandidateVersion, got %q", st.CandidateVersion)
+	}
+	if mgr.Status() != "2.48.0 · 2.49.0 rejected" {
+		t.Fatalf("unexpected status: %s", mgr.Status())
+	}
 }

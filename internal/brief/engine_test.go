@@ -94,8 +94,8 @@ func TestTranscript_RenderingFidelity(t *testing.T) {
 		t.Fatalf("message order not preserved in transcript")
 	}
 
-	// 3. Timestamp included
-	if !strings.Contains(transcript, "[12:00 UTC]") || !strings.Contains(transcript, "[12:05 UTC]") {
+	// 3. Timestamp included with UTC date
+	if !strings.Contains(transcript, "[2026-09-14 12:00 UTC]") || !strings.Contains(transcript, "[2026-09-14 12:05 UTC]") {
 		t.Errorf("timestamps missing in transcript:\n%s", transcript)
 	}
 
@@ -360,5 +360,23 @@ func TestEngine_LLMErrorAbortsCleanly(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "provider 503 unavailable") {
 		t.Errorf("expected provider error message, got: %v", err)
+	}
+}
+
+func TestTranscript_MultiDay(t *testing.T) {
+	day1 := time.Date(2026, 9, 14, 12, 0, 0, 0, time.UTC)
+	day2 := time.Date(2026, 9, 15, 12, 0, 0, 0, time.UTC)
+
+	messages := []Message{
+		{ID: "1", Timestamp: day1, Author: "Alice", Content: "Day 1 message"},
+		{ID: "2", Timestamp: day2, Author: "Alice", Content: "Day 2 message"},
+	}
+
+	transcript := RenderTranscript(messages)
+	if !strings.Contains(transcript, "[2026-09-14 12:00 UTC] Alice: Day 1 message") {
+		t.Errorf("missing day 1 timestamp in transcript:\n%s", transcript)
+	}
+	if !strings.Contains(transcript, "[2026-09-15 12:00 UTC] Alice: Day 2 message") {
+		t.Errorf("missing day 2 timestamp in transcript:\n%s", transcript)
 	}
 }

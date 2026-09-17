@@ -937,6 +937,13 @@ func TestFollowAndUnfollow_BlockedWhileBriefRunning(t *testing.T) {
 		t.Errorf("expected follow blocked message, got %v", edited)
 	}
 
+	// Verify pending follow was PRESERVED after rejection
+	b.mu.Lock()
+	if _, stillPending := b.pendingFollows["temp_pending"]; !stillPending {
+		t.Errorf("expected pending follow to be preserved after runner-busy rejection")
+	}
+	b.mu.Unlock()
+
 	// Verify channel was NOT added to config
 	cfgAfter, _ := store.LoadConfig()
 	if len(cfgAfter.Channels) != 1 {
@@ -957,6 +964,84 @@ func TestFollowAndUnfollow_BlockedWhileBriefRunning(t *testing.T) {
 	}
 
 	runner.Wait()
+
+	// Now that runner is idle, re-attempt the preserved pending follow
+	b.HandleUpdate(ctx, nil, makeCallback(12345, "private", "f:now:temp_pending"))
+	edited = sender.lastEdited()
+	if edited == nil || !strings.Contains(edited.Text, "Now following dev (20002)") {
+		t.Errorf("expected follow success after runner completed, got: %v", edited)
+	}
+
+	// Verify pending follow is now CONSUMED on success
+	b.mu.Lock()
+	if _, stillPending := b.pendingFollows["temp_pending"]; stillPending {
+		t.Errorf("expected pending follow to be consumed after successful follow")
+	}
+	b.mu.Unlock()
+
+	// Verify channel WAS added to config
+	cfgAfter3, _ := store.LoadConfig()
+	if len(cfgAfter3.Channels) != 2 {
+		t.Errorf("expected 2 channels in config after follow, got: %v", cfgAfter3.Channels)
+	}
+}
+
+func TestFollow_CancelConsumesPending(t *testing.T) {
+	b, sender, _, _ := setupTestBot(t)
+	ctx := context.Background()
+
+	b.mu.Lock()
+	b.pendingFollows["cancel_me"] = PendingFollow{
+		ChannelID:   "30003",
+		DisplayName: "test-cancel",
+	}
+	b.mu.Unlock()
+
+	b.HandleUpdate(ctx, nil, makeCallback(12345, "private", "f:cancel:cancel_me"))
+	edited := sender.lastEdited()
+	if edited == nil || !strings.Contains(edited.Text, "Follow cancelled.") {
+		t.Errorf("expected 'Follow cancelled.', got %v", edited)
+	}
+
+	b.mu.Lock()
+	_, exists := b.pendingFollows["cancel_me"]
+	b.mu.Unlock()
+	if exists {
+		t.Errorf("expected pending follow to be consumed on cancel")
+	}
+}
+
+func TestFollow_PersistenceFailurePreservesPending(t *testing.T) {
+	b, sender, store, _ := setupTestBot(t)
+	ctx := context.Background()
+
+	b.mu.Lock()
+	b.pendingFollows["fail_persist"] = PendingFollow{
+		ChannelID:   "40004",
+		DisplayName: "test-fail",
+	}
+	b.mu.Unlock()
+
+	// Block state.json by making a directory at its path
+	statePath := store.StatePath()
+	_ = os.Remove(statePath)
+	if err := os.Mkdir(statePath, 0500); err != nil {
+		t.Skip("cannot create directory blocking state file")
+	}
+	defer os.Remove(statePath)
+
+	b.HandleUpdate(ctx, nil, makeCallback(12345, "private", "f:now:fail_persist"))
+	edited := sender.lastEdited()
+	if edited == nil || !strings.Contains(edited.Text, "Failed to") {
+		t.Errorf("expected failure message, got %v", edited)
+	}
+
+	b.mu.Lock()
+	_, exists := b.pendingFollows["fail_persist"]
+	b.mu.Unlock()
+	if !exists {
+		t.Errorf("expected pending follow to be preserved when persistence fails")
+	}
 }
 
 func TestSchedule_View(t *testing.T) {

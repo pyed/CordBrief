@@ -10,8 +10,8 @@ import (
 func RenderMessage(m Message) string {
 	var sb strings.Builder
 
-	// Header: [15:04 UTC] Author:
-	timeStr := m.Timestamp.UTC().Format("15:04 UTC")
+	// Header: [2006-01-02 15:04 UTC] Author:
+	timeStr := m.Timestamp.UTC().Format("2006-01-02 15:04 UTC")
 	author := strings.TrimSpace(m.Author)
 	if author == "" {
 		author = "Unknown"

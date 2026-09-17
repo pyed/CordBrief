@@ -8,9 +8,13 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
+	"net/http"
+	"net/url"
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"testing/synctest"
 	"time"
@@ -504,7 +508,7 @@ func TestRunner_SummarizeFailure_LeavesCursorUnchanged(t *testing.T) {
 		completeFunc: func(ctx context.Context, messages []llm.Message) (string, error) {
 			attempts++
 			if attempts <= 2 {
-				return "", errors.New("LLM rate limit reached")
+				return "", &llm.StatusError{StatusCode: http.StatusTooManyRequests, Message: "LLM rate limit reached"}
 			}
 			return "Healthy channel summary", nil
 		},
@@ -545,7 +549,7 @@ func TestRunner_TransientLLMFailure_RetriedOnce(t *testing.T) {
 		completeFunc: func(ctx context.Context, messages []llm.Message) (string, error) {
 			attempt++
 			if attempt == 1 {
-				return "", errors.New("transient network drop")
+				return "", &url.Error{Op: "Post", URL: "https://api.openai.com/v1/chat/completions", Err: &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}}
 			}
 			return "• Succeeded on retry attempt.", nil
 		},
@@ -586,6 +590,146 @@ func TestRunner_ContextCancellation_NotRetried(t *testing.T) {
 	if attempt != 1 {
 		t.Fatalf("expected 1 attempt without retry on cancellation, got %d", attempt)
 	}
+}
+
+type fakeNetError struct {
+	msg string
+}
+
+func (e *fakeNetError) Error() string   { return e.msg }
+func (e *fakeNetError) Timeout() bool   { return false }
+func (e *fakeNetError) Temporary() bool { return false }
+
+func TestRetryCompleter_TransientAndPermanent(t *testing.T) {
+	transientCases := []struct {
+		name string
+		err  error
+	}{
+		{"HTTP 429 Too Many Requests", &llm.StatusError{StatusCode: 429, Message: "rate limit"}},
+		{"HTTP 500 Internal Server Error", &llm.StatusError{StatusCode: 500, Message: "server error"}},
+		{"HTTP 502 Bad Gateway", &llm.StatusError{StatusCode: 502, Message: "bad gateway"}},
+		{"HTTP 503 Service Unavailable", &llm.StatusError{StatusCode: 503, Message: "overloaded"}},
+		{"HTTP 504 Gateway Timeout", &llm.StatusError{StatusCode: 504, Message: "gateway timeout"}},
+		{"net.OpError dial network failure", &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNRESET}},
+		{"net.Error implementation", &fakeNetError{msg: "network connection lost"}},
+		{"url.Error transport failure", &url.Error{Op: "Post", URL: "http://localhost", Err: &net.OpError{Op: "read", Net: "tcp", Err: syscall.ECONNRESET}}},
+		{"HTTP client timeout while caller context alive", &url.Error{Op: "Post", URL: "http://localhost", Err: context.DeadlineExceeded}},
+		{"io.ErrUnexpectedEOF connection cut", io.ErrUnexpectedEOF},
+	}
+
+	for _, tc := range transientCases {
+		t.Run("transient_"+tc.name, func(t *testing.T) {
+			attempts := 0
+			fakeComp := &FakeCompleter{
+				completeFunc: func(c context.Context, messages []llm.Message) (string, error) {
+					attempts++
+					if attempts == 1 {
+						return "", tc.err
+					}
+					return "recovered", nil
+				},
+			}
+			r := NewRetryCompleter(fakeComp)
+			r.sleep = 5 * time.Millisecond
+
+			res, err := r.Complete(context.Background(), []llm.Message{{Role: "user", Content: "hi"}})
+			if err != nil {
+				t.Fatalf("expected transient error to recover on retry: %v", err)
+			}
+			if res != "recovered" {
+				t.Fatalf("unexpected response: %s", res)
+			}
+			if attempts != 2 {
+				t.Fatalf("expected 2 attempts for transient error, got %d", attempts)
+			}
+		})
+	}
+
+	permanentCases := []struct {
+		name string
+		err  error
+	}{
+		{"plain error matching connection reset", errors.New("connection reset by peer")},
+		{"plain error matching rate limit", errors.New("rate limit reached")},
+		{"arbitrary local error", errors.New("arbitrary application failure")},
+		{"JSON parse error", fmt.Errorf("failed to parse llm response JSON: invalid character")},
+		{"validation zero choices", errors.New("llm response contained zero completion choices")},
+		{"validation empty content", errors.New("llm response returned empty completion content")},
+		{"validation oversized response", errors.New("llm response exceeded maximum allowed size (4 MiB)")},
+		{"HTTP 400 Bad Request", &llm.StatusError{StatusCode: 400, Message: "invalid request"}},
+		{"HTTP 401 Unauthorized", &llm.StatusError{StatusCode: 401, Message: "invalid api key"}},
+		{"HTTP 403 Forbidden", &llm.StatusError{StatusCode: 403, Message: "not allowed"}},
+		{"HTTP 404 Not Found (invalid model)", &llm.StatusError{StatusCode: 404, Message: "model not found"}},
+		{"HTTP 422 Unprocessable Entity", &llm.StatusError{StatusCode: 422, Message: "unprocessable"}},
+		{"raw context.Canceled", context.Canceled},
+		{"raw context.DeadlineExceeded", context.DeadlineExceeded},
+	}
+
+	for _, tc := range permanentCases {
+		t.Run("permanent_"+tc.name, func(t *testing.T) {
+			attempts := 0
+			fakeComp := &FakeCompleter{
+				completeFunc: func(c context.Context, messages []llm.Message) (string, error) {
+					attempts++
+					return "", tc.err
+				},
+			}
+			r := NewRetryCompleter(fakeComp)
+			r.sleep = 5 * time.Millisecond
+
+			_, err := r.Complete(context.Background(), []llm.Message{{Role: "user", Content: "hi"}})
+			if err == nil {
+				t.Fatalf("expected error for permanent status, got nil")
+			}
+			if attempts != 1 {
+				t.Fatalf("expected exactly 1 attempt for permanent status %s (no retry), got %d", tc.name, attempts)
+			}
+		})
+	}
+
+	t.Run("caller cancellation does not retry", func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		attempts := 0
+		fakeComp := &FakeCompleter{
+			completeFunc: func(c context.Context, messages []llm.Message) (string, error) {
+				attempts++
+				return "", c.Err()
+			},
+		}
+		r := NewRetryCompleter(fakeComp)
+		r.sleep = 5 * time.Millisecond
+
+		_, err := r.Complete(ctx, []llm.Message{{Role: "user", Content: "hi"}})
+		if err == nil {
+			t.Fatal("expected error on canceled context, got nil")
+		}
+		if attempts != 1 {
+			t.Fatalf("expected exactly 1 attempt on canceled context, got %d", attempts)
+		}
+	})
+
+	t.Run("caller deadline expiration does not retry", func(t *testing.T) {
+		ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+		defer cancel()
+		attempts := 0
+		fakeComp := &FakeCompleter{
+			completeFunc: func(c context.Context, messages []llm.Message) (string, error) {
+				attempts++
+				return "", &url.Error{Op: "Post", URL: "http://localhost", Err: context.DeadlineExceeded}
+			},
+		}
+		r := NewRetryCompleter(fakeComp)
+		r.sleep = 5 * time.Millisecond
+
+		_, err := r.Complete(ctx, []llm.Message{{Role: "user", Content: "hi"}})
+		if err == nil {
+			t.Fatal("expected error on expired context, got nil")
+		}
+		if attempts != 1 {
+			t.Fatalf("expected exactly 1 attempt on expired context, got %d", attempts)
+		}
+	})
 }
 
 func TestRunner_MultiPartDelivery_PartialFailure_LeavesCursorUnchanged(t *testing.T) {
@@ -684,7 +828,7 @@ func TestRetry_DeadlineAndCancellationDuringDelay(t *testing.T) {
 				return "", context.DeadlineExceeded
 			}
 			go func() { time.Sleep(10 * time.Millisecond); cancel() }()
-			return "", errors.New("transient error")
+			return "", &url.Error{Op: "Post", URL: "http://localhost", Err: &net.OpError{Op: "dial", Net: "tcp", Err: syscall.ECONNRESET}}
 		}}
 		_, err := NewRetryCompleter(comp).Complete(ctx, []llm.Message{{Role: "user", Content: "hi"}})
 		cancel()
@@ -1129,4 +1273,138 @@ func TestScheduledCancellationAndPartialDeliveryKeepCursor(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestRunner_Mutate_ExcludesJobStart(t *testing.T) {
+	store, _ := setupTestStore(t)
+	cfg := state.DefaultConfig()
+	cfg.Channels = []state.ChannelConfig{{ID: "100", Name: "general"}}
+	_ = store.SaveConfig(cfg)
+	st := state.NewEmptyState()
+	st.Channels["100"] = state.ChannelState{Cursor: state.Cursor{Kind: state.CursorKindMessageID, Value: "10"}}
+	_ = store.SaveState(st)
+
+	exporter := &FakeDCE{
+		configured: true,
+		exportFunc: func(ctx context.Context, req dce.ExportRequest) (*dce.ExportResult, error) {
+			return &dce.ExportResult{
+				Channel:  dce.ChannelInfo{ID: req.ChannelID},
+				Messages: []dce.Message{},
+			}, nil
+		},
+	}
+	var delivered []string
+	var delMu sync.Mutex
+	del := &FakeDeliverer{
+		deliverFunc: func(ctx context.Context, msg string) error {
+			delMu.Lock()
+			delivered = append(delivered, msg)
+			delMu.Unlock()
+			return nil
+		},
+	}
+
+	r, err := NewRunner(store, WithDCEClient(exporter), WithDeliverer(del))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	mutateStarted := make(chan struct{})
+	continueMutate := make(chan struct{})
+	mutateDone := make(chan struct{})
+
+	go func() {
+		defer close(mutateDone)
+		err := r.Mutate(func() error {
+			close(mutateStarted)
+			<-continueMutate
+			cfg, _ := store.LoadConfig()
+			cfg.Channels = append(cfg.Channels, state.ChannelConfig{ID: "200", Name: "random"})
+			_ = store.SaveConfig(cfg)
+			st, _ := store.LoadState()
+			st.Channels["200"] = state.ChannelState{Cursor: state.Cursor{Kind: state.CursorKindMessageID, Value: "20"}}
+			_ = store.SaveState(st)
+			return nil
+		})
+		if err != nil {
+			t.Errorf("mutation failed: %v", err)
+		}
+	}()
+
+	<-mutateStarted
+
+	jobStarted := make(chan bool)
+	go func() {
+		ok := r.Start(context.Background(), "")
+		jobStarted <- ok
+	}()
+
+	select {
+	case <-jobStarted:
+		t.Fatal("job started while mutation was still in progress!")
+	case <-time.After(50 * time.Millisecond):
+	}
+
+	close(continueMutate)
+	<-mutateDone
+
+	ok := <-jobStarted
+	if !ok {
+		t.Fatal("job failed to start after mutation completed")
+	}
+
+	r.Wait()
+
+	delMu.Lock()
+	defer delMu.Unlock()
+	if len(delivered) != 2 {
+		t.Fatalf("expected 2 channel deliveries, got %d: %v", len(delivered), delivered)
+	}
+}
+
+func TestRunner_Mutate_RejectedWhenRunning(t *testing.T) {
+	store, _ := setupTestStore(t)
+	cfg := state.DefaultConfig()
+	cfg.Channels = []state.ChannelConfig{{ID: "100", Name: "general"}}
+	_ = store.SaveConfig(cfg)
+	st := state.NewEmptyState()
+	st.Channels["100"] = state.ChannelState{Cursor: state.Cursor{Kind: state.CursorKindMessageID, Value: "10"}}
+	_ = store.SaveState(st)
+
+	jobHold := make(chan struct{})
+	exporter := &FakeDCE{
+		configured: true,
+		exportFunc: func(ctx context.Context, req dce.ExportRequest) (*dce.ExportResult, error) {
+			<-jobHold
+			return &dce.ExportResult{
+				Channel: dce.ChannelInfo{ID: req.ChannelID},
+			}, nil
+		},
+	}
+	del := &FakeDeliverer{}
+
+	r, err := NewRunner(store, WithDCEClient(exporter), WithDeliverer(del))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !r.Start(context.Background(), "") {
+		t.Fatal("failed to start runner")
+	}
+
+	called := false
+	err = r.Mutate(func() error {
+		called = true
+		return nil
+	})
+
+	if !errors.Is(err, ErrBriefRunning) {
+		t.Fatalf("expected ErrBriefRunning, got %v", err)
+	}
+	if called {
+		t.Fatal("mutation function was called while brief was running")
+	}
+
+	close(jobHold)
+	r.Wait()
 }

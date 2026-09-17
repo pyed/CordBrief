@@ -95,13 +95,21 @@ const sampleValidJSON = `{
   "messageCount": 1
 }`
 
+func writeMockExport(args []string) error {
+	outPath := getArgValue(args, "-o")
+	channelID := getArgValue(args, "-c")
+	if channelID == "" {
+		channelID = "1"
+	}
+	return os.WriteFile(outPath, []byte(fmt.Sprintf(`{"guild":{"id":"1"},"channel":{"id":%q},"messages":[]}`, channelID)), 0600)
+}
+
 // 1. timestamp cursor produces correct verified --after argument
 func TestArgv_TimestampCursor(t *testing.T) {
 	var capturedArgs []string
 	runner := func(ctx context.Context, name string, args []string, env []string, stdout, stderr io.Writer) error {
 		capturedArgs = args
-		outPath := getArgValue(args, "-o")
-		return os.WriteFile(outPath, []byte(`{"guild":{"id":"1"},"channel":{"id":"1"},"messages":[]}`), 0600)
+		return writeMockExport(args)
 	}
 
 	client := NewMockClient("dce.exe", "fake-token", runner)
@@ -129,8 +137,7 @@ func TestArgv_MessageIDCursor(t *testing.T) {
 	var capturedArgs []string
 	runner := func(ctx context.Context, name string, args []string, env []string, stdout, stderr io.Writer) error {
 		capturedArgs = args
-		outPath := getArgValue(args, "-o")
-		return os.WriteFile(outPath, []byte(`{"guild":{"id":"1"},"channel":{"id":"1"},"messages":[]}`), 0600)
+		return writeMockExport(args)
 	}
 
 	client := NewMockClient("dce.exe", "fake-token", runner)
@@ -158,8 +165,7 @@ func TestArgv_BeforeCutoff(t *testing.T) {
 	var capturedArgs []string
 	runner := func(ctx context.Context, name string, args []string, env []string, stdout, stderr io.Writer) error {
 		capturedArgs = args
-		outPath := getArgValue(args, "-o")
-		return os.WriteFile(outPath, []byte(`{"guild":{"id":"1"},"channel":{"id":"1"},"messages":[]}`), 0600)
+		return writeMockExport(args)
 	}
 
 	client := NewMockClient("dce.exe", "fake-token", runner)
@@ -185,8 +191,7 @@ func TestArgv_FormatJson(t *testing.T) {
 	var capturedArgs []string
 	runner := func(ctx context.Context, name string, args []string, env []string, stdout, stderr io.Writer) error {
 		capturedArgs = args
-		outPath := getArgValue(args, "-o")
-		return os.WriteFile(outPath, []byte(`{"guild":{"id":"1"},"channel":{"id":"1"},"messages":[]}`), 0600)
+		return writeMockExport(args)
 	}
 
 	client := NewMockClient("dce.exe", "fake-token", runner)
@@ -210,8 +215,7 @@ func TestArgv_ChannelIDExact(t *testing.T) {
 	var capturedArgs []string
 	runner := func(ctx context.Context, name string, args []string, env []string, stdout, stderr io.Writer) error {
 		capturedArgs = args
-		outPath := getArgValue(args, "-o")
-		return os.WriteFile(outPath, []byte(`{"guild":{"id":"1"},"channel":{"id":"1"},"messages":[]}`), 0600)
+		return writeMockExport(args)
 	}
 
 	client := NewMockClient("dce.exe", "fake-token", runner)
@@ -235,8 +239,7 @@ func TestArgv_OutputPathExact(t *testing.T) {
 	var capturedArgs []string
 	runner := func(ctx context.Context, name string, args []string, env []string, stdout, stderr io.Writer) error {
 		capturedArgs = args
-		outPath := getArgValue(args, "-o")
-		return os.WriteFile(outPath, []byte(`{"guild":{"id":"1"},"channel":{"id":"1"},"messages":[]}`), 0600)
+		return writeMockExport(args)
 	}
 
 	client := NewMockClient("dce.exe", "fake-token", runner)
@@ -263,8 +266,7 @@ func TestSecurity_TokenNotInArgv(t *testing.T) {
 	var capturedArgs []string
 	runner := func(ctx context.Context, name string, args []string, env []string, stdout, stderr io.Writer) error {
 		capturedArgs = args
-		outPath := getArgValue(args, "-o")
-		return os.WriteFile(outPath, []byte(`{"guild":{"id":"1"},"channel":{"id":"1"},"messages":[]}`), 0600)
+		return writeMockExport(args)
 	}
 
 	client := NewMockClient("dce.exe", secretToken, runner)
@@ -291,8 +293,7 @@ func TestSecurity_ChildReceivesTokenInEnv(t *testing.T) {
 	var capturedEnv []string
 	runner := func(ctx context.Context, name string, args []string, env []string, stdout, stderr io.Writer) error {
 		capturedEnv = env
-		outPath := getArgValue(args, "-o")
-		return os.WriteFile(outPath, []byte(`{"guild":{"id":"1"},"channel":{"id":"1"},"messages":[]}`), 0600)
+		return writeMockExport(args)
 	}
 
 	client := NewMockClient("dce.exe", secretToken, runner)
@@ -383,7 +384,8 @@ func TestCancellation_ContextCancelled(t *testing.T) {
 
 // 13. valid real-shaped fixture JSON parses correctly
 func TestParser_ValidFixture(t *testing.T) {
-	res, err := parseDCEExport([]byte(sampleValidJSON))
+	req := ExportRequest{ChannelID: "1391912303376728155"}
+	res, err := parseDCEExport([]byte(sampleValidJSON), req)
 	if err != nil {
 		t.Fatalf("failed to parse valid fixture: %v", err)
 	}
@@ -416,7 +418,8 @@ func TestParser_UnknownFieldsForwardCompatibility(t *testing.T) {
 		]
 	}`
 
-	res, err := parseDCEExport([]byte(jsonWithExtra))
+	req := ExportRequest{ChannelID: "2"}
+	res, err := parseDCEExport([]byte(jsonWithExtra), req)
 	if err != nil {
 		t.Fatalf("expected forward compatibility for unknown fields, got error: %v", err)
 	}
@@ -427,7 +430,8 @@ func TestParser_UnknownFieldsForwardCompatibility(t *testing.T) {
 
 // 15. malformed JSON rejected
 func TestParser_MalformedJSON(t *testing.T) {
-	_, err := parseDCEExport([]byte(`{not valid json`))
+	req := ExportRequest{ChannelID: "2"}
+	_, err := parseDCEExport([]byte(`{not valid json`), req)
 	if err == nil {
 		t.Fatal("expected malformed JSON error, got nil")
 	}
@@ -442,7 +446,8 @@ func TestParser_EmptyMessageArray(t *testing.T) {
 		"messageCount": 0
 	}`
 
-	res, err := parseDCEExport([]byte(emptyJSON))
+	req := ExportRequest{ChannelID: "2"}
+	res, err := parseDCEExport([]byte(emptyJSON), req)
 	if err != nil {
 		t.Fatalf("unexpected error for empty messages array: %v", err)
 	}
@@ -464,7 +469,8 @@ func TestParser_LargeSnowflakePreservation(t *testing.T) {
 		"messages": [{"id": %q, "timestamp": "2026-09-14T12:00:00Z", "content": "test"}]
 	}`, largeID)
 
-	res, err := parseDCEExport([]byte(jsonText))
+	req := ExportRequest{ChannelID: "2"}
+	res, err := parseDCEExport([]byte(jsonText), req)
 	if err != nil {
 		t.Fatalf("failed to parse large snowflake: %v", err)
 	}
@@ -488,7 +494,8 @@ func TestParser_ChronologicalOrdering(t *testing.T) {
 		]
 	}`
 
-	res, err := parseDCEExport([]byte(unorderedJSON))
+	req := ExportRequest{ChannelID: "2"}
+	res, err := parseDCEExport([]byte(unorderedJSON), req)
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
@@ -513,7 +520,8 @@ func TestParser_MaxMessageID(t *testing.T) {
 		]
 	}`
 
-	res, err := parseDCEExport([]byte(jsonText))
+	req := ExportRequest{ChannelID: "2"}
+	res, err := parseDCEExport([]byte(jsonText), req)
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
@@ -524,7 +532,8 @@ func TestParser_MaxMessageID(t *testing.T) {
 
 // 20. parser preserves timestamp, author, content, reply/attachment fields
 func TestParser_PreservesCoreFields(t *testing.T) {
-	res, err := parseDCEExport([]byte(sampleValidJSON))
+	req := ExportRequest{ChannelID: "1391912303376728155"}
+	res, err := parseDCEExport([]byte(sampleValidJSON), req)
 	if err != nil {
 		t.Fatalf("parse failed: %v", err)
 	}
@@ -632,6 +641,15 @@ func TestCompareSnowflake(t *testing.T) {
 	}
 }
 
+func TestCompareSnowflake_DifferingDecimalLengths(t *testing.T) {
+	if got := CompareSnowflake("1000", "999"); got <= 0 {
+		t.Fatalf("expected CompareSnowflake(\"1000\", \"999\") > 0, got %d", got)
+	}
+	if got := CompareSnowflake("999", "1000"); got >= 0 {
+		t.Fatalf("expected CompareSnowflake(\"999\", \"1000\") < 0, got %d", got)
+	}
+}
+
 // helper to extract value for a flag from args list
 func getArgValue(args []string, flag string) string {
 	for i := 0; i < len(args); i++ {
@@ -643,4 +661,105 @@ func getArgValue(args []string, flag string) string {
 		}
 	}
 	return ""
+}
+
+func TestDCE_Validation(t *testing.T) {
+	req := ExportRequest{
+		ChannelID: "100",
+		After:     state.Cursor{Kind: state.CursorKindMessageID, Value: "500"},
+	}
+
+	t.Run("empty json {}", func(t *testing.T) {
+		_, err := parseDCEExport([]byte("{}"), req)
+		if err == nil {
+			t.Fatal("expected error for empty json {}, got nil")
+		}
+	})
+
+	t.Run("missing messages field", func(t *testing.T) {
+		jsonText := `{"guild": {"id": "1"}, "channel": {"id": "100"}}`
+		_, err := parseDCEExport([]byte(jsonText), req)
+		if err == nil || !strings.Contains(err.Error(), "missing messages field") {
+			t.Fatalf("expected missing messages field error, got: %v", err)
+		}
+	})
+
+	t.Run("wrong channel", func(t *testing.T) {
+		jsonText := `{"guild": {"id": "1"}, "channel": {"id": "999"}, "messages": []}`
+		_, err := parseDCEExport([]byte(jsonText), req)
+		if err == nil || !strings.Contains(err.Error(), "channel ID mismatch") {
+			t.Fatalf("expected channel ID mismatch error, got: %v", err)
+		}
+	})
+
+	t.Run("empty message ID", func(t *testing.T) {
+		jsonText := `{"guild": {"id": "1"}, "channel": {"id": "100"}, "messages": [{"id": "", "content": "hi"}]}`
+		_, err := parseDCEExport([]byte(jsonText), req)
+		if err == nil || !strings.Contains(err.Error(), "invalid message ID") {
+			t.Fatalf("expected invalid message ID error, got: %v", err)
+		}
+	})
+
+	t.Run("nondecimal message ID", func(t *testing.T) {
+		jsonText := `{"guild": {"id": "1"}, "channel": {"id": "100"}, "messages": [{"id": "abc123", "content": "hi"}]}`
+		_, err := parseDCEExport([]byte(jsonText), req)
+		if err == nil || !strings.Contains(err.Error(), "invalid message ID") {
+			t.Fatalf("expected invalid message ID error, got: %v", err)
+		}
+	})
+
+	t.Run("negative message ID", func(t *testing.T) {
+		jsonText := `{"guild": {"id": "1"}, "channel": {"id": "100"}, "messages": [{"id": "-500", "content": "hi"}]}`
+		_, err := parseDCEExport([]byte(jsonText), req)
+		if err == nil || !strings.Contains(err.Error(), "invalid message ID") {
+			t.Fatalf("expected invalid message ID error, got: %v", err)
+		}
+	})
+
+	t.Run("ID equal to cursor (at cursor)", func(t *testing.T) {
+		jsonText := `{"guild": {"id": "1"}, "channel": {"id": "100"}, "messages": [{"id": "500", "content": "hi"}]}`
+		_, err := parseDCEExport([]byte(jsonText), req)
+		if err == nil || !strings.Contains(err.Error(), "not strictly greater than cursor") {
+			t.Fatalf("expected ID at cursor rejected, got: %v", err)
+		}
+	})
+
+	t.Run("ID behind cursor", func(t *testing.T) {
+		jsonText := `{"guild": {"id": "1"}, "channel": {"id": "100"}, "messages": [{"id": "499", "content": "hi"}]}`
+		_, err := parseDCEExport([]byte(jsonText), req)
+		if err == nil || !strings.Contains(err.Error(), "not strictly greater than cursor") {
+			t.Fatalf("expected ID behind cursor rejected, got: %v", err)
+		}
+	})
+
+	t.Run("valid empty messages array", func(t *testing.T) {
+		jsonText := `{"guild": {"id": "1"}, "channel": {"id": "100"}, "messages": []}`
+		res, err := parseDCEExport([]byte(jsonText), req)
+		if err != nil {
+			t.Fatalf("unexpected error for valid empty messages: %v", err)
+		}
+		if len(res.Messages) != 0 {
+			t.Fatalf("expected 0 messages, got %d", len(res.Messages))
+		}
+		if res.MaxMessageID != "" {
+			t.Fatalf("expected empty MaxMessageID, got %s", res.MaxMessageID)
+		}
+	})
+
+	t.Run("valid normal export unchanged", func(t *testing.T) {
+		jsonText := `{"guild": {"id": "1"}, "channel": {"id": "100"}, "messages": [
+			{"id": "501", "content": "first", "timestamp": "2026-09-14T12:00:00Z"},
+			{"id": "502", "content": "second", "timestamp": "2026-09-14T12:01:00Z"}
+		]}`
+		res, err := parseDCEExport([]byte(jsonText), req)
+		if err != nil {
+			t.Fatalf("unexpected error for valid export: %v", err)
+		}
+		if len(res.Messages) != 2 {
+			t.Fatalf("expected 2 messages, got %d", len(res.Messages))
+		}
+		if res.MaxMessageID != "502" {
+			t.Fatalf("expected MaxMessageID 502, got %s", res.MaxMessageID)
+		}
+	})
 }

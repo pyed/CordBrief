@@ -211,7 +211,7 @@ func (c *Client) Export(ctx context.Context, req ExportRequest) (*ExportResult, 
 		return nil, fmt.Errorf("dce completed successfully but output file is missing: %w", err)
 	}
 
-	return parseDCEExport(data)
+	return parseDCEExport(data, req)
 }
 
 // DCE only receives its own credential, never inherited Telegram or AI credentials.
@@ -252,7 +252,7 @@ type rawDCEExport struct {
 		Type     string `json:"type"`
 		Category string `json:"category"`
 	} `json:"channel"`
-	Messages []rawDCEMessage `json:"messages"`
+	Messages *[]rawDCEMessage `json:"messages"`
 }
 
 type rawDCEMessage struct {
@@ -283,11 +283,21 @@ type rawDCEMessage struct {
 	} `json:"embeds"`
 }
 
-// parseDCEExport normalizes external DCE JSON into CordBrief domain types.
-func parseDCEExport(data []byte) (*ExportResult, error) {
+// parseDCEExport normalizes and strictly validates external DCE JSON into CordBrief domain types.
+func parseDCEExport(data []byte, req ExportRequest) (*ExportResult, error) {
 	var raw rawDCEExport
 	if err := json.Unmarshal(data, &raw); err != nil {
 		return nil, fmt.Errorf("failed to parse dce export json: %w", err)
+	}
+
+	// 1. messages field must actually be present in DCE JSON
+	if raw.Messages == nil {
+		return nil, errors.New("dce export missing messages field")
+	}
+
+	// 2. returned channel ID must exactly match the requested channel ID
+	if raw.Channel.ID != req.ChannelID {
+		return nil, fmt.Errorf("dce export channel ID mismatch: expected %q, got %q", req.ChannelID, raw.Channel.ID)
 	}
 
 	res := &ExportResult{
@@ -301,11 +311,23 @@ func parseDCEExport(data []byte) (*ExportResult, error) {
 			Type:     raw.Channel.Type,
 			Category: raw.Channel.Category,
 		},
-		Messages: make([]Message, 0, len(raw.Messages)),
+		Messages: make([]Message, 0, len(*raw.Messages)),
 	}
 
 	var maxID string
-	for _, m := range raw.Messages {
+	for _, m := range *raw.Messages {
+		// 3. every returned message ID must be a valid decimal Discord snowflake
+		if !state.IsDecimalString(m.ID) {
+			return nil, fmt.Errorf("invalid message ID %q: must contain only decimal digits", m.ID)
+		}
+
+		// 4. when After is a message-ID cursor, returned IDs must be strictly greater than it
+		if req.After.Kind == state.CursorKindMessageID && req.After.Value != "" {
+			if CompareSnowflake(m.ID, req.After.Value) <= 0 {
+				return nil, fmt.Errorf("returned message ID %s is not strictly greater than cursor %s", m.ID, req.After.Value)
+			}
+		}
+
 		msg := Message{
 			ID:        m.ID,
 			Timestamp: m.Timestamp,
@@ -351,6 +373,7 @@ func parseDCEExport(data []byte) (*ExportResult, error) {
 
 		res.Messages = append(res.Messages, msg)
 
+		// 5. MaxMessageID derived safely from valid returned IDs
 		if maxID == "" || CompareSnowflake(m.ID, maxID) > 0 {
 			maxID = m.ID
 		}
@@ -363,6 +386,13 @@ func parseDCEExport(data []byte) (*ExportResult, error) {
 		}
 		return res.Messages[i].Timestamp.Before(res.Messages[j].Timestamp)
 	})
+
+	// Enforce that MaxMessageID must never move progress backward
+	if req.After.Kind == state.CursorKindMessageID && req.After.Value != "" && maxID != "" {
+		if CompareSnowflake(maxID, req.After.Value) <= 0 {
+			return nil, fmt.Errorf("derived max message ID %s is not greater than cursor %s", maxID, req.After.Value)
+		}
+	}
 
 	res.MaxMessageID = maxID
 	return res, nil

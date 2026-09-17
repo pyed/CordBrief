@@ -136,6 +136,21 @@ func (r *Runner) IsRunning() bool {
 	return r.running
 }
 
+// ErrBriefRunning is returned when a mutation cannot proceed because a brief is currently executing.
+var ErrBriefRunning = errors.New("brief already running")
+
+// Mutate executes fn exclusively with respect to brief job startup and execution.
+// If a brief job is already running, Mutate returns ErrBriefRunning without executing fn.
+// While fn executes, no brief job can acquire the runner or start.
+func (r *Runner) Mutate(fn func() error) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.running {
+		return ErrBriefRunning
+	}
+	return fn()
+}
+
 // Wait blocks until any active background job finishes.
 func (r *Runner) Wait() {
 	r.wg.Wait()
