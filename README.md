@@ -42,15 +42,28 @@ Replace the example with your channel ID. Choose **From now** or **Last 24 hours
 | --- | --- |
 | `/brief [channel_id]` | Summarize all followed channels, or one channel. |
 | `/channels` | List followed channels. |
+| `/discover` | Browse discovered servers and channels; follow or hide a channel. |
+| `/hidden` | View hidden channels and unhide them. |
 | `/unfollow [channel_id]` | Stop following a channel after confirmation. |
 | `/schedule 08:00 Asia/Riyadh` | Target daily brief delivery around that local time; preparation starts earlier. |
 | `/schedule off` | Disable daily briefs; `/schedule` shows the current setting. |
 | `/dcecooldown [0\|5m\|15m\|1h]` | Show or save the minimum interval between DCE export starts (default 15m; 0 disables it; maximum 1h). |
 | `/model [model_id]` | Browse models or set one directly. |
+| `/fallback [on|off|model <model_id>]` | Show or change the optional fallback profile; never accepts API keys. |
 | `/prompt` | View/edit instructions; `/prompt reset` restores the default. |
 | `/status` | Show settings, exporter version, and current job status. |
 
 Scheduling starts disabled, with UTC as the initial timezone. Only the configured owner can control CordBrief, in a private Telegram chat.
+
+### Discover channels
+
+Use **Discover** from `/start` or `/channels`, or send `/discover`. Select a server, then a channel, then **Follow**. This opens the same **From now / Last 24 hours** selection used by direct `/follow <channel_id> [name]`.
+
+DCE's catalog can be much larger than the channels shown in Discord's UI. CordBrief cannot infer UI visibility or permission-hidden channels from these lists. Select **Hide** for irrelevant entries. Normal channel pages omit followed and hidden entries. `/hidden` lets you unhide entries even after a restart or when they disappear from the catalog. Hiding affects only browsing, never an existing follow or cursor.
+
+Server and per-server channel lists are cached in memory until restart or explicit **Refresh**. Paging, going back and reopening a cached server make no DCE calls. Refresh replaces only the selected list after success; failures retain the previous list. There is no background discovery or TTL. Discovery lists ordinary non-voice channels, without enumerating threads or direct messages; direct follow by ID remains available.
+
+Metadata calls are sequential, limited to 30 seconds and 1 MiB of output, and refused while a brief is running or DCE is busy. Cached browsing still works during a brief; follow/hide/unhide changes are refused until it finishes. Discovery uses only the active DCE version and never changes export cooldown or candidate probation state. On a first installation with only a candidate, use direct follow and complete a normal brief first. Discovery never exports messages. Unknown or truncated metadata fails closed and leaves cached data intact.
 
 ### Export spacing and scheduled delivery
 
@@ -66,15 +79,33 @@ Keep the app running for scheduled delivery. Prepared text is held in memory; re
 
 ## Credentials and headless operation
 
-To change credentials, stop CordBrief and run `./cordbrief --setup` (Windows: `.\cordbrief.exe --setup`). Enter keeps an existing value; `-` clears the optional AI key. Setup saves and exits without contacting Discord or testing exports.
+To change credentials, stop CordBrief and run `./cordbrief --setup` (Windows: `.\cordbrief.exe --setup`). Enter keeps an existing value; `-` clears either optional AI key. Setup saves and exits without contacting Discord or testing exports.
 
 Credentials live in `data/credentials.json`, separate from `config.json` and `state.json`. The file is **not encrypted**: Unix permissions restrict it to the owner (`0600`), and Windows uses a protected ACL granting access only to the current account. Windows storage must support ACLs, such as NTFS. Administrators, software running as your account, and anyone with access to an unprotected disk/backup can still read it.
 
 For a headless service, run setup once as the service account. Use the same working directory on subsequent starts, or set `CORDBRIEF_DATA_DIR` to a permanent data folder. Noninteractive launches never prompt: missing required credentials produce an error and exit.
 
-Existing environment deployments still work. `TELEGRAM_BOT_TOKEN`, `TELEGRAM_OWNER_ID`, `DISCORD_TOKEN`, and `LLM_API_KEY` override saved values; an explicitly empty variable clears its saved value for that run. Environment-only startup does not save credentials. CordBrief does not load `.env` files or accept secrets as command-line arguments.
+Existing environment deployments still work. `TELEGRAM_BOT_TOKEN`, `TELEGRAM_OWNER_ID`, `DISCORD_TOKEN`, `LLM_API_KEY`, and `FALLBACK_LLM_API_KEY` override saved values; an explicitly empty variable clears its saved value for that run. Environment-only startup does not save credentials. CordBrief does not load `.env` files or accept secrets as command-line arguments.
 
 To change AI providers, save a setting with `/model model-id`, stop CordBrief, and edit `llm.base_url` and `llm.model` in `data/config.json`. Use `--setup` to change the API key, then restart.
+
+### Optional fallback LLM
+
+While stopped, add one non-secret `fallback` object to `config.json`, keeping your other settings:
+
+```json
+"fallback": {
+  "enabled": false,
+  "base_url": "https://your-other-provider.example/v1",
+  "model": "your-fallback-model"
+}
+```
+
+Use `--setup` to enter the separate fallback key, or set `FALLBACK_LLM_API_KEY`, then restart. A local unauthenticated fallback can have an empty key; it never inherits the primary key, even when both endpoints are identical. Endpoint changes stay in the offline configuration path. Neither profile follows HTTP redirects. Do not put credentials in endpoint URLs or Telegram messages.
+
+Send `/fallback` to see the profile and `/fallback on` to enable it. `/fallback off` retains the profile while disabling failover; `/fallback model <model_id>` changes its model. Configuration changes are refused during a brief. A successful primary never contacts fallback. If a completion fails after the existing bounded retry policy, and the job is still valid, fallback receives that same collected request. Each provider retains at most two attempts for transient errors; permanent errors are not retried. No failover causes a Discord export. Zero-message channels make no AI calls. Once fallback succeeds, all remaining completions in that job use it; the next job tries primary again. Stopping CordBrief or cancelling a brief suppresses fallback; provider timeouts or remote errors are treated as provider failures and can still fail over. Failed summaries leave their channel cursors unchanged.
+
+Config schema 4 adds only optional `fallback` and `hidden_channels` fields. Older configurations migrate automatically (v2 -> v3 -> v4), preserving existing channels, custom prompt, schedule, timezone, LLM settings, cooldown, and cursors. Fallback starts absent, and hidden channels start empty. Cursor storage is unchanged. The separate private credential file gains `fallback_llm_api_key`; older credential files remain valid.
 
 Back up the data folder securely and run only one instance per folder. Messages are sent to your configured AI provider. Temporary exports are deleted, and channel progress advances only after every summary part reaches Telegram. A partly delivered brief may repeat on retry.
 

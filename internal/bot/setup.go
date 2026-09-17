@@ -15,10 +15,11 @@ import (
 
 // Credentials have their own private file, never the public config or cursor state.
 type credentials struct {
-	BotToken     string `json:"telegram_bot_token"`
-	OwnerID      string `json:"telegram_owner_id"`
-	DiscordToken string `json:"discord_token"`
-	LLMAPIKey    string `json:"llm_api_key"`
+	BotToken       string `json:"telegram_bot_token"`
+	OwnerID        string `json:"telegram_owner_id"`
+	DiscordToken   string `json:"discord_token"`
+	LLMAPIKey      string `json:"llm_api_key"`
+	FallbackAPIKey string `json:"fallback_llm_api_key,omitempty"`
 }
 
 func credentialDataDir() string {
@@ -37,6 +38,7 @@ func loadCredentials() (credentials, error) {
 	for key, dst := range map[string]*string{
 		"TELEGRAM_BOT_TOKEN": &c.BotToken, "TELEGRAM_OWNER_ID": &c.OwnerID,
 		"DISCORD_TOKEN": &c.DiscordToken, "LLM_API_KEY": &c.LLMAPIKey,
+		"FALLBACK_LLM_API_KEY": &c.FallbackAPIKey,
 	} {
 		if value, ok := os.LookupEnv(key); ok {
 			*dst = strings.TrimSpace(value)
@@ -79,7 +81,7 @@ func loadStoredCredentials() (credentials, error) {
 }
 
 func (c credentials) validateValues() error {
-	for _, value := range []string{c.BotToken, c.OwnerID, c.DiscordToken, c.LLMAPIKey} {
+	for _, value := range []string{c.BotToken, c.OwnerID, c.DiscordToken, c.LLMAPIKey, c.FallbackAPIKey} {
 		if len(value) > 8192 || strings.ContainsAny(value, "\r\n\x00") {
 			return errors.New("credential value is too long or contains a line break/control character")
 		}
@@ -130,7 +132,7 @@ func Configure() error {
 	if !Interactive() {
 		return errors.New("setup needs an interactive terminal; run cordbrief --setup as the service account, or provide environment variables")
 	}
-	fmt.Println("CordBrief setup. Input is hidden. Enter keeps an existing value; '-' clears the optional AI key.")
+	fmt.Println("CordBrief setup. Input is hidden. Enter keeps an existing value; '-' clears either optional AI key.")
 	fmt.Println("Get a Telegram bot token from @BotFather and your numeric Telegram user ID.")
 	fmt.Println("Use a Discord token that can read your channels. The AI key is for Gemini by default.")
 	return configure(func(label string) (string, error) {
@@ -155,6 +157,7 @@ func configure(read func(string) (string, error)) error {
 	}{
 		{"Telegram bot token", &c.BotToken}, {"Telegram user ID", &c.OwnerID},
 		{"Discord token", &c.DiscordToken}, {"AI API key (optional for local servers)", &c.LLMAPIKey},
+		{"Fallback AI API key (optional; never inherits primary key)", &c.FallbackAPIKey},
 	} {
 		label := field.label
 		if *field.value != "" {
@@ -170,6 +173,9 @@ func configure(read func(string) (string, error)) error {
 	}
 	if c.LLMAPIKey == "-" {
 		c.LLMAPIKey = ""
+	}
+	if c.FallbackAPIKey == "-" {
+		c.FallbackAPIKey = ""
 	}
 	if c.BotToken == "" || c.DiscordToken == "" {
 		return errors.New("Telegram and Discord tokens are required; run --setup again")

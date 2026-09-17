@@ -306,7 +306,7 @@ func TestValidateConfig_MalformedTimezoneRejected(t *testing.T) {
 
 // 10. Unsupported config schema rejected
 func TestValidateConfig_UnsupportedVersionRejected(t *testing.T) {
-	for _, v := range []int{0, 1, 2, -1, 4, 99} {
+	for _, v := range []int{0, 1, 2, 3, -1, 99} {
 		cfg := DefaultConfig()
 		cfg.Version = v
 		if err := cfg.Validate(); err == nil {
@@ -456,7 +456,7 @@ func TestLoadConfig_LegacyV2Migration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to reload migrated config: %v", err)
 	}
-	if reloaded.Version != 3 || !reloaded.Schedule.Enabled {
+	if reloaded.Version != CurrentConfigVersion || !reloaded.Schedule.Enabled {
 		t.Errorf("reloaded config mismatch: version=%d enabled=%v", reloaded.Version, reloaded.Schedule.Enabled)
 	}
 }

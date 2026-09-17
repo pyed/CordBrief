@@ -156,8 +156,8 @@ func TestPromptConfig(t *testing.T) {
 			t.Fatalf("failed to load v2 config: %v", err)
 		}
 
-		if loaded.Version != 3 {
-			t.Fatalf("expected version 3, got %d", loaded.Version)
+		if loaded.Version != state.CurrentConfigVersion {
+			t.Fatalf("expected current version, got %d", loaded.Version)
 		}
 		if loaded.Brief != nil {
 			t.Fatalf("expected nil brief after migration, got %+v", loaded.Brief)

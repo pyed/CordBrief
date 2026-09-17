@@ -3,6 +3,7 @@ package state
 import (
 	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 )
@@ -37,6 +38,11 @@ type LLMConfig struct {
 	Model   string `json:"model"`
 }
 
+type FallbackConfig struct {
+	Enabled bool `json:"enabled"`
+	LLMConfig
+}
+
 // BriefConfig stores user-customizable brief instructions.
 // An empty Prompt or nil pointer indicates the built-in DefaultBriefPrompt should be used.
 type BriefConfig struct {
@@ -50,13 +56,15 @@ type Config struct {
 	Schedule           ScheduleConfig  `json:"schedule"`
 	Timezone           string          `json:"timezone"`
 	LLM                LLMConfig       `json:"llm"`
+	Fallback           *FallbackConfig `json:"fallback,omitempty"`
+	HiddenChannels     []ChannelConfig `json:"hidden_channels,omitempty"`
 	Brief              *BriefConfig    `json:"brief,omitempty"`
 	DCECooldownSeconds int             `json:"dce_cooldown_seconds"`
 }
 
 // CurrentConfigVersion defines the active config.json schema version.
-// Version 3 introduces operator-customizable brief prompt.
-const CurrentConfigVersion = 3
+// Version 4 adds optional fallback and durable discovery hiding.
+const CurrentConfigVersion = 4
 
 // DefaultConfig returns the standard initial configuration.
 // Timezone defaults to UTC for portability. LLM defaults to the Gemini OpenAI-compatible endpoint.
@@ -106,6 +114,22 @@ func (c *Config) Validate() error {
 	}
 	if strings.TrimSpace(c.LLM.Model) == "" {
 		return errors.New("llm model cannot be empty")
+	}
+	if c.Fallback != nil {
+		u, err := url.Parse(c.Fallback.BaseURL)
+		if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+			return errors.New("fallback base_url must be an HTTP(S) endpoint without credentials, query or fragment")
+		}
+		if strings.TrimSpace(c.Fallback.Model) == "" {
+			return errors.New("fallback model cannot be empty")
+		}
+	}
+	hidden := make(map[string]bool)
+	for _, ch := range c.HiddenChannels {
+		if !IsDecimalString(ch.ID) || hidden[ch.ID] {
+			return errors.New("hidden channel IDs must be unique decimal strings")
+		}
+		hidden[ch.ID] = true
 	}
 
 	seen := make(map[string]struct{}, len(c.Channels))

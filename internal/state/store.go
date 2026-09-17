@@ -67,9 +67,12 @@ func (s *Store) LoadConfig() (*Config, error) {
 	// Pre-existing v2 configs migrate to v3 with no custom override (Brief = nil),
 	// preserving channels, schedule, timezone, and LLM configuration untouched.
 	if cfg.Version == 2 {
-		cfg.Version = CurrentConfigVersion
+		cfg.Version = 3
 		cfg.Brief = nil
-		// Persist the migrated config best-effort so disk is updated to v3
+	}
+	if cfg.Version == 3 {
+		cfg.Version = CurrentConfigVersion
+		// New optional fields have zero defaults; preserve every existing setting.
 		_ = s.SaveConfig(&cfg)
 	}
 

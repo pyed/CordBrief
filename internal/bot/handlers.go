@@ -76,6 +76,12 @@ func (b *Bot) handleMessage(ctx context.Context, msg *models.Message) {
 		b.handleStatus(ctx, msg.Chat.ID)
 	case "/channels":
 		b.handleChannels(ctx, msg.Chat.ID)
+	case "/discover":
+		b.showDiscovery(ctx, msg.Chat.ID, 0, "", 0, true, false)
+	case "/hidden":
+		b.showHidden(ctx, msg.Chat.ID, 0, 0)
+	case "/fallback":
+		b.handleFallback(ctx, msg.Chat.ID, parts[1:])
 	case "/follow":
 		b.handleFollow(ctx, msg.Chat.ID, parts[1:])
 	case "/unfollow":
@@ -118,6 +124,7 @@ func (b *Bot) handleStart(ctx context.Context, chatID int64) {
 			{
 				{Text: "Status", CallbackData: "action=status"},
 				{Text: "Channels", CallbackData: "action=channels"},
+				{Text: "Discover", CallbackData: "d:open:"},
 			},
 		},
 	}
@@ -154,6 +161,7 @@ func (b *Bot) handleStatus(ctx context.Context, chatID int64) {
 
 	text := fmt.Sprintf("CordBrief status\n\nChannels: %d\nSchedule: %s · %s · %s\nLLM: %s\nBrief prompt: %s\nDiscord exporter: %s\nBrief job: %s",
 		len(cfg.Channels), schedEnabled, cfg.Schedule.Time, cfg.Timezone, cfg.LLM.Model, promptStatus, dceStatus, jobStatus)
+	text += "\n" + fallbackStatus(cfg)
 
 	markup := &models.InlineKeyboardMarkup{
 		InlineKeyboard: [][]models.InlineKeyboardButton{
@@ -179,7 +187,7 @@ func (b *Bot) handleChannels(ctx context.Context, chatID int64) {
 		markup := &models.InlineKeyboardMarkup{
 			InlineKeyboard: [][]models.InlineKeyboardButton{
 				{
-					{Text: "Follow channel", CallbackData: "action=help_follow"},
+					{Text: "Discover channels", CallbackData: "d:open:"},
 				},
 			},
 		}
@@ -196,7 +204,7 @@ func (b *Bot) handleChannels(ctx context.Context, chatID int64) {
 	markup := &models.InlineKeyboardMarkup{
 		InlineKeyboard: [][]models.InlineKeyboardButton{
 			{
-				{Text: "Follow channel", CallbackData: "action=help_follow"},
+				{Text: "Discover channels", CallbackData: "d:open:"},
 				{Text: "Unfollow channel", CallbackData: "action=unfollow_menu"},
 			},
 		},
@@ -346,6 +354,8 @@ func (b *Bot) handleCallbackQuery(ctx context.Context, q *models.CallbackQuery) 
 	data := q.Data
 
 	switch {
+	case strings.HasPrefix(data, "d:"):
+		b.handleDiscoveryCallback(ctx, chatID, messageID, data)
 	case data == "action=brief":
 		b.handleBrief(ctx, chatID, nil)
 	case data == "action=status":

@@ -166,8 +166,8 @@ func TestListModels(t *testing.T) {
 		if strings.Contains(err.Error(), apiKey) {
 			t.Fatalf("sensitive api key leaked in error: %s", err.Error())
 		}
-		if !strings.Contains(err.Error(), "[REDACTED]") {
-			t.Fatalf("expected [REDACTED] in error, got: %s", err.Error())
+		if err.Error() != "llm request failed with status 401" {
+			t.Fatalf("expected status-only error, got: %s", err.Error())
 		}
 	})
 

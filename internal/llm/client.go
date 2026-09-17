@@ -13,13 +13,8 @@ import (
 	"time"
 )
 
-// Default limits for response bodies.
-const (
-	// MaxResponseBytes caps successful JSON completions to 4 MiB.
-	MaxResponseBytes = 4 * 1024 * 1024
-	// MaxErrorBytes caps diagnostic error response bodies to 64 KiB.
-	MaxErrorBytes = 64 * 1024
-)
+// MaxResponseBytes caps successful JSON completions to 4 MiB.
+const MaxResponseBytes = 4 * 1024 * 1024
 
 // DefaultRequestTimeout is the timeout applied to the default HTTP client.
 // It bounds stalled requests while providing ample time for completions.
@@ -69,6 +64,9 @@ func NewClient(baseURL, model, apiKey string, httpClient *http.Client) (*Client,
 	if u.Scheme != "http" && u.Scheme != "https" {
 		return nil, fmt.Errorf("invalid base URL %q: unsupported scheme %q (must be http or https)", baseURL, u.Scheme)
 	}
+	if u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return nil, errors.New("base URL must not contain credentials, query or fragment")
+	}
 
 	model = strings.TrimSpace(model)
 	if model == "" {
@@ -80,12 +78,16 @@ func NewClient(baseURL, model, apiKey string, httpClient *http.Client) (*Client,
 			Timeout: DefaultRequestTimeout,
 		}
 	}
+	// Never forward either profile's credentials through redirects, even to
+	// another port or path on the same host. Do not mutate a supplied client.
+	isolatedHTTP := *httpClient
+	isolatedHTTP.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
 	return &Client{
 		baseURL: baseURL,
 		model:   model,
 		apiKey:  strings.TrimSpace(apiKey),
-		http:    httpClient,
+		http:    &isolatedHTTP,
 	}, nil
 }
 
@@ -143,10 +145,7 @@ func (c *Client) Complete(ctx context.Context, messages []Message) (string, erro
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		diagReader := io.LimitReader(resp.Body, MaxErrorBytes)
-		diagBody, _ := io.ReadAll(diagReader)
-		diagText := strings.TrimSpace(string(diagBody))
-		return "", c.sanitizeError(&StatusError{StatusCode: resp.StatusCode, Message: diagText})
+		return "", &StatusError{StatusCode: resp.StatusCode}
 	}
 
 	// Read response bounded by MaxResponseBytes
@@ -169,7 +168,7 @@ func (c *Client) Complete(ctx context.Context, messages []Message) (string, erro
 	}
 
 	if err := json.Unmarshal(body, &respPayload); err != nil {
-		return "", c.sanitizeError(fmt.Errorf("failed to parse llm response JSON: %w", err))
+		return "", errors.New("failed to parse llm response JSON")
 	}
 
 	if len(respPayload.Choices) == 0 {
@@ -262,10 +261,7 @@ func (c *Client) ListModels(ctx context.Context) ([]ModelInfo, error) {
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK {
-		diagReader := io.LimitReader(resp.Body, MaxErrorBytes)
-		diagBody, _ := io.ReadAll(diagReader)
-		diagText := strings.TrimSpace(string(diagBody))
-		return nil, c.sanitizeError(&StatusError{StatusCode: resp.StatusCode, Message: diagText})
+		return nil, &StatusError{StatusCode: resp.StatusCode}
 	}
 
 	limitedReader := io.LimitReader(resp.Body, MaxResponseBytes+1)
@@ -284,7 +280,7 @@ func (c *Client) ListModels(ctx context.Context) ([]ModelInfo, error) {
 	}
 
 	if err := json.Unmarshal(body, &respPayload); err != nil {
-		return nil, c.sanitizeError(fmt.Errorf("failed to parse llm models JSON: %w", err))
+		return nil, errors.New("failed to parse llm models JSON")
 	}
 
 	var models []ModelInfo

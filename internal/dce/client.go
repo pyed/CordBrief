@@ -242,7 +242,7 @@ func commandEnv() []string {
 	for _, entry := range os.Environ() {
 		key, _, _ := strings.Cut(entry, "=")
 		switch strings.ToUpper(key) {
-		case "TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID", "LLM_API_KEY", "DISCORD_TOKEN":
+		case "TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID", "LLM_API_KEY", "FALLBACK_LLM_API_KEY", "DISCORD_TOKEN":
 			continue
 		}
 		env = append(env, entry)

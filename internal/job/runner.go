@@ -28,6 +28,7 @@ type Runner struct {
 	completerFactory CompleterFactory
 	deliverer        Deliverer
 	llmAPIKey        string
+	fallbackAPIKey   string
 	now              func() time.Time
 
 	mu      sync.Mutex
@@ -71,6 +72,10 @@ func WithLLMAPIKey(apiKey string) Option {
 	return func(r *Runner) {
 		r.llmAPIKey = apiKey
 	}
+}
+
+func WithFallbackAPIKey(apiKey string) Option {
+	return func(r *Runner) { r.fallbackAPIKey = apiKey }
 }
 
 // NewRunner creates a new Runner instance.
@@ -216,8 +221,17 @@ func (r *Runner) run(ctx context.Context, targetChannelID string, deliveryAt tim
 		_ = r.deliverer.Deliver(ctx, msg)
 		return err
 	}
-	retryComp := NewRetryCompleter(baseCompleter)
-	engine := brief.NewEngine(retryComp, brief.WithPrompt(cfg.EffectiveBriefPrompt()))
+	completer := &fallbackCompleter{primary: NewRetryCompleter(baseCompleter)}
+	if cfg.Fallback != nil && cfg.Fallback.Enabled {
+		completer.createFallback = func() (brief.Completer, error) {
+			client, err := r.completerFactory(cfg.Fallback.BaseURL, cfg.Fallback.Model, r.fallbackAPIKey)
+			if err != nil {
+				return nil, err
+			}
+			return NewRetryCompleter(client), nil
+		}
+	}
+	engine := brief.NewEngine(completer, brief.WithPrompt(cfg.EffectiveBriefPrompt()))
 
 	// 5. Scheduled runs retain only finished text and message-ID boundaries.
 	var prepared []*preparedChannel
@@ -288,9 +302,9 @@ func (r *Runner) prepareChannel(ctx context.Context, ch state.ChannelConfig, eng
 
 	dceRes, err := r.dceClient.Export(ctx, req)
 	if err != nil {
-		log.Printf("[job] DCE export failed for #%s (%s): %v", ch.Name, ch.ID, err)
 		// Record sanitized error without altering cursor
 		chState.LastError = r.sanitize(err.Error())
+		log.Printf("[job] DCE export failed for #%s (%s): %s", ch.Name, ch.ID, chState.LastError)
 		st.Channels[ch.ID] = chState
 		_ = r.store.SaveState(st)
 
@@ -341,8 +355,8 @@ func (r *Runner) prepareChannel(ctx context.Context, ch state.ChannelConfig, eng
 	// E. Synthesize brief with bounded LLM retry
 	briefText, err := engine.Summarize(ctx, brief.Channel{ID: ch.ID, Name: chName}, briefMessages)
 	if err != nil {
-		log.Printf("[job] summarization failed for #%s (%s): %v", chName, ch.ID, err)
 		chState.LastError = r.sanitize(err.Error())
+		log.Printf("[job] summarization failed for #%s (%s): %s", chName, ch.ID, chState.LastError)
 		st.Channels[ch.ID] = chState
 		_ = r.store.SaveState(st)
 
@@ -359,6 +373,9 @@ func (r *Runner) prepareChannel(ctx context.Context, ch state.ChannelConfig, eng
 
 // deliverChannel commits only after every part of this channel's brief succeeds.
 func (r *Runner) deliverChannel(ctx context.Context, result *preparedChannel) {
+	if ctx.Err() != nil {
+		return
+	}
 	ch := result.channel
 	var deliveryErr error
 	for _, part := range result.parts {
@@ -368,6 +385,9 @@ func (r *Runner) deliverChannel(ctx context.Context, result *preparedChannel) {
 		}
 	}
 	if result.maxMessageID == "" {
+		return
+	}
+	if ctx.Err() != nil {
 		return
 	}
 
@@ -392,10 +412,12 @@ func (r *Runner) deliverChannel(ctx context.Context, result *preparedChannel) {
 	}
 }
 
-// sanitize strips the LLM API key from user-facing error text.
+// sanitize strips both LLM API keys from user-facing error text.
 func (r *Runner) sanitize(msg string) string {
-	if r.llmAPIKey != "" && strings.Contains(msg, r.llmAPIKey) {
-		msg = strings.ReplaceAll(msg, r.llmAPIKey, "[REDACTED]")
+	for _, key := range []string{r.llmAPIKey, r.fallbackAPIKey} {
+		if key != "" {
+			msg = strings.ReplaceAll(msg, key, "[REDACTED]")
+		}
 	}
 	return msg
 }

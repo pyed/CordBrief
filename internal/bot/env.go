@@ -11,18 +11,19 @@ import (
 
 // EnvConfig holds startup settings after environment overrides saved credentials.
 type EnvConfig struct {
-	BotToken     string
-	OwnerID      int64
-	DataDir      string
-	DiscordToken string
-	DCEPath      string
-	DCEVersion   string
-	LLMAPIKey    string
+	BotToken       string
+	OwnerID        int64
+	DataDir        string
+	DiscordToken   string
+	DCEPath        string
+	DCEVersion     string
+	LLMAPIKey      string
+	FallbackAPIKey string
 }
 
 // Redact also covers URL-escaped tokens in HTTP transport errors.
 func (c *EnvConfig) Redact(text string) string {
-	for _, secret := range []string{c.BotToken, c.DiscordToken, c.LLMAPIKey} {
+	for _, secret := range []string{c.BotToken, c.DiscordToken, c.LLMAPIKey, c.FallbackAPIKey} {
 		if secret != "" {
 			for _, value := range []string{secret, url.PathEscape(secret), url.QueryEscape(secret)} {
 				text = strings.ReplaceAll(text, value, "[REDACTED]")
@@ -51,12 +52,13 @@ func LoadEnv() (*EnvConfig, error) {
 	}
 
 	return &EnvConfig{
-		BotToken:     c.BotToken,
-		OwnerID:      ownerID,
-		DataDir:      credentialDataDir(),
-		DiscordToken: c.DiscordToken,
-		DCEPath:      strings.TrimSpace(os.Getenv("CORDBRIEF_DCE_PATH")),
-		DCEVersion:   strings.TrimSpace(os.Getenv("CORDBRIEF_DCE_VERSION")),
-		LLMAPIKey:    c.LLMAPIKey,
+		BotToken:       c.BotToken,
+		OwnerID:        ownerID,
+		DataDir:        credentialDataDir(),
+		DiscordToken:   c.DiscordToken,
+		DCEPath:        strings.TrimSpace(os.Getenv("CORDBRIEF_DCE_PATH")),
+		DCEVersion:     strings.TrimSpace(os.Getenv("CORDBRIEF_DCE_VERSION")),
+		LLMAPIKey:      c.LLMAPIKey,
+		FallbackAPIKey: c.FallbackAPIKey,
 	}, nil
 }

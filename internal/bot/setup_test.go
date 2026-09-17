@@ -19,7 +19,7 @@ func credentialTestEnv(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	t.Setenv("CORDBRIEF_DATA_DIR", dir)
-	for _, key := range []string{"TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID", "DISCORD_TOKEN", "LLM_API_KEY"} {
+	for _, key := range []string{"TELEGRAM_BOT_TOKEN", "TELEGRAM_OWNER_ID", "DISCORD_TOKEN", "LLM_API_KEY", "FALLBACK_LLM_API_KEY"} {
 		t.Setenv(key, "")
 		os.Unsetenv(key)
 	}
@@ -28,7 +28,7 @@ func credentialTestEnv(t *testing.T) string {
 
 func TestCredentialSetupAndPrecedence(t *testing.T) {
 	dir := credentialTestEnv(t)
-	values := []string{"test-telegram-secret", "12345", "test-discord-secret", "test-ai-secret"}
+	values := []string{"test-telegram-secret", "12345", "test-discord-secret", "test-ai-secret", "test-fallback-secret"}
 	i := 0
 	if err := configure(func(label string) (string, error) {
 		for _, secret := range values {
@@ -46,7 +46,7 @@ func TestCredentialSetupAndPrecedence(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.BotToken != values[0] || cfg.OwnerID != 12345 || cfg.DiscordToken != values[2] || cfg.LLMAPIKey != values[3] {
+	if cfg.BotToken != values[0] || cfg.OwnerID != 12345 || cfg.DiscordToken != values[2] || cfg.LLMAPIKey != values[3] || cfg.FallbackAPIKey != values[4] {
 		t.Fatal("saved credentials did not load")
 	}
 	path := filepath.Join(dir, "credentials.json")
@@ -77,7 +77,7 @@ func TestCredentialSetupAndPrecedence(t *testing.T) {
 
 func TestCredentialReconfigureAtomicAndSecretSafe(t *testing.T) {
 	dir := credentialTestEnv(t)
-	original := credentials{"telegram-secret", "123", "discord-secret", "ai-secret"}
+	original := credentials{"telegram-secret", "123", "discord-secret", "ai-secret", "fallback-secret"}
 	if err := saveCredentials(original); err != nil {
 		t.Fatal(err)
 	}
@@ -128,7 +128,7 @@ func TestCredentialValidationAndFailedReplacement(t *testing.T) {
 	dir := credentialTestEnv(t)
 	for _, owner := range []string{"", "0", "-1", "not-numeric-secret"} {
 		i := 0
-		values := []string{"telegram-secret", owner, "discord-secret", ""}
+		values := []string{"telegram-secret", owner, "discord-secret", "", ""}
 		err := configure(func(string) (string, error) { value := values[i]; i++; return value, nil })
 		if err == nil || strings.Contains(err.Error(), "secret") {
 			t.Fatal("invalid owner was accepted or echoed")

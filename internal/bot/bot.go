@@ -53,6 +53,7 @@ type Bot struct {
 	modelCache        *ModelCache
 	modelLister       ModelLister
 	pendingPromptEdit bool
+	discoveryCache    map[string][]state.ChannelConfig // "" is the server list; no TTL.
 }
 
 // Option configures Bot instances.
@@ -128,6 +129,7 @@ func New(appCtx context.Context, cfg *EnvConfig, store *state.Store, opts ...Opt
 		llmAPIKey:      cfg.LLMAPIKey,
 		modelCache:     NewModelCache(),
 		redact:         cfg.Redact,
+		discoveryCache: make(map[string][]state.ChannelConfig),
 	}
 
 	for _, opt := range opts {
@@ -175,6 +177,7 @@ func New(appCtx context.Context, cfg *EnvConfig, store *state.Store, opts ...Opt
 			job.WithDCEClient(exporter),
 			job.WithDeliverer(b),
 			job.WithLLMAPIKey(cfg.LLMAPIKey),
+			job.WithFallbackAPIKey(cfg.FallbackAPIKey),
 		)
 		if err == nil {
 			b.runner = r

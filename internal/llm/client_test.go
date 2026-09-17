@@ -164,8 +164,8 @@ func TestSecurity_APIKeyNeverInErrors(t *testing.T) {
 	if strings.Contains(errStr, secretKey) {
 		t.Fatalf("CRITICAL SECURITY VIOLATION: API key found in returned error: %s", errStr)
 	}
-	if !strings.Contains(errStr, "[REDACTED]") {
-		t.Errorf("expected [REDACTED] in error, got: %s", errStr)
+	if errStr != "llm request failed with status 401" {
+		t.Errorf("expected status-only error, got: %s", errStr)
 	}
 }
 
@@ -183,8 +183,8 @@ func TestClient_Non2xxError(t *testing.T) {
 		t.Fatal("expected error for status 400, got nil")
 	}
 
-	if !strings.Contains(err.Error(), "status 400") || !strings.Contains(err.Error(), "Invalid parameter model") {
-		t.Errorf("expected diagnostic in error, got: %v", err)
+	if err.Error() != "llm request failed with status 400" {
+		t.Errorf("expected status-only error, got: %v", err)
 	}
 }
 
@@ -431,8 +431,8 @@ func TestLLM_PreservesCustomClient(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create client: %v", err)
 	}
-	if client.http != customClient {
-		t.Fatal("expected custom HTTP client to be preserved")
+	if client.http == customClient || customClient.CheckRedirect != nil || client.http.Transport != customClient.Transport {
+		t.Fatal("client must be copied with transport retained and caller unmodified")
 	}
 	if client.http.Timeout != 123*time.Millisecond {
 		t.Fatalf("expected custom timeout 123ms, got %v", client.http.Timeout)
